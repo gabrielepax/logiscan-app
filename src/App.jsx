@@ -486,10 +486,11 @@ export default function App() {
     setLoading(false);
   }
 
-  function resetToDashboard() {
+  async function resetToDashboard() {
     setActiveLineKey(null);
     setActiveLine(null);
     setCurrentView('dashboard');
+    await fetchPOLines();
   }
 
   const uniqueInvoices = [...new Set(poLines.map(item => item.china_invoice))].sort();
