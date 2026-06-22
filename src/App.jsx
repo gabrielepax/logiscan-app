@@ -250,13 +250,6 @@ export default function App() {
     reader.readAsArrayBuffer(file);
   }
 
-  async function toggleSNRequired(lineKey, currentValue) {
-    const newValue = !currentValue;
-    const { error } = await supabase.from('po_lines').update({ sn_required: newValue }).eq('unique_key', lineKey);
-    if (!error) {
-      setPoLines(prev => prev.map(l => l.unique_key === lineKey ? { ...l, sn_required: newValue } : l));
-    }
-  }
 
   async function startScanningSession(line) {
     setLoading(true);
@@ -653,68 +646,63 @@ export default function App() {
                                 </div>
                               </div>
 
-                              {/* Quantità + azioni */}
-                              <div className="flex items-center justify-between md:justify-end gap-3 pt-2 md:pt-0 border-t md:border-t-0 border-gray-100 shrink-0 md:w-auto">
-                                {/* Contatori quantità */}
-                                <div className="bg-gray-900 text-white rounded-xl px-4 py-2 flex flex-col items-center shadow-xs min-w-[72px]">
-                                  <span className="text-[9px] uppercase font-bold tracking-wider text-gray-400 leading-tight">Attesi</span>
-                                  <span className="text-2xl font-black font-mono text-amber-400 leading-tight">{item.qty_expected}</span>
-                                  <span className="text-[9px] uppercase font-bold tracking-wider text-gray-500 leading-tight">pezzi</span>
+                              {/* Livello 1+2+3 — colonna verticale full-width su mobile, compatta su desktop */}
+                              <div className="w-full md:w-auto flex flex-col gap-2 pt-2 md:pt-0 border-t md:border-t-0 border-gray-100">
+
+                                {/* Livello 1: Matricole attese */}
+                                <div className="bg-gray-900 text-white rounded-xl px-4 py-2 flex items-center justify-between md:flex-col md:items-center shadow-xs">
+                                  <span className="text-[9px] uppercase font-bold tracking-wider text-gray-400 md:leading-tight">Attesi</span>
+                                  <span className="text-2xl font-black font-mono text-amber-400 md:leading-tight">{item.qty_expected}</span>
+                                  <span className="text-[9px] uppercase font-bold tracking-wider text-gray-500 md:leading-tight">pezzi</span>
                                 </div>
-                                {snRequired && item.sn_loaded && (
-                                  <div className={`rounded-xl px-4 py-2 flex flex-col items-center shadow-xs min-w-[72px] border ${item.scanned_count >= item.qty_expected ? 'bg-green-50 border-green-200' : 'bg-blue-50 border-blue-200'}`}>
-                                    <span className="text-[9px] uppercase font-bold tracking-wider text-gray-400 leading-tight">Rilevate</span>
-                                    <span className={`text-2xl font-black font-mono leading-tight ${item.scanned_count >= item.qty_expected ? 'text-green-600' : 'text-blue-600'}`}>
+
+                                {/* Livello 2: Matricole rilevate — solo se scansione avviata */}
+                                {snRequired && item.sn_loaded && item.scanned_count > 0 && (
+                                  <div className={`rounded-xl px-4 py-2 flex items-center justify-between md:flex-col md:items-center shadow-xs border ${item.scanned_count >= item.qty_expected ? 'bg-green-50 border-green-200' : 'bg-blue-50 border-blue-200'}`}>
+                                    <span className="text-[9px] uppercase font-bold tracking-wider text-gray-400 md:leading-tight">Rilevate</span>
+                                    <span className={`text-2xl font-black font-mono md:leading-tight ${item.scanned_count >= item.qty_expected ? 'text-green-600' : 'text-blue-600'}`}>
                                       {item.scanned_count}
                                     </span>
-                                    <span className="text-[9px] uppercase font-bold tracking-wider text-gray-400 leading-tight">/ {item.qty_expected}</span>
+                                    <span className="text-[9px] uppercase font-bold tracking-wider text-gray-400 md:leading-tight">/ {item.qty_expected}</span>
                                   </div>
                                 )}
 
-                                {/* Toggle SN + pulsanti azione */}
-                                <div className="flex flex-col items-end gap-2">
-                                  {/* Toggle SN Yes/No */}
-                                  <button
-                                    onClick={() => toggleSNRequired(item.unique_key, snRequired)}
-                                    className={`text-[10px] font-bold px-2.5 py-1 rounded-lg border transition cursor-pointer ${snRequired ? 'bg-indigo-50 text-indigo-700 border-indigo-200 hover:bg-indigo-100' : 'bg-gray-100 text-gray-500 border-gray-200 hover:bg-gray-200'}`}
-                                  >
-                                    SN: {snRequired ? 'Sì' : 'No'}
-                                  </button>
-
-                                  {/* Pulsanti azione — solo se SN required */}
-                                  {snRequired && (
-                                    <div className="flex gap-2">
-                                      {!isConfirmed && (
-                                        <div className="relative inline-block">
-                                          {item.sn_loaded ? (
-                                            <>
-                                              <button className="bg-gray-200 hover:bg-gray-300 text-gray-500 text-xs font-medium px-3 py-2 rounded-xl transition cursor-pointer border border-gray-300">
-                                                Sovrascrivi SN
-                                              </button>
-                                              <input type="file" accept=".xls,.xlsx" className="absolute inset-0 w-full h-full opacity-0 cursor-pointer" onChange={(e) => handleSNUpload(e, item)} />
-                                            </>
-                                          ) : (
-                                            <>
-                                              <button className="bg-amber-600 hover:bg-amber-700 text-white text-xs font-bold px-3 py-2 rounded-xl transition cursor-pointer shadow-xs">
-                                                Carica SN
-                                              </button>
-                                              <input type="file" accept=".xls,.xlsx" className="absolute inset-0 w-full h-full opacity-0 cursor-pointer" onChange={(e) => handleSNUpload(e, item)} />
-                                            </>
-                                          )}
-                                        </div>
-                                      )}
+                                {/* Livello 3: Pulsanti azione */}
+                                {snRequired && (
+                                  <div className="flex gap-2 flex-wrap">
+                                    {!isConfirmed && (
+                                      <div className="relative inline-block flex-1 min-w-0">
+                                        {item.sn_loaded ? (
+                                          <>
+                                            <button className="w-full bg-gray-200 hover:bg-gray-300 text-gray-500 text-xs font-medium px-3 py-2 rounded-xl transition cursor-pointer border border-gray-300 whitespace-nowrap">
+                                              Sovrascrivi SN
+                                            </button>
+                                            <input type="file" accept=".xls,.xlsx" className="absolute inset-0 w-full h-full opacity-0 cursor-pointer" onChange={(e) => handleSNUpload(e, item)} />
+                                          </>
+                                        ) : (
+                                          <>
+                                            <button className="w-full bg-amber-600 hover:bg-amber-700 text-white text-xs font-bold px-3 py-2 rounded-xl transition cursor-pointer shadow-xs whitespace-nowrap">
+                                              Carica SN
+                                            </button>
+                                            <input type="file" accept=".xls,.xlsx" className="absolute inset-0 w-full h-full opacity-0 cursor-pointer" onChange={(e) => handleSNUpload(e, item)} />
+                                          </>
+                                        )}
+                                      </div>
+                                    )}
+                                    <div className="flex-1 min-w-0">
                                       {isConfirmed ? (
-                                        <button onClick={() => downloadArrivoCSV(item)} className={`text-xs font-bold px-3.5 py-2 rounded-xl transition cursor-pointer whitespace-nowrap ${downloadedKeys.has(item.unique_key) ? 'bg-gray-100 hover:bg-gray-200 text-gray-400 border border-gray-200' : 'bg-blue-600 hover:bg-blue-700 text-white shadow-xs'}`}>
+                                        <button onClick={() => downloadArrivoCSV(item)} className={`w-full text-xs font-bold px-3.5 py-2 rounded-xl transition cursor-pointer whitespace-nowrap ${downloadedKeys.has(item.unique_key) ? 'bg-gray-100 hover:bg-gray-200 text-gray-400 border border-gray-200' : 'bg-blue-600 hover:bg-blue-700 text-white shadow-xs'}`}>
                                           📥 Scarica Arrivo
                                         </button>
                                       ) : (
-                                        <button onClick={() => startScanningSession(item)} className="bg-green-600 hover:bg-green-700 text-white text-xs font-bold px-3.5 py-2 rounded-xl transition cursor-pointer shadow-xs whitespace-nowrap">
+                                        <button onClick={() => startScanningSession(item)} className="w-full bg-green-600 hover:bg-green-700 text-white text-xs font-bold px-3.5 py-2 rounded-xl transition cursor-pointer shadow-xs whitespace-nowrap">
                                           Avvia Controllo
                                         </button>
                                       )}
                                     </div>
-                                  )}
-                                </div>
+                                  </div>
+                                )}
+
                               </div>
 
                             </div>
