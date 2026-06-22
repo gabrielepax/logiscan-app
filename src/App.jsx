@@ -635,11 +635,11 @@ export default function App() {
                               {/* Descrizione */}
                               <div className="flex-grow min-w-0 space-y-1">
                                 <div className="flex flex-wrap items-center gap-2">
-                                  <h4 className="text-base font-black text-blue-700 font-mono tracking-tight break-all">{item.item_code}</h4>
-                                  <span className="text-[10px] text-gray-400 font-mono hidden md:inline">(L: {item.line_id})</span>
+                                  <h4 className="text-xl font-black text-blue-700 font-mono tracking-tight break-all">{item.item_code}</h4>
+                                  <span className="text-xs text-gray-400 font-mono hidden md:inline">(L: {item.line_id})</span>
                                 </div>
-                                <p className="text-xs text-gray-500 font-medium line-clamp-1">{item.description}</p>
-                                <div className="flex flex-wrap gap-x-4 text-[10px] text-gray-400 font-semibold uppercase tracking-wider">
+                                <p className="text-sm text-gray-500 font-medium line-clamp-1">{item.description}</p>
+                                <div className="flex flex-wrap gap-x-4 text-xs text-gray-400 font-semibold uppercase tracking-wider">
                                   <span>Rif. Ordine: <span className="text-gray-600 font-mono">{item.po_name}</span></span>
                                   {item.part_number && item.part_number !== 'N/D' && (
                                     <span>PN: <span className="text-indigo-600 font-mono font-bold">{item.part_number}</span></span>
@@ -672,17 +672,17 @@ export default function App() {
                                 {snRequired && (
                                   <div className="flex gap-2 flex-wrap">
                                     {!isConfirmed && (
-                                      <div className="relative inline-block flex-1 min-w-0">
+                                      <div className="relative inline-block w-full md:w-28">
                                         {item.sn_loaded ? (
                                           <>
-                                            <button className="w-full bg-gray-200 hover:bg-gray-300 text-gray-500 text-xs font-medium px-3 py-2 rounded-xl transition cursor-pointer border border-gray-300 whitespace-nowrap">
+                                            <button className="w-full bg-gray-200 hover:bg-gray-300 text-gray-500 text-xs font-medium py-2.5 rounded-xl transition cursor-pointer border border-gray-300 text-center">
                                               Sovrascrivi SN
                                             </button>
                                             <input type="file" accept=".xls,.xlsx" className="absolute inset-0 w-full h-full opacity-0 cursor-pointer" onChange={(e) => handleSNUpload(e, item)} />
                                           </>
                                         ) : (
                                           <>
-                                            <button className="w-full bg-amber-600 hover:bg-amber-700 text-white text-xs font-bold px-3 py-2 rounded-xl transition cursor-pointer shadow-xs whitespace-nowrap">
+                                            <button className="w-full bg-amber-600 hover:bg-amber-700 text-white text-xs font-bold py-2.5 rounded-xl transition cursor-pointer shadow-xs text-center">
                                               Carica SN
                                             </button>
                                             <input type="file" accept=".xls,.xlsx" className="absolute inset-0 w-full h-full opacity-0 cursor-pointer" onChange={(e) => handleSNUpload(e, item)} />
@@ -690,13 +690,13 @@ export default function App() {
                                         )}
                                       </div>
                                     )}
-                                    <div className="flex-1 min-w-0">
+                                    <div className="w-full md:w-28">
                                       {isConfirmed ? (
-                                        <button onClick={() => downloadArrivoCSV(item)} className={`w-full text-xs font-bold px-3.5 py-2 rounded-xl transition cursor-pointer whitespace-nowrap ${downloadedKeys.has(item.unique_key) ? 'bg-gray-100 hover:bg-gray-200 text-gray-400 border border-gray-200' : 'bg-blue-600 hover:bg-blue-700 text-white shadow-xs'}`}>
+                                        <button onClick={() => downloadArrivoCSV(item)} className={`w-full text-xs font-bold py-2.5 rounded-xl transition cursor-pointer text-center ${downloadedKeys.has(item.unique_key) ? 'bg-gray-100 hover:bg-gray-200 text-gray-400 border border-gray-200' : 'bg-blue-600 hover:bg-blue-700 text-white shadow-xs'}`}>
                                           📥 Scarica Arrivo
                                         </button>
                                       ) : (
-                                        <button onClick={() => startScanningSession(item)} className="w-full bg-green-600 hover:bg-green-700 text-white text-xs font-bold px-3.5 py-2 rounded-xl transition cursor-pointer shadow-xs whitespace-nowrap">
+                                        <button onClick={() => startScanningSession(item)} className="w-full bg-green-600 hover:bg-green-700 text-white text-xs font-bold py-2.5 rounded-xl transition cursor-pointer shadow-xs text-center">
                                           Avvia Controllo
                                         </button>
                                       )}
