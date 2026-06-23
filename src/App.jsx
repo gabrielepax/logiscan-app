@@ -439,8 +439,9 @@ export default function App() {
 
   async function handleScanSubmit(e) {
     e.preventDefault();
-    const rawInput = scannerValue.trim();
+    const rawInput = (scannerInputRef.current?.value || scannerValue).trim();
     setScannerValue('');
+    if (scannerInputRef.current) scannerInputRef.current.value = '';
     if (!rawInput || !activeLineKey) return;
 
     const totalExpected = activeLine?.qty_expected || Object.keys(expectedSerials).length;
