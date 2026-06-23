@@ -2,6 +2,56 @@ import { useState, useEffect, useRef } from 'react';
 import { supabase } from './supabaseClient';
 import * as XLSX from 'xlsx';
 
+// Web Audio API — crea il contesto la prima volta che l'utente interagisce
+let audioCtx = null;
+function getAudioCtx() {
+  if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  return audioCtx;
+}
+
+function playBeep({ frequency = 880, duration = 0.12, type = 'sine', volume = 0.4, delay = 0 } = {}) {
+  try {
+    const ctx = getAudioCtx();
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.connect(gain);
+    gain.connect(ctx.destination);
+    osc.type = type;
+    osc.frequency.setValueAtTime(frequency, ctx.currentTime + delay);
+    gain.gain.setValueAtTime(volume, ctx.currentTime + delay);
+    gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + delay + duration);
+    osc.start(ctx.currentTime + delay);
+    osc.stop(ctx.currentTime + delay + duration + 0.05);
+  } catch { /* audio non disponibile */ }
+}
+
+const sounds = {
+  // Scansione singola OK — bip acuto breve
+  ok() {
+    playBeep({ frequency: 1320, duration: 0.1, type: 'sine', volume: 0.35 });
+  },
+  // Cartone QR OK — doppio bip ascendente
+  carton() {
+    playBeep({ frequency: 880, duration: 0.09, type: 'sine', volume: 0.35, delay: 0 });
+    playBeep({ frequency: 1320, duration: 0.12, type: 'sine', volume: 0.4, delay: 0.12 });
+  },
+  // Scansione completata — tre note ascendenti
+  complete() {
+    playBeep({ frequency: 880,  duration: 0.1, volume: 0.35, delay: 0 });
+    playBeep({ frequency: 1100, duration: 0.1, volume: 0.38, delay: 0.13 });
+    playBeep({ frequency: 1320, duration: 0.18, volume: 0.42, delay: 0.26 });
+  },
+  // Errore — bip basso lungo
+  error() {
+    playBeep({ frequency: 220, duration: 0.35, type: 'square', volume: 0.25 });
+  },
+  // Duplicato — doppio bip medio
+  duplicate() {
+    playBeep({ frequency: 520, duration: 0.1, type: 'sine', volume: 0.3, delay: 0 });
+    playBeep({ frequency: 520, duration: 0.1, type: 'sine', volume: 0.3, delay: 0.15 });
+  },
+};
+
 export default function App() {
   const [currentView, setCurrentView] = useState('dashboard');
   const [poLines, setPoLines] = useState([]);
@@ -282,13 +332,20 @@ export default function App() {
     setExpectedSerials(expectedMap);
     setScannedSerials(formattedScanned);
 
-    if (line.is_user_confirmed || (formattedScanned.length === Object.keys(expectedMap).length && Object.keys(expectedMap).length > 0)) {
+    if (line.is_user_confirmed) {
       openReviewSession();
     } else {
       setFeedback({ text: 'Scanner pronto, punta il laser sul codice.', type: 'success' });
       setCurrentView('scan');
     }
     setLoading(false);
+  }
+
+  async function reopenScanningSession(line) {
+    if (!window.confirm(`Riaprire la riga "${line.item_code}" per modificare le rilevazioni?\n\nL'arrivo verrà riportato in stato "In Corso".`)) return;
+    await supabase.from('po_lines').update({ is_user_confirmed: false }).eq('unique_key', line.unique_key);
+    await fetchPOLines();
+    await startScanningSession({ ...line, is_user_confirmed: false });
   }
 
   async function downloadArrivoCSV(line) {
@@ -395,7 +452,7 @@ export default function App() {
     if (isMasterQRCode(rawInput)) {
       const qrData = parseMasterQRCode(rawInput);
       if (!qrData) {
-        triggerVibration([350]);
+        triggerVibration([350]); sounds.error();
         setFeedback({ text: 'Errore: Formato QR Master non interpretabile.', type: 'error' });
         return;
       }
@@ -422,14 +479,15 @@ export default function App() {
         ];
         setScannedSerials(updatedScanned);
         setCartonsScanned(newCartonsCount);
-        triggerVibration([150, 100, 150]);
-        setFeedback({ text: `Cartone Rilevato! +${aggiunti.length} matricole acquisite.`, type: 'success' });
-
-        if (updatedScanned.length === totalExpected) {
+        if (updatedScanned.length >= totalExpected) {
+          triggerVibration([150, 100, 150, 100, 200]); sounds.complete();
           setTimeout(() => openReviewSession(), 1200);
+        } else {
+          triggerVibration([150, 100, 150]); sounds.carton();
         }
+        setFeedback({ text: `Cartone Rilevato! +${aggiunti.length} matricole acquisite.`, type: 'success' });
       } else {
-        triggerVibration([300]);
+        triggerVibration([300]); sounds.error();
         const details = [duplicati > 0 && `${duplicati} già lette`, errati > 0 && `${errati} non appartenenti`].filter(Boolean).join(', ');
         setFeedback({ text: `Cartone scartato (${details || 'nessuna matricola valida'}).`, type: 'error' });
       }
@@ -438,16 +496,15 @@ export default function App() {
       const serial = rawInput;
       const giaLetto = scannedSerials.some(s => s.serial === serial);
       if (giaLetto) {
-        triggerVibration([100, 50, 100]);
+        triggerVibration([100, 50, 100]); sounds.duplicate();
         setFeedback({ text: `Duplicato! Matricola ${serial} già letta.`, type: 'error' });
         return;
       }
       if (!Object.hasOwn(expectedSerials, serial)) {
-        triggerVibration([300]);
+        triggerVibration([300]); sounds.error();
         setFeedback({ text: `Errore! La matricola ${serial} non appartiene a questa riga.`, type: 'error' });
         return;
       }
-      triggerVibration([150]);
       const meta = expectedSerials[serial];
       await supabase.from('scanned_serials').insert({ po_line_key: activeLineKey, serial, model: meta.model, pn: meta.pn });
 
@@ -456,10 +513,14 @@ export default function App() {
         ...scannedSerials
       ];
       setScannedSerials(updatedScanned);
-      setFeedback({ text: `OK: Rilevato modello ${meta.model}`, type: 'success' });
 
-      if (updatedScanned.length === totalExpected) {
+      if (updatedScanned.length >= totalExpected) {
+        triggerVibration([150, 100, 150, 100, 200]); sounds.complete();
+        setFeedback({ text: `Completato! Ultima matricola: ${meta.model}`, type: 'success' });
         setTimeout(() => openReviewSession(), 1200);
+      } else {
+        triggerVibration([150]); sounds.ok();
+        setFeedback({ text: `OK: Rilevato modello ${meta.model}`, type: 'success' });
       }
     }
   }
@@ -647,11 +708,11 @@ export default function App() {
                                 </div>
                               </div>
 
-                              {/* Livello 1+2+3 — colonna verticale full-width su mobile, compatta su desktop */}
-                              <div className="w-full md:w-auto flex flex-col gap-2 pt-2 md:pt-0 border-t md:border-t-0 border-gray-100">
+                              {/* Livello 1+2+3 — larghezza fissa uniforme su desktop, full-width su mobile */}
+                              <div className="w-full md:w-36 flex flex-col gap-2 pt-2 md:pt-0 border-t md:border-t-0 border-gray-100 shrink-0">
 
                                 {/* Livello 1: Matricole attese */}
-                                <div className="bg-gray-900 text-white rounded-xl px-4 py-2 flex items-center justify-between md:flex-col md:items-center shadow-xs">
+                                <div className="w-full bg-gray-900 text-white rounded-xl px-4 py-2 flex items-center justify-between md:flex-col md:items-center shadow-xs">
                                   <span className="text-[9px] uppercase font-bold tracking-wider text-gray-400 md:leading-tight">Attesi</span>
                                   <span className="text-2xl font-black font-mono text-amber-400 md:leading-tight">{item.qty_expected}</span>
                                   <span className="text-[9px] uppercase font-bold tracking-wider text-gray-500 md:leading-tight">pezzi</span>
@@ -659,7 +720,7 @@ export default function App() {
 
                                 {/* Livello 2: Matricole rilevate — solo se scansione avviata */}
                                 {snRequired && item.sn_loaded && item.scanned_count > 0 && (
-                                  <div className={`rounded-xl px-4 py-2 flex items-center justify-between md:flex-col md:items-center shadow-xs border ${item.scanned_count >= item.qty_expected ? 'bg-green-50 border-green-200' : 'bg-blue-50 border-blue-200'}`}>
+                                  <div className={`w-full rounded-xl px-4 py-2 flex items-center justify-between md:flex-col md:items-center shadow-xs border ${item.scanned_count >= item.qty_expected ? 'bg-green-50 border-green-200' : 'bg-blue-50 border-blue-200'}`}>
                                     <span className="text-[9px] uppercase font-bold tracking-wider text-gray-400 md:leading-tight">Rilevate</span>
                                     <span className={`text-2xl font-black font-mono md:leading-tight ${item.scanned_count >= item.qty_expected ? 'text-green-600' : 'text-blue-600'}`}>
                                       {item.scanned_count}
@@ -670,9 +731,9 @@ export default function App() {
 
                                 {/* Livello 3: Pulsanti azione */}
                                 {snRequired && (
-                                  <div className="flex gap-2 flex-wrap">
+                                  <div className="flex flex-col gap-2">
                                     {!isConfirmed && (
-                                      <div className="relative inline-block w-full md:w-28">
+                                      <div className="relative w-full">
                                         {item.sn_loaded ? (
                                           <>
                                             <button className="w-full bg-gray-200 hover:bg-gray-300 text-gray-500 text-xs font-medium py-2.5 rounded-xl transition cursor-pointer border border-gray-300 text-center">
@@ -690,14 +751,19 @@ export default function App() {
                                         )}
                                       </div>
                                     )}
-                                    <div className="w-full md:w-28">
+                                    <div className="w-full flex flex-col gap-2">
                                       {isConfirmed ? (
-                                        <button onClick={() => downloadArrivoCSV(item)} className={`w-full text-xs font-bold py-2.5 rounded-xl transition cursor-pointer text-center ${downloadedKeys.has(item.unique_key) ? 'bg-gray-100 hover:bg-gray-200 text-gray-400 border border-gray-200' : 'bg-blue-600 hover:bg-blue-700 text-white shadow-xs'}`}>
-                                          📥 Scarica Arrivo
-                                        </button>
+                                        <>
+                                          <button onClick={() => downloadArrivoCSV(item)} className={`w-full text-xs font-bold py-2.5 rounded-xl transition cursor-pointer text-center ${downloadedKeys.has(item.unique_key) ? 'bg-gray-100 hover:bg-gray-200 text-gray-400 border border-gray-200' : 'bg-blue-600 hover:bg-blue-700 text-white shadow-xs'}`}>
+                                            📥 Scarica Arrivo
+                                          </button>
+                                          <button onClick={() => reopenScanningSession(item)} className="w-full bg-gray-200 hover:bg-gray-300 text-gray-500 text-xs font-medium py-2.5 rounded-xl transition cursor-pointer border border-gray-300 text-center">
+                                            Modifica / Rivedi
+                                          </button>
+                                        </>
                                       ) : (
                                         <button onClick={() => startScanningSession(item)} className="w-full bg-green-600 hover:bg-green-700 text-white text-xs font-bold py-2.5 rounded-xl transition cursor-pointer shadow-xs text-center">
-                                          Avvia Controllo
+                                          {item.scanned_count >= item.qty_expected && item.scanned_count > 0 ? 'Modifica / Rivedi' : 'Avvia Controllo'}
                                         </button>
                                       )}
                                     </div>
@@ -863,11 +929,8 @@ export default function App() {
               </div>
             </div>
 
-            <div className="grid grid-cols-1 sm:grid-cols-12 gap-3 pt-2">
-              <button onClick={() => setCurrentView('scan')} className="sm:col-span-4 bg-gray-100 hover:bg-gray-200 text-gray-700 font-bold p-4 rounded-xl transition text-sm cursor-pointer">
-                ← Modifica / Sblocca
-              </button>
-              <button onClick={confirmAndFinalizeVerification} className="sm:col-span-8 bg-green-600 hover:bg-green-700 text-white font-black p-4 rounded-xl text-base shadow-md transition cursor-pointer flex items-center justify-center gap-2">
+            <div className="grid grid-cols-1 gap-3 pt-2">
+              <button onClick={confirmAndFinalizeVerification} className="w-full bg-green-600 hover:bg-green-700 text-white font-black p-4 rounded-xl text-base shadow-md transition cursor-pointer flex items-center justify-center gap-2">
                 ✓ Approva e Registra Carico su Cloud
               </button>
             </div>
