@@ -53,6 +53,8 @@ const sounds = {
 };
 
 export default function App() {
+  const [activeModule, setActiveModule] = useState('arrivi');
+  const [menuOpen, setMenuOpen] = useState(false);
   const [currentView, setCurrentView] = useState('dashboard');
   const [poLines, setPoLines] = useState([]);
   const [activeLineKey, setActiveLineKey] = useState(null);
@@ -67,7 +69,8 @@ export default function App() {
 
   const [filterInvoice, setFilterInvoice] = useState('');
   const [filterItem, setFilterItem] = useState('');
-  const [filterSN, setFilterSN] = useState('Yes');
+  const [filterSNYes, setFilterSNYes] = useState(true);
+  const [filterSNNo, setFilterSNNo] = useState(false);
   const [downloadedKeys, setDownloadedKeys] = useState(new Set());
 
   const scannerInputRef = useRef(null);
@@ -561,30 +564,70 @@ export default function App() {
   const filteredLines = poLines.filter(line => {
     const matchInvoice = !filterInvoice || line.china_invoice === filterInvoice;
     const matchItem = !filterItem || line.item_code === filterItem;
-    // Treat null/undefined sn_required as true (default: SN required)
     const snRequired = line.sn_required == null ? true : line.sn_required;
-    let matchSN = true;
-    if (filterSN === 'Yes') matchSN = snRequired === true;
-    if (filterSN === 'No') matchSN = snRequired === false;
+    const matchSN = (snRequired && filterSNYes) || (!snRequired && filterSNNo);
     return matchInvoice && matchItem && matchSN;
   });
 
+  // Raggruppa per invoice + sn_required
   const invoiceGroups = {};
   filteredLines.forEach(line => {
-    if (!invoiceGroups[line.china_invoice]) invoiceGroups[line.china_invoice] = [];
-    invoiceGroups[line.china_invoice].push(line);
+    const snRequired = line.sn_required == null ? true : line.sn_required;
+    const groupKey = `${line.china_invoice}__${snRequired ? 'yes' : 'no'}`;
+    if (!invoiceGroups[groupKey]) invoiceGroups[groupKey] = { invoice: line.china_invoice, snRequired, lines: [] };
+    invoiceGroups[groupKey].lines.push(line);
   });
 
   return (
     <div className="bg-gray-50 font-sans min-h-screen text-gray-800 flex flex-col justify-between">
 
-      <header className="bg-white border-b border-gray-200 sticky top-0 z-50 shadow-xs">
-        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-4 flex justify-between items-center">
-          <div className="flex items-center gap-4">
-            <img src="/logo.png" alt="Logo" className="h-12 sm:h-16 w-auto object-contain" />
-            <h1 className="text-xl sm:text-2xl font-black tracking-tight text-gray-800 uppercase tracking-widest">Piano Arrivi</h1>
+      {/* Overlay menu */}
+      {menuOpen && (
+        <div className="fixed inset-0 z-50 flex">
+          <div className="fixed inset-0 bg-black/40" onClick={() => setMenuOpen(false)} />
+          <div className="relative z-10 w-72 bg-white h-full shadow-2xl flex flex-col">
+            <div className="p-5 border-b border-gray-100 flex items-center justify-between">
+              <img src="/logo.png" alt="Logo" className="h-10 w-auto object-contain" />
+              <button onClick={() => setMenuOpen(false)} className="text-gray-400 hover:text-gray-700 text-2xl leading-none cursor-pointer">✕</button>
+            </div>
+            <nav className="flex-grow p-4 space-y-1">
+              {[
+                { id: 'arrivi', label: 'Piano Arrivi', icon: '📦' },
+                { id: 'spare-parts', label: 'DB Spare Parts', icon: '🔧' },
+                { id: 'stock', label: 'Stock', icon: '🗄️' },
+              ].map(mod => (
+                <button
+                  key={mod.id}
+                  onClick={() => { setActiveModule(mod.id); setMenuOpen(false); setCurrentView('dashboard'); }}
+                  className={`w-full flex items-center gap-3 px-4 py-3 rounded-xl text-sm font-bold transition cursor-pointer text-left ${activeModule === mod.id ? 'bg-blue-600 text-white' : 'text-gray-700 hover:bg-gray-100'}`}
+                >
+                  <span className="text-lg">{mod.icon}</span>
+                  {mod.label}
+                </button>
+              ))}
+            </nav>
           </div>
-          {currentView === 'scan' && (
+        </div>
+      )}
+
+      <header className="bg-white border-b border-gray-200 sticky top-0 z-40 shadow-xs">
+        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-4 flex justify-between items-center">
+          <div className="flex items-center gap-3">
+            <button onClick={() => setMenuOpen(true)} className="p-2 rounded-xl hover:bg-gray-100 transition cursor-pointer" aria-label="Menu">
+              <div className="space-y-1.5">
+                <span className="block w-6 h-0.5 bg-gray-700"></span>
+                <span className="block w-6 h-0.5 bg-gray-700"></span>
+                <span className="block w-6 h-0.5 bg-gray-700"></span>
+              </div>
+            </button>
+            <img src="/logo.png" alt="Logo" className="h-12 sm:h-16 w-auto object-contain" />
+            <h1 className="text-xl sm:text-2xl font-black tracking-tight text-gray-800 uppercase tracking-widest">
+              {activeModule === 'arrivi' && 'Piano Arrivi'}
+              {activeModule === 'spare-parts' && 'DB Spare Parts'}
+              {activeModule === 'stock' && 'Stock'}
+            </h1>
+          </div>
+          {activeModule === 'arrivi' && currentView === 'scan' && (
             <button className="bg-gray-100 hover:bg-gray-200 text-gray-700 text-xs sm:text-sm font-bold px-4 py-2.5 rounded-xl cursor-pointer transition" onClick={resetToDashboard}>
               ← Torna alla Dashboard
             </button>
@@ -600,7 +643,25 @@ export default function App() {
           </div>
         )}
 
-        {/* ==================== VISTA 1: DASHBOARD ==================== */}
+        {/* ==================== MODULI SPARE PARTS / STOCK ==================== */}
+        {activeModule === 'spare-parts' && (
+          <div className="flex flex-col items-center justify-center py-24 text-center space-y-3">
+            <span className="text-5xl">🔧</span>
+            <h2 className="text-xl font-black text-gray-700">DB Spare Parts</h2>
+            <p className="text-sm text-gray-400">Modulo in sviluppo.</p>
+          </div>
+        )}
+        {activeModule === 'stock' && (
+          <div className="flex flex-col items-center justify-center py-24 text-center space-y-3">
+            <span className="text-5xl">🗄️</span>
+            <h2 className="text-xl font-black text-gray-700">Stock</h2>
+            <p className="text-sm text-gray-400">Modulo in sviluppo.</p>
+          </div>
+        )}
+
+        {/* ==================== MODULO PIANO ARRIVI ==================== */}
+        {activeModule === 'arrivi' && (
+        <>{/* ==================== VISTA 1: DASHBOARD ==================== */}
         {currentView === 'dashboard' && (
           <div className="space-y-6">
 
@@ -646,13 +707,18 @@ export default function App() {
                         {uniqueItems.map(it => <option key={it} value={it}>{it}</option>)}
                       </select>
                     </div>
-                    <div className="space-y-1">
+                    <div className="space-y-2">
                       <label className="block text-xs font-bold text-gray-500">Tracciamento Matricole (SN):</label>
-                      <select value={filterSN} onChange={e => setFilterSN(e.target.value)} className="w-full bg-gray-50 border border-gray-300 rounded-xl p-2.5 text-xs sm:text-sm focus:outline-hidden">
-                        <option value="">Tutti</option>
-                        <option value="Yes">SN: Sì (con tracciamento matricole)</option>
-                        <option value="No">SN: No (solo quantità)</option>
-                      </select>
+                      <div className="flex gap-4">
+                        <label className="flex items-center gap-2 cursor-pointer">
+                          <input type="checkbox" checked={filterSNYes} onChange={e => setFilterSNYes(e.target.checked)} className="w-4 h-4 accent-blue-600 cursor-pointer" />
+                          <span className="text-sm font-semibold text-gray-700">Serializzato</span>
+                        </label>
+                        <label className="flex items-center gap-2 cursor-pointer">
+                          <input type="checkbox" checked={filterSNNo} onChange={e => setFilterSNNo(e.target.checked)} className="w-4 h-4 accent-blue-600 cursor-pointer" />
+                          <span className="text-sm font-semibold text-gray-700">Solo quantità</span>
+                        </label>
+                      </div>
                     </div>
                   </div>
                 </div>
@@ -668,13 +734,19 @@ export default function App() {
                 </div>
 
                 <div className="space-y-8">
-                  {Object.keys(invoiceGroups).map(invoice => (
-                    <div key={invoice} className="bg-gray-100/60 p-4 sm:p-5 rounded-2xl border border-gray-200/80 space-y-3">
+                  {Object.values(invoiceGroups).map(group => (
+                    <div key={`${group.invoice}_${group.snRequired}`} className="bg-gray-100/60 p-4 sm:p-5 rounded-2xl border border-gray-200/80 space-y-3">
                       <div className="flex justify-between items-center border-b border-gray-200 pb-2">
-                        <span className="text-sm sm:text-base font-black text-gray-800 tracking-tight">📄 China Invoice: {invoice}</span>
+                        <div className="flex flex-wrap items-center gap-2">
+                          <span className="text-sm sm:text-base font-black text-gray-800 tracking-tight">📄 {group.invoice}</span>
+                          {group.snRequired
+                            ? <span className="text-[10px] bg-indigo-50 text-indigo-700 border border-indigo-200 font-bold px-2 py-0.5 rounded-md">Serializzato</span>
+                            : <span className="text-[10px] bg-gray-100 text-gray-500 border border-gray-200 font-bold px-2 py-0.5 rounded-md">Solo quantità</span>
+                          }
+                        </div>
                       </div>
                       <div className="flex flex-col space-y-3">
-                        {invoiceGroups[invoice].map(item => {
+                        {group.lines.map(item => {
                           const snRequired = item.sn_required == null ? true : item.sn_required;
                           const isConfirmed = item.is_user_confirmed === true;
                           return (
@@ -956,6 +1028,7 @@ export default function App() {
             </div>
           </div>
         )}
+        </>)}
 
       </main>
 
