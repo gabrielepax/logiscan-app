@@ -2856,9 +2856,12 @@ export default function App() {
                   </button>
                 )}
               </div>
+              {scannedSerials.length > 50 && (
+                <p className="text-[11px] text-gray-400 italic">Mostrate le ultime 50 di {scannedSerials.length} matricole rilevate.</p>
+              )}
               <ul className="divide-y divide-gray-100 max-h-64 md:max-h-[500px] overflow-y-auto font-mono text-sm pr-1">
-                {scannedSerials.map((s, index) => (
-                  <li key={index} className="py-2.5 flex items-center gap-3 border-b border-gray-100 last:border-none group">
+                {scannedSerials.slice(0, 50).map((s) => (
+                  <li key={s.serial} className="py-2.5 flex items-center gap-3 border-b border-gray-100 last:border-none group">
                     <div className="flex-grow min-w-0">
                       <div className="flex items-center justify-between">
                         <span className="font-bold text-gray-900 text-base">🟢 {s.serial}</span>
