@@ -161,6 +161,7 @@ export default function App() {
     fetchSpareParts();
     fetchStock();
     fetchPrelievi();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   useEffect(() => {
@@ -189,12 +190,27 @@ export default function App() {
     return () => window.removeEventListener('click', handleGlobalClick);
   }, [currentView]);
 
+  // Helper: carica TUTTE le righe di una tabella superando il limite di 1000
+  async function fetchAllRows(table, cols) {
+    const pageSize = 1000;
+    let all = [];
+    let from = 0;
+    while (true) {
+      const { data, error } = await supabase.from(table).select(cols).range(from, from + pageSize - 1);
+      if (error) break;
+      all = [...all, ...(data || [])];
+      if (!data || data.length < pageSize) break;
+      from += pageSize;
+    }
+    return all;
+  }
+
   async function fetchPOLines() {
     setLoading(true);
-    const [{ data, error }, { data: scannedKeys }, { data: cartonData }] = await Promise.all([
+    const [{ data, error }, scannedKeys, cartonData] = await Promise.all([
       supabase.from('po_lines').select('*').order('arrival_date', { ascending: true }),
-      supabase.from('scanned_serials').select('po_line_key'),
-      supabase.from('carton_arrivals').select('po_line_key, quantita, invoice, codice')
+      fetchAllRows('scanned_serials', 'po_line_key'),
+      fetchAllRows('carton_arrivals', 'po_line_key, quantita, invoice, codice')
     ]);
 
     if (error) {
@@ -2550,7 +2566,7 @@ export default function App() {
                                 )}
                                 {snRequired && !isConfirmed && (
                                   <button onClick={() => startScanningSession(item)} className="bg-blue-600 hover:bg-blue-700 text-white text-xs font-bold px-3 py-2 rounded-xl transition cursor-pointer shadow-xs whitespace-nowrap">
-                                    {item.scanned_count >= item.qty_expected && item.scanned_count > 0 ? 'Modifica' : 'Avvia'}
+                                    {item.scanned_count > 0 ? 'Modifica' : 'Avvia'}
                                   </button>
                                 )}
                               </div>
