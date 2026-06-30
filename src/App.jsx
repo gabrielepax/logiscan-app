@@ -1031,7 +1031,7 @@ export default function App() {
       try {
         const wb = XLSX.read(e.target.result, { type: 'array' });
         const ws = wb.Sheets[wb.SheetNames[0]];
-        snRecords = XLSX.utils.sheet_to_json(ws, { defval: '' });
+        snRecords = XLSX.utils.sheet_to_json(ws, { defval: '', blankrows: false, raw: false });
       } catch {
         alert("Errore: impossibile leggere il file. Assicurati che sia un file Excel (.xls/.xlsx).");
         setLoading(false);
@@ -1045,6 +1045,23 @@ export default function App() {
       }
 
       const validRows = snRecords.filter(row => String(row['SN']).trim() !== '');
+
+      // Rileva serial duplicati nel file
+      const seenSerials = new Set();
+      const duplicateSerials = [];
+      validRows.forEach(row => {
+        const sn = String(row['SN']).trim();
+        if (seenSerials.has(sn)) duplicateSerials.push(sn);
+        else seenSerials.add(sn);
+      });
+      if (duplicateSerials.length > 0) {
+        const proceed = window.confirm(
+          `Attenzione: il file contiene ${duplicateSerials.length} matricole DUPLICATE:\n\n` +
+          `${[...new Set(duplicateSerials)].slice(0, 10).join(', ')}${duplicateSerials.length > 10 ? '...' : ''}\n\n` +
+          `Verranno caricate solo le matricole univoche (${seenSerials.size}). Procedere?`
+        );
+        if (!proceed) { setLoading(false); return; }
+      }
 
       const qtyProvided = validRows.length;
       const qtyExpected = line.qty_expected;
@@ -1090,19 +1107,35 @@ export default function App() {
         sn_loaded: fullyMatched
       }).eq('unique_key', line.unique_key);
 
-      const serialsToInsert = validRows.map(row => ({
-        po_line_key: line.unique_key,
-        serial: String(row['SN']).trim(),
-        model: String(row['Model'] || 'N/D').trim(),
-        pn: String(row['PN'] || 'N/D').trim()
-      }));
+      // Deduplica per serial (la chiave del controllo è il serial univoco)
+      const dedup = new Map();
+      validRows.forEach(row => {
+        const sn = String(row['SN']).trim();
+        if (!dedup.has(sn)) dedup.set(sn, {
+          po_line_key: line.unique_key,
+          serial: sn,
+          model: String(row['Model'] || 'N/D').trim(),
+          pn: String(row['PN'] || 'N/D').trim()
+        });
+      });
+      const serialsToInsert = [...dedup.values()];
 
-      const { error } = await supabase.from('expected_serials').insert(serialsToInsert);
-      if (error) {
-        alert("Errore nel caricamento delle matricole: " + error.message);
+      // Inserimento a blocchi di 500 per evitare limiti di payload
+      const CHUNK = 500;
+      let insertErr = null;
+      for (let i = 0; i < serialsToInsert.length; i += CHUNK) {
+        const { error } = await supabase.from('expected_serials').insert(serialsToInsert.slice(i, i + CHUNK));
+        if (error) { insertErr = error; break; }
+      }
+
+      if (insertErr) {
+        alert("Errore nel caricamento delle matricole: " + insertErr.message);
       } else {
+        // Conteggio reale dal DB
+        const { count } = await supabase.from('expected_serials')
+          .select('*', { count: 'exact', head: true }).eq('po_line_key', line.unique_key);
         await fetchPOLines();
-        alert(`Matricole caricate: ${serialsToInsert.length} SN per la riga ${line.item_code}.`);
+        alert(`Matricole caricate: ${count} SN salvate (file: ${qtyProvided} righe, univoche: ${serialsToInsert.length}).`);
       }
     };
     reader.readAsArrayBuffer(file);
@@ -1115,16 +1148,25 @@ export default function App() {
     setActiveLine(line);
     setCartonsScanned(line.cartons_scanned || 0);
 
-    const { data: expectedData } = await supabase
-      .from('expected_serials')
-      .select('serial, model, pn')
-      .eq('po_line_key', line.unique_key);
+    // Fetch paginato per superare il limite di 1000 righe di Supabase
+    const fetchAllByLine = async (table, cols, orderCol) => {
+      const pageSize = 1000;
+      let all = [];
+      let from = 0;
+      while (true) {
+        let qy = supabase.from(table).select(cols).eq('po_line_key', line.unique_key).range(from, from + pageSize - 1);
+        if (orderCol) qy = qy.order(orderCol, { ascending: false });
+        const { data, error } = await qy;
+        if (error) { alert(`Errore caricamento ${table}: ${error.message}`); break; }
+        all = [...all, ...(data || [])];
+        if (!data || data.length < pageSize) break;
+        from += pageSize;
+      }
+      return all;
+    };
 
-    const { data: scannedData } = await supabase
-      .from('scanned_serials')
-      .select('serial, model, pn, scanned_at')
-      .eq('po_line_key', line.unique_key)
-      .order('scanned_at', { ascending: false });
+    const expectedData = await fetchAllByLine('expected_serials', 'serial, model, pn', null);
+    const scannedData = await fetchAllByLine('scanned_serials', 'serial, model, pn, scanned_at', 'scanned_at');
 
     const expectedMap = {};
     if (expectedData) {
