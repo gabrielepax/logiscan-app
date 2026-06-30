@@ -39,29 +39,19 @@ function playBeep({ frequency = 880, duration = 0.12, type = 'sine', volume = 0.
 }
 
 const sounds = {
-  // Scansione singola OK — bip acuto breve
+  // OK matricola SINGOLA — bip singolo acuto
   ok() {
     playBeep({ frequency: 1320, duration: 0.1, type: 'sine', volume: 0.35 });
   },
-  // Cartone QR OK — doppio bip ascendente
+  // OK QR leggibile (ID cartone accessori / QR scatola matricole) — doppio bip
   carton() {
-    playBeep({ frequency: 880, duration: 0.09, type: 'sine', volume: 0.35, delay: 0 });
-    playBeep({ frequency: 1320, duration: 0.12, type: 'sine', volume: 0.4, delay: 0.12 });
+    playBeep({ frequency: 1180, duration: 0.09, type: 'sine', volume: 0.35, delay: 0 });
+    playBeep({ frequency: 1180, duration: 0.11, type: 'sine', volume: 0.4, delay: 0.13 });
   },
-  // Scansione completata — tre note ascendenti
-  complete() {
-    playBeep({ frequency: 880,  duration: 0.1, volume: 0.35, delay: 0 });
-    playBeep({ frequency: 1100, duration: 0.1, volume: 0.38, delay: 0.13 });
-    playBeep({ frequency: 1320, duration: 0.18, volume: 0.42, delay: 0.26 });
-  },
-  // Errore — bip basso lungo
+  // ERRORE unificato — segnale grave e marcato (doppio tono basso discendente)
   error() {
-    playBeep({ frequency: 220, duration: 0.35, type: 'square', volume: 0.25 });
-  },
-  // Duplicato — doppio bip medio
-  duplicate() {
-    playBeep({ frequency: 520, duration: 0.1, type: 'sine', volume: 0.3, delay: 0 });
-    playBeep({ frequency: 520, duration: 0.1, type: 'sine', volume: 0.3, delay: 0.15 });
+    playBeep({ frequency: 200, duration: 0.22, type: 'square', volume: 0.3, delay: 0 });
+    playBeep({ frequency: 140, duration: 0.32, type: 'square', volume: 0.3, delay: 0.2 });
   },
 };
 
@@ -523,7 +513,7 @@ export default function App() {
     const duplicate = arrivoQtyCartoni.find(c => c.idCartone === raw);
     if (duplicate) {
       setArrivoQtyFeedback({ text: 'Duplicato! Cartone già rilevato.', type: 'error' });
-      sounds.duplicate(); triggerVibration([100, 50, 100]);
+      sounds.error(); triggerVibration([300]);
       return;
     }
     const matchedLine = checkCodiceInPianoArrivi(parsed.codice);
@@ -536,7 +526,7 @@ export default function App() {
       setPoLines(prev => prev.map(l => l.unique_key === matchedLine.unique_key ? { ...l, qty_loaded: (l.qty_loaded || 0) + parsed.quantita } : l));
     }
     setArrivoQtyFeedback({ text: `OK: ${parsed.codice} — qtà ${parsed.quantita}`, type: 'success' });
-    sounds.ok(); triggerVibration([150]);
+    sounds.carton(); triggerVibration([150, 100, 150]);
   }
 
   async function addCartonManuale() {
@@ -755,7 +745,7 @@ export default function App() {
   function addPrelievoRiga(stockRow, quantita) {
     if (prelievoRighe.some(r => r.stockId === stockRow.id)) {
       setPrelievoFeedback({ text: 'Questa riga di stock è già nel prelievo.', type: 'error' });
-      sounds.duplicate(); triggerVibration([100, 50, 100]);
+      sounds.error(); triggerVibration([300]);
       return false;
     }
     const qta = parseFloat(quantita);
@@ -774,7 +764,6 @@ export default function App() {
       quantita: qta,
       qtaDisponibile: stockRow.stock,
     }, ...prev]);
-    sounds.ok(); triggerVibration([150]);
     return true;
   }
 
@@ -787,14 +776,25 @@ export default function App() {
 
     // Cerca riga stock per id_cartone (sia QR grezzo che id manuale)
     const stockRow = stockItems.find(s => (s.carton_ids || []).includes(raw));
-    if (!stockRow) {
-      setPrelievoFeedback({ text: `Nessun cartone trovato in inventario con ID: ${raw}`, type: 'error' });
-      sounds.error(); triggerVibration([300]);
+    if (stockRow) {
+      if (addPrelievoRiga(stockRow, stockRow.stock)) {
+        setPrelievoFeedback({ text: `OK: ${stockRow.codice} — disp. ${stockRow.stock} (modificabile)`, type: 'success' });
+        sounds.carton(); triggerVibration([150, 100, 150]);
+      }
       return;
     }
-    if (addPrelievoRiga(stockRow, stockRow.stock)) {
-      setPrelievoFeedback({ text: `OK: ${stockRow.codice} — disp. ${stockRow.stock} (modificabile)`, type: 'success' });
+
+    // Non trovato come id_cartone: prova a interpretare il QR per estrarre codice + quantità
+    const parsed = parseCartonQR(raw);
+    if (parsed) {
+      setPrelievoManuale({ codice: parsed.codice, stockId: '', quantita: parsed.quantita });
+      setPrelievoFeedback({ text: `Cartone non in inventario per ID. Codice ${parsed.codice} (qtà ${parsed.quantita}) precompilato: seleziona l'ubicazione e premi +.`, type: 'warning' });
+      sounds.carton(); triggerVibration([150, 100, 150]);
+      return;
     }
+
+    setPrelievoFeedback({ text: `Nessun cartone trovato per ID: ${raw}`, type: 'error' });
+    sounds.error(); triggerVibration([300]);
   }
 
   function addPrelievoManuale() {
@@ -805,6 +805,7 @@ export default function App() {
     if (addPrelievoRiga(stockRow, quantita || stockRow.stock)) {
       setPrelievoManuale({ codice: '', stockId: '', quantita: '' });
       setPrelievoFeedback({ text: `Aggiunto: ${stockRow.codice} — qtà ${quantita || stockRow.stock}`, type: 'success' });
+      sounds.ok(); triggerVibration([150]);
     }
   }
 
@@ -990,6 +991,16 @@ export default function App() {
 
       const existingKeys = new Set(existing.map(l => l.unique_key));
 
+      // Trova in modo flessibile la colonna del vendor part number (ignora maiuscole/spazi/parentesi)
+      const norm = s => String(s).toLowerCase().replace(/[^a-z0-9]/g, '');
+      const findVendorPN = (row) => {
+        const key = Object.keys(row).find(k => {
+          const n = norm(k);
+          return n.includes('vendorpartnumber') || n.includes('vendorpn') || n === 'vpn';
+        });
+        return key ? String(row[key] || '').trim() : '';
+      };
+
       const rowsToUpsert = records.map(row => {
         const poInternalId = row["PO INTERNAL ID"];
         const lineId = row["Line ID"];
@@ -1007,7 +1018,7 @@ export default function App() {
           china_invoice: chinaInvoice,
           item_code: itemCode,
           arrival_date: row["DATA DI ARRIVO"] || "N/D",
-          part_number: row["[PAX] Vendor Part Number"] || itemCode,
+          part_number: findVendorPN(row),
         };
         // sn_required comes from the "SN" column in the CSV (Yes/Si = true, anything else = false)
         const snValue = (row["SN"] || "").trim().toLowerCase();
@@ -1054,15 +1065,54 @@ export default function App() {
         return;
       }
 
-      if (snRecords.length === 0 || !Object.hasOwn(snRecords[0], 'SN')) {
-        alert("Errore: impossibile trovare la colonna 'SN' nel file delle matricole.");
+      if (snRecords.length === 0) {
+        alert("Errore: il file è vuoto o non leggibile.");
         setLoading(false);
         return;
       }
 
-      const validRows = snRecords.filter(row => String(row['SN']).trim() !== '');
+      const cols = Object.keys(snRecords[0]);
+      const hasSN = cols.includes('SN');
+      const hasPN = cols.includes('PN');
 
-      // Rileva serial duplicati nel file
+      const errors = [];
+
+      // 1. Presenza colonne obbligatorie
+      if (!hasSN) errors.push(`• Colonna "SN" mancante nel file.`);
+      if (!hasPN) errors.push(`• Colonna "PN" mancante nel file.`);
+
+      const validRows = hasSN ? snRecords.filter(row => String(row['SN']).trim() !== '') : [];
+      const qtyProvided = validRows.length;
+      const qtyExpected = line.qty_expected;
+
+      // 2. Corrispondenza quantità
+      if (hasSN && qtyProvided !== qtyExpected) {
+        errors.push(`• QUANTITÀ non corrispondente:\n   Attese: ${qtyExpected} pz — Fornite: ${qtyProvided} pz`);
+      }
+
+      // 3. Corrispondenza VPN / PN (case/spazi-insensitive)
+      const normPN = s => String(s || '').trim().toLowerCase().replace(/\s+/g, '');
+      const expectedPN = (line.part_number || '').trim();
+      if (!expectedPN || expectedPN === 'N/D') {
+        errors.push(`• VPN non presente sulla riga del piano arrivi: impossibile verificare la corrispondenza Part Number.`);
+      } else if (hasPN) {
+        const expN = normPN(expectedPN);
+        const mismatchedPNs = [...new Set(
+          validRows.map(row => String(row['PN'] || '').trim()).filter(pn => pn !== '' && normPN(pn) !== expN)
+        )];
+        if (mismatchedPNs.length > 0) {
+          errors.push(`• PART NUMBER non corrispondente:\n   VPN atteso: ${expectedPN}\n   PN nel file: ${mismatchedPNs.slice(0, 5).join(', ')}${mismatchedPNs.length > 5 ? '...' : ''}`);
+        }
+      }
+
+      // Controlli BLOCCANTI: se anche solo uno fallisce, il caricamento è impedito
+      if (errors.length > 0) {
+        alert(`CARICAMENTO BLOCCATO — il file non rispetta i requisiti:\n\n${errors.join('\n\n')}\n\nCorreggi il file e riprova.`);
+        setLoading(false);
+        return;
+      }
+
+      // Avviso (non bloccante) sui serial duplicati: vengono caricati solo gli univoci
       const seenSerials = new Set();
       const duplicateSerials = [];
       validRows.forEach(row => {
@@ -1079,41 +1129,7 @@ export default function App() {
         if (!proceed) { setLoading(false); return; }
       }
 
-      const qtyProvided = validRows.length;
-      const qtyExpected = line.qty_expected;
-      let fullyMatched = true;
-
-      // Validazione quantità
-      if (qtyProvided !== qtyExpected) {
-        fullyMatched = false;
-        const proceed = window.confirm(
-          `Attenzione: quantità non corrispondente.\n\n` +
-          `Attese: ${qtyExpected} pz\n` +
-          `Fornite nel file: ${qtyProvided} pz\n\n` +
-          `Vuoi procedere comunque?`
-        );
-        if (!proceed) { setLoading(false); return; }
-      }
-
-      // Validazione PN
-      const expectedPN = (line.part_number || '').trim();
-      if (expectedPN && expectedPN !== 'N/D') {
-        const mismatchedPNs = [...new Set(
-          validRows
-            .map(row => String(row['PN'] || '').trim())
-            .filter(pn => pn !== '' && pn !== expectedPN)
-        )];
-        if (mismatchedPNs.length > 0) {
-          fullyMatched = false;
-          const proceed = window.confirm(
-            `Attenzione: il file contiene Part Number non corrispondenti.\n\n` +
-            `PN atteso dalla riga: ${expectedPN}\n` +
-            `PN trovati nel file: ${mismatchedPNs.join(', ')}\n\n` +
-            `Vuoi procedere comunque?`
-          );
-          if (!proceed) { setLoading(false); return; }
-        }
-      }
+      const fullyMatched = true;
 
       await supabase.from('expected_serials').delete().eq('po_line_key', line.unique_key);
       await supabase.from('scanned_serials').delete().eq('po_line_key', line.unique_key);
@@ -1346,11 +1362,9 @@ export default function App() {
         ];
         setScannedSerials(updatedScanned);
         setCartonsScanned(newCartonsCount);
+        triggerVibration([150, 100, 150]); sounds.carton();
         if (updatedScanned.length >= totalExpected) {
-          triggerVibration([150, 100, 150, 100, 200]); sounds.complete();
           setTimeout(() => openReviewSession(), 1200);
-        } else {
-          triggerVibration([150, 100, 150]); sounds.carton();
         }
         setFeedback({ text: `Cartone Rilevato! +${aggiunti.length} matricole acquisite.`, type: 'success' });
       } else {
@@ -1363,7 +1377,7 @@ export default function App() {
       const serial = rawInput;
       const giaLetto = scannedSerials.some(s => s.serial === serial);
       if (giaLetto) {
-        triggerVibration([100, 50, 100]); sounds.duplicate();
+        triggerVibration([300]); sounds.error();
         setFeedback({ text: `Duplicato! Matricola ${serial} già letta.`, type: 'error' });
         return;
       }
@@ -1381,12 +1395,11 @@ export default function App() {
       ];
       setScannedSerials(updatedScanned);
 
+      triggerVibration([150]); sounds.ok();
       if (updatedScanned.length >= totalExpected) {
-        triggerVibration([150, 100, 150, 100, 200]); sounds.complete();
         setFeedback({ text: `Completato! Ultima matricola: ${meta.model}`, type: 'success' });
         setTimeout(() => openReviewSession(), 1200);
       } else {
-        triggerVibration([150]); sounds.ok();
         setFeedback({ text: `OK: Rilevato modello ${meta.model}`, type: 'success' });
       }
     }
@@ -2258,7 +2271,7 @@ export default function App() {
                     className="w-full bg-white border-2 border-blue-500 text-gray-800 font-mono text-base p-4 rounded-xl shadow-inner focus:outline-hidden text-center" />
                 </form>
                 {prelievoFeedback.text && (
-                  <div className={`p-3 rounded-xl text-center text-sm font-bold border ${prelievoFeedback.type === 'success' ? 'bg-green-50 text-green-800 border-green-200' : 'bg-red-50 text-red-800 border-red-200'}`}>
+                  <div className={`p-3 rounded-xl text-center text-sm font-bold border ${prelievoFeedback.type === 'success' ? 'bg-green-50 text-green-800 border-green-200' : prelievoFeedback.type === 'warning' ? 'bg-amber-50 text-amber-800 border-amber-200' : 'bg-red-50 text-red-800 border-red-200'}`}>
                     {prelievoFeedback.text}
                   </div>
                 )}
@@ -2509,8 +2522,8 @@ export default function App() {
                                 <p className="text-xs text-gray-500 font-medium line-clamp-1">{item.description}</p>
                                 <div className="flex flex-wrap gap-x-3 text-[10px] text-gray-400 font-semibold uppercase tracking-wider">
                                   <span>Rif: <span className="text-gray-600 font-mono">{item.po_name}</span></span>
-                                  {item.part_number && item.part_number !== 'N/D' && (
-                                    <span>PN: <span className="text-indigo-600 font-mono font-bold">{item.part_number}</span></span>
+                                  {item.part_number && item.part_number !== 'N/D' && item.part_number !== item.item_code && (
+                                    <span>VPN: <span className="text-indigo-600 font-mono font-bold">{item.part_number}</span></span>
                                   )}
                                 </div>
                               </div>
