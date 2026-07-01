@@ -1,8 +1,12 @@
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef, Fragment } from 'react';
 import { supabase } from './supabaseClient';
 import * as XLSX from 'xlsx';
 import { useColumnWidths } from './useColumnWidths';
 import JsBarcode from 'jsbarcode';
+
+// Moduli work-in-progress da nascondere dal menu (impostare a true per riattivarli)
+const SHOW_WIP_MODULES = false;
+const WIP_MODULE_IDS = ['riepilogo', 'anagrafica'];
 
 const SP_DEFAULT_WIDTHS = {
   pn: 130, terminal_pn: 120, modello: 60, pnit: 80, english_name: 110,
@@ -144,6 +148,18 @@ export default function App() {
   const [prelievoShowEsprinet, setPrelievoShowEsprinet] = useState(false);
   const prelievoScannerRef = useRef(null);
 
+  // Anagrafica Hardware
+  const [hardware, setHardware] = useState([]);
+  const [hwLoading, setHwLoading] = useState(false);
+
+  // Riepilogo Stock
+  const [riepSearch, setRiepSearch] = useState('');
+  const [riepFilterModello, setRiepFilterModello] = useState('');
+  const [riepFilterPnit, setRiepFilterPnit] = useState('');
+  const [riepFilterRef, setRiepFilterRef] = useState(false);
+  const [riepFilterRplus, setRiepFilterRplus] = useState(false);
+  const [riepExpanded, setRiepExpanded] = useState(new Set());
+
   const scannerInputRef = useRef(null);
 
   useEffect(() => {
@@ -151,6 +167,7 @@ export default function App() {
     fetchSpareParts();
     fetchStock();
     fetchPrelievi();
+    fetchHardware();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -250,6 +267,84 @@ export default function App() {
     }
     setSpareParts(all);
     setSpLoading(false);
+  }
+
+  async function fetchHardware() {
+    setHwLoading(true);
+    const pageSize = 1000;
+    let all = [];
+    let from = 0;
+    while (true) {
+      const { data, error } = await supabase.from('hardware').select('*').order('name', { ascending: true }).range(from, from + pageSize - 1);
+      if (error) break;
+      all = [...all, ...(data || [])];
+      if (!data || data.length < pageSize) break;
+      from += pageSize;
+    }
+    setHardware(all);
+    setHwLoading(false);
+  }
+
+  async function handleHardwareUpload(event) {
+    const file = event.target.files[0];
+    if (!file) return;
+    event.target.value = '';
+    setHwLoading(true);
+
+    const reader = new FileReader();
+    reader.onload = async function(e) {
+      let rows;
+      try {
+        const wb = XLSX.read(e.target.result, { type: 'array' });
+        const ws = wb.Sheets[wb.SheetNames[0]];
+        rows = XLSX.utils.sheet_to_json(ws, { defval: '', blankrows: false, raw: false });
+      } catch {
+        alert("Errore: impossibile leggere il file.");
+        setHwLoading(false);
+        return;
+      }
+      if (rows.length === 0) { alert("File vuoto."); setHwLoading(false); return; }
+
+      // Ricerca flessibile delle colonne
+      const norm = s => String(s).toLowerCase().replace(/[^a-z0-9]/g, '');
+      const cols = Object.keys(rows[0]);
+      const colFor = (...cands) => cols.find(k => cands.includes(norm(k)));
+      const cInternal = colFor('internalid');
+      const cName = colFor('name');
+      const cDisplay = colFor('displayname');
+      const cCluster = colFor('paxclusteritem', 'clusteritem', 'cluster');
+
+      if (!cInternal || !cName) {
+        alert("Colonne obbligatorie mancanti: servono almeno 'Internal ID' e 'Name'.");
+        setHwLoading(false);
+        return;
+      }
+
+      const seen = new Set();
+      const toUpsert = rows.filter(r => {
+        const id = String(r[cInternal] || '').trim();
+        if (!id || seen.has(id)) return false;
+        seen.add(id);
+        return true;
+      }).map(r => ({
+        internal_id: String(r[cInternal] || '').trim(),
+        name: String(r[cName] || '').trim(),
+        display_name: cDisplay ? String(r[cDisplay] || '').trim() : '',
+        cluster_item: cCluster ? String(r[cCluster] || '').trim() : '',
+      }));
+
+      // Upsert a blocchi
+      const CHUNK = 500;
+      let err = null;
+      for (let i = 0; i < toUpsert.length; i += CHUNK) {
+        const { error } = await supabase.from('hardware').upsert(toUpsert.slice(i, i + CHUNK), { onConflict: 'internal_id' });
+        if (error) { err = error; break; }
+      }
+      if (err) alert("Errore salvataggio: " + err.message);
+      else { await fetchHardware(); alert(`${toUpsert.length} articoli anagrafica caricati.${cCluster ? '' : '\n\n(Nota: colonna "Cluster Item" non trovata nel file.)'}`); }
+      setHwLoading(false);
+    };
+    reader.readAsArrayBuffer(file);
   }
 
   async function handleSparePartsUpload(event) {
@@ -1233,15 +1328,27 @@ export default function App() {
   async function downloadArrivoCSV(line) {
     setLoading(true);
     setDownloadedKeys(prev => new Set(prev).add(line.unique_key));
-    const { data: scannedData, error } = await supabase
-      .from('scanned_serials')
-      .select('serial, model, pn, scanned_at')
-      .eq('po_line_key', line.unique_key)
-      .order('scanned_at', { ascending: true });
+    // Fetch paginato per superare il limite di 1000 righe di Supabase
+    const pageSize = 1000;
+    let scannedData = [];
+    let from = 0;
+    let fetchErr = null;
+    while (true) {
+      const { data, error } = await supabase
+        .from('scanned_serials')
+        .select('serial, model, pn, scanned_at')
+        .eq('po_line_key', line.unique_key)
+        .order('scanned_at', { ascending: true })
+        .range(from, from + pageSize - 1);
+      if (error) { fetchErr = error; break; }
+      scannedData = [...scannedData, ...(data || [])];
+      if (!data || data.length < pageSize) break;
+      from += pageSize;
+    }
     setLoading(false);
-    if (error) { alert("Errore nel recupero dati: " + error.message); return; }
+    if (fetchErr) { alert("Errore nel recupero dati: " + fetchErr.message); return; }
 
-    buildAndDownloadCSV(line, scannedData || []);
+    buildAndDownloadCSV(line, scannedData);
   }
 
   function buildAndDownloadCSV(line, serials) {
@@ -1471,8 +1578,10 @@ export default function App() {
                 { id: 'arrivi', label: 'Piano Arrivi', icon: '📦' },
                 { id: 'spare-parts', label: 'DB Spare Parts', icon: '🔧' },
                 { id: 'stock', label: 'Inventario Spare Parts', icon: '🗄️' },
+                { id: 'riepilogo', label: 'Riepilogo Stock', icon: '📊' },
                 { id: 'prelievi', label: 'Prelievi', icon: '📤' },
-              ].map(mod => (
+                { id: 'anagrafica', label: 'Anagrafica', icon: '📇' },
+              ].filter(mod => SHOW_WIP_MODULES || !WIP_MODULE_IDS.includes(mod.id)).map(mod => (
                 <button
                   key={mod.id}
                   onClick={() => { setActiveModule(mod.id); setMenuOpen(false); setCurrentView('dashboard'); if (mod.id === 'prelievi') { setPrelievoView('list'); fetchPrelievi(); } }}
@@ -1502,7 +1611,9 @@ export default function App() {
               {activeModule === 'arrivi' && 'Piano Arrivi'}
               {activeModule === 'spare-parts' && 'DB Spare Parts'}
               {activeModule === 'stock' && 'Inventario Spare Parts'}
+              {activeModule === 'riepilogo' && 'Riepilogo Stock'}
               {activeModule === 'prelievi' && 'Prelievi'}
+              {activeModule === 'anagrafica' && 'Anagrafica'}
             </h1>
           </div>
           {activeModule === 'arrivi' && currentView === 'scan' && (
@@ -2090,6 +2201,199 @@ export default function App() {
             </div>
           );
         })()}
+
+        {/* ==================== MODULO RIEPILOGO STOCK ==================== */}
+        {activeModule === 'riepilogo' && (() => {
+          // Stock totale per codice
+          const stockByCodice = {};
+          stockItems.forEach(s => { if (s.stock > 0) stockByCodice[s.codice] = (stockByCodice[s.codice] || 0) + s.stock; });
+
+          // Info per pn dal DB spare parts
+          const pnInfo = {};
+          spareParts.forEach(p => {
+            const mod = (p.terminal_pn || '').split('-')[0];
+            if (!pnInfo[p.pn]) pnInfo[p.pn] = { models: new Set(), type: '', ref: '', rplus: '', descrizione: '', eol: '', pnits: new Set() };
+            const inf = pnInfo[p.pn];
+            if (mod) inf.models.add(mod);
+            if (!inf.type && p.type) inf.type = p.type;
+            if (!inf.ref && p.ref) inf.ref = p.ref;
+            if (!inf.rplus && p.rplus) inf.rplus = p.rplus;
+            if (!inf.eol && p.eol) inf.eol = p.eol;
+            if (!inf.descrizione && (p.descrizione || p.english_name)) inf.descrizione = p.descrizione || p.english_name;
+            if ((p.pnit || '').trim()) inf.pnits.add(p.pnit.trim());
+          });
+
+          // Liste filtri CONNESSE: la selezione su un filtro restringe le opzioni dell'altro
+          const tuttiModelli = new Set();
+          const tuttiPnit = new Set();
+          Object.values(pnInfo).forEach(inf => {
+            if (!riepFilterPnit || inf.pnits.has(riepFilterPnit)) {
+              inf.models.forEach(m => tuttiModelli.add(m));
+            }
+            if (!riepFilterModello || inf.models.has(riepFilterModello)) {
+              inf.pnits.forEach(p => tuttiPnit.add(p));
+            }
+          });
+          if (riepFilterModello) tuttiModelli.add(riepFilterModello);
+          if (riepFilterPnit) tuttiPnit.add(riepFilterPnit);
+          const modelliList = [...tuttiModelli].sort();
+          const pnitList = [...tuttiPnit].sort();
+
+          const q = riepSearch.trim().toLowerCase();
+          // Costruisci elenco codici con stock, applicando filtri
+          const codici = Object.keys(stockByCodice).filter(c => {
+            const inf = pnInfo[c] || { models: new Set(), type: '', ref: '', rplus: '', descrizione: '', pnits: new Set() };
+            if (riepFilterRef && inf.ref !== 'X') return false;
+            if (riepFilterRplus && inf.rplus !== 'X') return false;
+            if (riepFilterModello && !inf.models.has(riepFilterModello)) return false;
+            if (riepFilterPnit && !inf.pnits.has(riepFilterPnit)) return false;
+            if (q) {
+              const hay = `${c} ${inf.type} ${inf.descrizione} ${[...inf.models].join(' ')} ${[...inf.pnits].join(' ')}`.toLowerCase();
+              if (!hay.includes(q)) return false;
+            }
+            return true;
+          });
+
+          // Raggruppamento per TYPE
+          const groups = {};
+          codici.forEach(c => {
+            const inf = pnInfo[c] || { models: new Set(), type: '', ref: '', rplus: '', descrizione: '' };
+            const stock = stockByCodice[c];
+            const type = inf.type || '—';
+            if (!groups[type]) groups[type] = { key: type, type, totale: 0, codici: [] };
+            groups[type].totale += stock;
+            groups[type].codici.push({ codice: c, descrizione: inf.descrizione, ref: inf.ref, rplus: inf.rplus, eol: inf.eol, models: [...inf.models], stock });
+          });
+          const groupList = Object.values(groups).sort((a, b) => a.type.localeCompare(b.type));
+          const totaleGenerale = groupList.reduce((s, g) => s + g.totale, 0);
+
+          const toggleGroup = (key) => setRiepExpanded(prev => { const n = new Set(prev); if (n.has(key)) n.delete(key); else n.add(key); return n; });
+
+          return (
+            <div className="space-y-5">
+              {/* Controlli */}
+              <div className="bg-white p-4 rounded-2xl border border-gray-200 shadow-xs space-y-3">
+                <div className="flex flex-wrap items-center gap-3">
+                  <select value={riepFilterModello} onChange={e => { setRiepFilterModello(e.target.value); setRiepExpanded(new Set()); }}
+                    className="bg-gray-50 border border-gray-300 rounded-xl p-2.5 text-xs focus:outline-hidden">
+                    <option value="">Tutti i modelli ({modelliList.length})</option>
+                    {modelliList.map(m => <option key={m} value={m}>{m}</option>)}
+                  </select>
+                  <select value={riepFilterPnit} onChange={e => { setRiepFilterPnit(e.target.value); setRiepExpanded(new Set()); }}
+                    className="bg-gray-50 border border-gray-300 rounded-xl p-2.5 text-xs focus:outline-hidden">
+                    <option value="">Tutti i PNIT ({pnitList.length})</option>
+                    {pnitList.map(p => <option key={p} value={p}>{p}</option>)}
+                  </select>
+                  <input value={riepSearch} onChange={e => setRiepSearch(e.target.value)}
+                    placeholder="Cerca per type, codice, descrizione..."
+                    className="flex-grow min-w-[200px] bg-gray-50 border border-gray-300 rounded-xl p-2.5 text-xs focus:outline-hidden" />
+                  <label className="flex items-center gap-2 cursor-pointer">
+                    <input type="checkbox" checked={riepFilterRef} onChange={e => setRiepFilterRef(e.target.checked)} className="w-4 h-4 accent-blue-600 cursor-pointer" />
+                    <span className="text-xs font-semibold text-gray-700">Solo REF</span>
+                  </label>
+                  <label className="flex items-center gap-2 cursor-pointer">
+                    <input type="checkbox" checked={riepFilterRplus} onChange={e => setRiepFilterRplus(e.target.checked)} className="w-4 h-4 accent-blue-600 cursor-pointer" />
+                    <span className="text-xs font-semibold text-gray-700">Solo R+</span>
+                  </label>
+                </div>
+                <div className="flex items-center justify-between text-[11px] text-gray-500">
+                  <span>{groupList.length} gruppi · {codici.length} codici</span>
+                  <span className="font-black text-blue-600">Stock totale: {totaleGenerale}</span>
+                </div>
+              </div>
+
+              {/* Tabella gruppi */}
+              {groupList.length > 0 ? (
+                <div className="bg-white rounded-2xl border border-gray-200 shadow-xs overflow-hidden">
+                  <table className="w-full text-left border-collapse text-xs">
+                    <thead className="bg-gray-50 border-b border-gray-200 text-[10px] font-black text-gray-500 uppercase tracking-wider">
+                      <tr>
+                        <th className="px-3 py-3 w-8"></th>
+                        <th className="px-3 py-3">Type</th>
+                        <th className="px-3 py-3 text-right">N. Codici</th>
+                        <th className="px-3 py-3 text-right">Stock Totale</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-gray-100">
+                      {groupList.map(g => (
+                        <Fragment key={g.key}>
+                          <tr className="hover:bg-blue-50/50 transition cursor-pointer font-bold" onClick={() => toggleGroup(g.key)}>
+                            <td className="px-3 py-2.5 text-gray-400">{riepExpanded.has(g.key) ? '▾' : '▸'}</td>
+                            <td className="px-3 py-2.5 text-gray-700">{g.type}</td>
+                            <td className="px-3 py-2.5 text-right font-mono">{g.codici.length}</td>
+                            <td className="px-3 py-2.5 text-right font-mono font-black text-blue-700">{g.totale}</td>
+                          </tr>
+                          {riepExpanded.has(g.key) && (
+                            <tr>
+                              <td colSpan={4} className="p-0">
+                                <table className="w-full text-[11px] bg-gray-50/60">
+                                  <thead className="text-[9px] font-black text-gray-400 uppercase">
+                                    <tr>
+                                      <th className="px-3 py-1.5 text-left pl-10">Codice</th>
+                                      <th className="px-3 py-1.5 text-left">Descrizione</th>
+                                      <th className="px-3 py-1.5 text-left">Modelli</th>
+                                      <th className="px-3 py-1.5 text-center">ST.</th>
+                                      <th className="px-3 py-1.5 text-center">REF</th>
+                                      <th className="px-3 py-1.5 text-center">R+</th>
+                                      <th className="px-3 py-1.5 text-right">Stock</th>
+                                    </tr>
+                                  </thead>
+                                  <tbody>
+                                    {g.codici.sort((a, b) => b.stock - a.stock).map(c => (
+                                      <tr key={c.codice} className="border-t border-gray-100">
+                                        <td className="px-3 py-1.5 pl-10 font-mono font-bold text-blue-700">{c.codice}</td>
+                                        <td className="px-3 py-1.5 text-gray-600">{c.descrizione || '—'}</td>
+                                        <td className="px-3 py-1.5 font-mono text-gray-500 text-[10px]">{c.models.join(', ') || '—'}</td>
+                                        <td className="px-3 py-1.5 text-center">
+                                          {c.eol ? <span className={`px-1 py-px rounded font-black text-[9px] border ${c.eol === 'EOL' ? 'bg-red-50 text-red-600 border-red-100' : c.eol === 'ALT' ? 'bg-amber-50 text-amber-700 border-amber-100' : 'bg-blue-50 text-blue-700 border-blue-100'}`}>{c.eol}</span> : ''}
+                                        </td>
+                                        <td className="px-3 py-1.5 text-center">{c.ref === 'X' ? '✓' : ''}</td>
+                                        <td className="px-3 py-1.5 text-center">{c.rplus === 'X' ? '✓' : ''}</td>
+                                        <td className="px-3 py-1.5 text-right font-mono font-black">{c.stock}</td>
+                                      </tr>
+                                    ))}
+                                  </tbody>
+                                </table>
+                              </td>
+                            </tr>
+                          )}
+                        </Fragment>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              ) : (
+                <div className="text-center py-16 text-gray-400 text-sm">Nessuno stock da visualizzare.</div>
+              )}
+            </div>
+          );
+        })()}
+
+        {/* ==================== MODULO ANAGRAFICA ==================== */}
+        {activeModule === 'anagrafica' && (
+          <div className="max-w-xl mx-auto space-y-5">
+            <div className="bg-white p-6 rounded-2xl border border-gray-200 shadow-xs space-y-4 text-center">
+              <div className="space-y-1">
+                <span className="text-3xl block">📇</span>
+                <h2 className="text-lg font-black text-gray-800">Anagrafica Hardware</h2>
+                <p className="text-sm text-gray-500">Importa il CSV anagrafica (NetSuite Items). Vengono mappati Internal ID, Name, Display Name e Cluster Item.</p>
+              </div>
+              <div className="border-2 border-dashed border-gray-300 rounded-xl p-6 bg-gray-50 hover:bg-gray-100 transition relative cursor-pointer group">
+                <input type="file" accept=".csv,.xls,.xlsx" className="absolute inset-0 w-full h-full opacity-0 cursor-pointer" onChange={handleHardwareUpload} />
+                <div className="space-y-2 pointer-events-none">
+                  <span className="text-3xl block group-hover:scale-110 transition-transform">📥</span>
+                  <p className="text-sm font-bold text-blue-600">Seleziona il file anagrafica</p>
+                </div>
+              </div>
+              {hwLoading && <p className="text-xs font-bold text-amber-600 animate-pulse">Elaborazione in corso...</p>}
+              {!hwLoading && hardware.length > 0 && (
+                <p className="text-sm bg-blue-50 text-blue-600 font-black px-3 py-2 rounded-xl border border-blue-100">
+                  {hardware.length} articoli in anagrafica
+                </p>
+              )}
+            </div>
+          </div>
+        )}
 
         {/* ==================== MODULO PRELIEVI — LISTA ==================== */}
         {activeModule === 'prelievi' && prelievoView === 'list' && (
