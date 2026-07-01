@@ -74,6 +74,7 @@ export default function App() {
   const [activeLine, setActiveLine] = useState(null);
   const [expectedSerials, setExpectedSerials] = useState({});
   const [scannedSerials, setScannedSerials] = useState([]);
+  const scannedSetRef = useRef(new Set()); // guardia sincrona anti-duplicati
   const [cartonsScanned, setCartonsScanned] = useState(0);
   const [scannerValue, setScannerValue] = useState('');
   const [feedback, setFeedback] = useState({ text: '', type: '' });
@@ -203,7 +204,8 @@ export default function App() {
     let all = [];
     let from = 0;
     while (true) {
-      const { data, error } = await supabase.from(table).select(cols).range(from, from + pageSize - 1);
+      // Ordinamento per 'id' per una paginazione stabile (evita duplicati/salti sui confini di pagina)
+      const { data, error } = await supabase.from(table).select(cols).order('id', { ascending: true }).range(from, from + pageSize - 1);
       if (error) break;
       all = [...all, ...(data || [])];
       if (!data || data.length < pageSize) break;
@@ -258,7 +260,7 @@ export default function App() {
       const { data, error } = await supabase
         .from('spare_parts')
         .select('*')
-        .order('pn', { ascending: true })
+        .order('id', { ascending: true })
         .range(from, from + pageSize - 1);
       if (error) { alert("Errore caricamento spare parts: " + error.message); break; }
       all = [...all, ...(data || [])];
@@ -275,7 +277,7 @@ export default function App() {
     let all = [];
     let from = 0;
     while (true) {
-      const { data, error } = await supabase.from('hardware').select('*').order('name', { ascending: true }).range(from, from + pageSize - 1);
+      const { data, error } = await supabase.from('hardware').select('*').order('internal_id', { ascending: true }).range(from, from + pageSize - 1);
       if (error) break;
       all = [...all, ...(data || [])];
       if (!data || data.length < pageSize) break;
@@ -454,7 +456,7 @@ export default function App() {
       const { data, error } = await supabase
         .from('stock_inventory')
         .select('*')
-        .order('codice', { ascending: true })
+        .order('id', { ascending: true })
         .range(from, from + pageSize - 1);
       if (error) { alert("Errore caricamento stock: " + error.message); break; }
       all = [...all, ...(data || [])];
@@ -1276,14 +1278,14 @@ export default function App() {
     setCartonsScanned(line.cartons_scanned || 0);
 
     // Fetch paginato per superare il limite di 1000 righe di Supabase
-    const fetchAllByLine = async (table, cols, orderCol) => {
+    const fetchAllByLine = async (table, cols) => {
       const pageSize = 1000;
       let all = [];
       let from = 0;
       while (true) {
-        let qy = supabase.from(table).select(cols).eq('po_line_key', line.unique_key).range(from, from + pageSize - 1);
-        if (orderCol) qy = qy.order(orderCol, { ascending: false });
-        const { data, error } = await qy;
+        // Ordinamento per 'id' (chiave univoca) per una paginazione stabile: evita duplicati/salti sui confini di pagina
+        const { data, error } = await supabase.from(table).select(cols).eq('po_line_key', line.unique_key)
+          .order('id', { ascending: true }).range(from, from + pageSize - 1);
         if (error) { alert(`Errore caricamento ${table}: ${error.message}`); break; }
         all = [...all, ...(data || [])];
         if (!data || data.length < pageSize) break;
@@ -1292,8 +1294,8 @@ export default function App() {
       return all;
     };
 
-    const expectedData = await fetchAllByLine('expected_serials', 'serial, model, pn', null);
-    const scannedData = await fetchAllByLine('scanned_serials', 'serial, model, pn, scanned_at', 'scanned_at');
+    const expectedData = await fetchAllByLine('expected_serials', 'serial, model, pn');
+    const scannedData = await fetchAllByLine('scanned_serials', 'serial, model, pn, scanned_at');
 
     const expectedMap = {};
     if (expectedData) {
@@ -1305,6 +1307,7 @@ export default function App() {
       pn: s.pn,
       time: new Date(s.scanned_at).toLocaleTimeString('it-IT')
     }));
+    scannedSetRef.current = new Set(formattedScanned.map(s => s.serial));
 
     setExpectedSerials(expectedMap);
     setScannedSerials(formattedScanned);
@@ -1338,7 +1341,7 @@ export default function App() {
         .from('scanned_serials')
         .select('serial, model, pn, scanned_at')
         .eq('po_line_key', line.unique_key)
-        .order('scanned_at', { ascending: true })
+        .order('id', { ascending: true })
         .range(from, from + pageSize - 1);
       if (error) { fetchErr = error; break; }
       scannedData = [...scannedData, ...(data || [])];
@@ -1352,6 +1355,8 @@ export default function App() {
   }
 
   function buildAndDownloadCSV(line, serials) {
+    // Nessun dedup: il file riporta TUTTE le matricole registrate (anche i doppioni) per piena tracciabilità
+    serials = serials || [];
     const header = "Internal ID,Date,Document Number,Subsidiary,Item,CODICE CINESE,Fornitore,Memo,[PAX] China Invoice,Quantity Riga,Quantity Serial,Seriale,Line ID,Surrogate ID,Vendor DDT,Vendor DDT Date";
     const rows = serials.map(s => [
       line.po_internal_id,
@@ -1389,6 +1394,7 @@ export default function App() {
       .eq('po_line_key', activeLineKey)
       .eq('serial', serial);
     if (error) { alert("Errore: " + error.message); return; }
+    scannedSetRef.current.delete(serial);
     setScannedSerials(prev => prev.filter(s => s.serial !== serial));
     await fetchPOLines();
   }
@@ -1401,10 +1407,49 @@ export default function App() {
       .eq('po_line_key', activeLineKey);
     if (error) { alert("Errore: " + error.message); return; }
     await supabase.from('po_lines').update({ cartons_scanned: 0 }).eq('unique_key', activeLineKey);
+    scannedSetRef.current = new Set();
     setScannedSerials([]);
     setCartonsScanned(0);
     setFeedback({ text: 'Rilevazioni azzerate. Scanner pronto.', type: 'success' });
     await fetchPOLines();
+  }
+
+  async function removeDuplicateSerials() {
+    // Rimuove le occorrenze extra dei seriali duplicati, mantenendone UNA per seriale
+    setLoading(true);
+    // Recupera tutte le righe con id (paginato)
+    const pageSize = 1000;
+    let allRows = [];
+    let from = 0;
+    while (true) {
+      const { data, error } = await supabase.from('scanned_serials')
+        .select('id, serial').eq('po_line_key', activeLineKey)
+        .order('id', { ascending: true }).range(from, from + pageSize - 1);
+      if (error) { alert("Errore: " + error.message); setLoading(false); return; }
+      allRows = [...allRows, ...(data || [])];
+      if (!data || data.length < pageSize) break;
+      from += pageSize;
+    }
+    const seen = new Set();
+    const extraIds = [];
+    allRows.forEach(r => {
+      if (seen.has(r.serial)) extraIds.push(r.id);
+      else seen.add(r.serial);
+    });
+    if (extraIds.length === 0) { setLoading(false); return; }
+    // Elimina a blocchi
+    for (let i = 0; i < extraIds.length; i += 500) {
+      await supabase.from('scanned_serials').delete().in('id', extraIds.slice(i, i + 500));
+    }
+    // Ricarica lo stato locale
+    setScannedSerials(prev => {
+      const s = new Set();
+      return prev.filter(x => { if (s.has(x.serial)) return false; s.add(x.serial); return true; });
+    });
+    scannedSetRef.current = seen;
+    setFeedback({ text: `${extraIds.length} doppioni eliminati.`, type: 'success' });
+    await fetchPOLines();
+    setLoading(false);
   }
 
   function triggerVibration(pattern) {
@@ -1433,8 +1478,9 @@ export default function App() {
     if (scannerInputRef.current) scannerInputRef.current.value = '';
     if (!rawInput || !activeLineKey) return;
 
-    const totalExpected = activeLine?.qty_expected || Object.keys(expectedSerials).length;
-    if (scannedSerials.length === totalExpected) {
+    // Il totale da rilevare è il numero di matricole ATTESE (tutte devono essere lette per completare)
+    const totalExpected = Object.keys(expectedSerials).length || activeLine?.qty_expected || 0;
+    if (scannedSerials.length >= totalExpected && totalExpected > 0) {
       openReviewSession();
       return;
     }
@@ -1452,9 +1498,9 @@ export default function App() {
       let errati = 0;
 
       qrData.serials.forEach(serial => {
-        const giaLetto = scannedSerials.some(s => s.serial === serial);
-        if (giaLetto) { duplicati++; return; }
+        if (scannedSetRef.current.has(serial)) { duplicati++; return; }
         if (!Object.hasOwn(expectedSerials, serial)) { errati++; return; }
+        scannedSetRef.current.add(serial); // guardia sincrona: previene doppi da scansioni rapide o QR con seriali ripetuti
         aggiunti.push({ po_line_key: activeLineKey, serial, model: expectedSerials[serial].model, pn: expectedSerials[serial].pn });
       });
 
@@ -1482,8 +1528,7 @@ export default function App() {
 
     } else {
       const serial = rawInput;
-      const giaLetto = scannedSerials.some(s => s.serial === serial);
-      if (giaLetto) {
+      if (scannedSetRef.current.has(serial)) {
         triggerVibration([300]); sounds.error();
         setFeedback({ text: `Duplicato! Matricola ${serial} già letta.`, type: 'error' });
         return;
@@ -1493,6 +1538,7 @@ export default function App() {
         setFeedback({ text: `Errore! La matricola ${serial} non appartiene a questa riga.`, type: 'error' });
         return;
       }
+      scannedSetRef.current.add(serial); // guardia sincrona anti-duplicati
       const meta = expectedSerials[serial];
       await supabase.from('scanned_serials').insert({ po_line_key: activeLineKey, serial, model: meta.model, pn: meta.pn });
 
@@ -1512,7 +1558,26 @@ export default function App() {
     }
   }
 
-  function openReviewSession() {
+  async function openReviewSession() {
+    // Rilegge TUTTE le matricole dal DB (paginato) così la revisione riflette esattamente ciò che c'è nel database
+    if (activeLineKey) {
+      setLoading(true);
+      const pageSize = 1000;
+      let all = [];
+      let from = 0;
+      while (true) {
+        const { data, error } = await supabase.from('scanned_serials')
+          .select('serial, model, pn, scanned_at').eq('po_line_key', activeLineKey)
+          .order('id', { ascending: true }).range(from, from + pageSize - 1);
+        if (error) break;
+        all = [...all, ...(data || [])];
+        if (!data || data.length < pageSize) break;
+        from += pageSize;
+      }
+      all.reverse(); // più recenti in cima
+      setScannedSerials(all.map(s => ({ serial: s.serial, model: s.model, pn: s.pn, time: new Date(s.scanned_at).toLocaleTimeString('it-IT') })));
+      setLoading(false);
+    }
     setCurrentView('review');
   }
 
@@ -3118,12 +3183,12 @@ export default function App() {
                   <div className="flex justify-between items-center">
                     <span className="text-xs sm:text-sm text-gray-400 font-bold">Progresso Scansione:</span>
                     <span className="text-xl sm:text-2xl font-black text-blue-600 font-mono">
-                      {scannedSerials.length}/{activeLine.qty_expected}
+                      {scannedSerials.length}/{Object.keys(expectedSerials).length || activeLine.qty_expected}
                     </span>
                   </div>
                   <div className="w-full bg-gray-100 rounded-full h-3 overflow-hidden">
                     <div className="bg-blue-600 h-3 rounded-full transition-all duration-300"
-                      style={{ width: `${activeLine.qty_expected > 0 ? Math.min((scannedSerials.length / activeLine.qty_expected) * 100, 100) : 0}%` }}></div>
+                      style={{ width: `${(Object.keys(expectedSerials).length || activeLine.qty_expected) > 0 ? Math.min((scannedSerials.length / (Object.keys(expectedSerials).length || activeLine.qty_expected)) * 100, 100) : 0}%` }}></div>
                   </div>
                   <div className="flex justify-between items-center bg-amber-50/70 px-3 py-2 rounded-xl border border-amber-100 mt-1">
                     <span className="text-xs text-amber-800 font-bold flex items-center gap-1.5">📦 Cartoni Caricati (QR Master):</span>
@@ -3151,7 +3216,7 @@ export default function App() {
                 </div>
               )}
 
-              {scannedSerials.length > 0 && scannedSerials.length >= activeLine.qty_expected && (
+              {scannedSerials.length > 0 && scannedSerials.length >= Object.keys(expectedSerials).length && (
                 <button
                   onClick={openReviewSession}
                   className="w-full bg-green-600 hover:bg-green-700 text-white font-black p-4 rounded-xl text-base shadow-md transition cursor-pointer flex items-center justify-center gap-2"
@@ -3205,7 +3270,16 @@ export default function App() {
         )}
 
         {/* ==================== VISTA 3: REVISIONE FINALE ==================== */}
-        {currentView === 'review' && activeLine && (
+        {currentView === 'review' && activeLine && (() => {
+          // Rileva i doppioni: seriali presenti più di una volta
+          const counts = {};
+          scannedSerials.forEach(s => { counts[s.serial] = (counts[s.serial] || 0) + 1; });
+          const extraCount = scannedSerials.length - Object.keys(counts).length; // righe in eccesso da rimuovere
+          const hasDuplicates = extraCount > 0;
+          // Ordina mettendo i doppioni in cima
+          const ordered = [...scannedSerials].sort((a, b) => (counts[b.serial] > 1 ? 1 : 0) - (counts[a.serial] > 1 ? 1 : 0));
+
+          return (
           <div className="max-w-3xl mx-auto bg-white p-6 sm:p-8 rounded-2xl shadow-md border border-gray-200 space-y-6 my-4">
             <div className="border-b border-gray-200 pb-4 text-center sm:text-left">
               <span className="text-[10px] bg-amber-100 text-amber-800 border border-amber-200 font-black px-3 py-1 rounded-md uppercase tracking-wider">Fase di Controllo Finale</span>
@@ -3213,19 +3287,35 @@ export default function App() {
               <p className="text-sm text-gray-400 font-bold uppercase mt-0.5">China Invoice: {activeLine.china_invoice} | Arrivo: {activeLine.arrival_date}</p>
             </div>
 
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
               <div className="bg-blue-50 border border-blue-100 p-4 rounded-xl text-center">
-                <span className="block text-xs font-bold text-blue-500 uppercase tracking-wider">Matricole Verificate</span>
-                <span className="text-3xl font-black text-blue-700 font-mono">{scannedSerials.length} / {activeLine.qty_expected}</span>
+                <span className="block text-xs font-bold text-blue-500 uppercase tracking-wider">Matricole Registrate</span>
+                <span className="text-3xl font-black text-blue-700 font-mono">{scannedSerials.length}</span>
+              </div>
+              <div className={`p-4 rounded-xl text-center border ${hasDuplicates ? 'bg-red-50 border-red-200' : 'bg-green-50 border-green-100'}`}>
+                <span className={`block text-xs font-bold uppercase tracking-wider ${hasDuplicates ? 'text-red-600' : 'text-green-600'}`}>Doppioni</span>
+                <span className={`text-3xl font-black font-mono ${hasDuplicates ? 'text-red-700' : 'text-green-700'}`}>{extraCount}</span>
               </div>
               <div className="bg-amber-50 border border-amber-100 p-4 rounded-xl text-center">
-                <span className="block text-xs font-bold text-amber-600 uppercase tracking-wider">Cartoni Totali Caricati (QR)</span>
+                <span className="block text-xs font-bold text-amber-600 uppercase tracking-wider">Cartoni (QR)</span>
                 <span className="text-3xl font-black text-amber-700 font-mono">{cartonsScanned}</span>
               </div>
             </div>
 
+            {hasDuplicates && (
+              <div className="bg-red-50 border border-red-200 rounded-xl p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                <span className="text-sm font-bold text-red-700">
+                  ⚠ Sono presenti {extraCount} matricole doppie. Rimuovile prima di registrare il carico.
+                </span>
+                <button onClick={removeDuplicateSerials}
+                  className="bg-red-600 hover:bg-red-700 text-white text-xs font-bold px-4 py-2 rounded-xl cursor-pointer transition shadow-xs whitespace-nowrap">
+                  🗑 Elimina {extraCount} doppioni
+                </button>
+              </div>
+            )}
+
             <div className="space-y-2">
-              <label className="block text-xs font-bold text-gray-400 uppercase tracking-wider">Anteprima Registro Scansioni:</label>
+              <label className="block text-xs font-bold text-gray-400 uppercase tracking-wider">Registro Scansioni (doppioni in evidenza):</label>
               <div className="border border-gray-200 rounded-xl overflow-hidden max-h-60 overflow-y-auto shadow-inner bg-gray-50">
                 <table className="w-full text-left border-collapse">
                   <thead className="bg-gray-100 text-[11px] font-bold text-gray-500 sticky top-0 border-b border-gray-200">
@@ -3237,26 +3327,33 @@ export default function App() {
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-gray-100 bg-white">
-                    {scannedSerials.map((s, idx) => (
-                      <tr key={idx} className="border-b border-gray-100 text-xs font-mono hover:bg-gray-50/80 transition">
-                        <td className="p-2.5 pl-4 font-bold text-gray-900">🟢 {s.serial}</td>
-                        <td className="p-2.5 text-gray-600">{s.model}</td>
-                        <td className="p-2.5 text-gray-500">{s.pn}</td>
-                        <td className="p-2.5 pr-4 text-right text-gray-400">{s.time}</td>
-                      </tr>
-                    ))}
+                    {ordered.map((s, idx) => {
+                      const dup = counts[s.serial] > 1;
+                      return (
+                        <tr key={idx} className={`border-b border-gray-100 text-xs font-mono transition ${dup ? 'bg-red-50 hover:bg-red-100' : 'hover:bg-gray-50/80'}`}>
+                          <td className={`p-2.5 pl-4 font-bold ${dup ? 'text-red-700' : 'text-gray-900'}`}>
+                            {dup ? '🔴' : '🟢'} {s.serial}{dup ? ` (×${counts[s.serial]})` : ''}
+                          </td>
+                          <td className="p-2.5 text-gray-600">{s.model}</td>
+                          <td className="p-2.5 text-gray-500">{s.pn}</td>
+                          <td className="p-2.5 pr-4 text-right text-gray-400">{s.time}</td>
+                        </tr>
+                      );
+                    })}
                   </tbody>
                 </table>
               </div>
             </div>
 
             <div className="grid grid-cols-1 gap-3 pt-2">
-              <button onClick={confirmAndFinalizeVerification} className="w-full bg-green-600 hover:bg-green-700 text-white font-black p-4 rounded-xl text-base shadow-md transition cursor-pointer flex items-center justify-center gap-2">
-                ✓ Approva e Registra Carico su Cloud
+              <button onClick={confirmAndFinalizeVerification} disabled={hasDuplicates}
+                className={`w-full font-black p-4 rounded-xl text-base shadow-md transition flex items-center justify-center gap-2 ${hasDuplicates ? 'bg-gray-200 text-gray-400 cursor-not-allowed' : 'bg-green-600 hover:bg-green-700 text-white cursor-pointer'}`}>
+                {hasDuplicates ? '⚠ Rimuovi i doppioni per registrare' : '✓ Approva e Registra Carico su Cloud'}
               </button>
             </div>
           </div>
-        )}
+          );
+        })()}
 
         {/* ==================== VISTA 4: COMPLETAMENTO ==================== */}
         {currentView === 'complete' && activeLine && (
