@@ -119,6 +119,8 @@ export default function App() {
   const [arrivoQtyScanner, setArrivoQtyScanner] = useState('');
   const [arrivoQtyManuale, setArrivoQtyManuale] = useState({ codice: '', quantita: '' });
   const [arrivoCodiceOpen, setArrivoCodiceOpen] = useState(false);
+  const [arrivoBancaleForm, setArrivoBancaleForm] = useState({ open: false, nome: '', magazzino: 'GESSATE' });
+  const [riepCodiceOpen, setRiepCodiceOpen] = useState(true);
   const [arrivoQtyFeedback, setArrivoQtyFeedback] = useState({ text: '', type: '' });
   const arrivoQtyScannerRef = useRef(null);
   const [moveBancaleSrc, setMoveBancaleSrc] = useState('');
@@ -615,11 +617,11 @@ export default function App() {
       });
       if (error) { setArrivoQtyFeedback({ text: 'Errore DB: ' + error.message, type: 'error' }); return false; }
     }
-    // Stato locale: aggrega per codice+bancale+magazzino
+    // Stato locale: aggrega per codice+bancale+magazzino, contando i rilievi (scansioni/inserimenti)
     setArrivoQtyCartoni(prev => {
       const i = prev.findIndex(c => c.codice === codice && c.bancale === bancale && c.magazzino === mag);
-      if (i >= 0) { const copy = [...prev]; copy[i] = { ...copy[i], quantita: copy[i].quantita + qty }; return copy; }
-      return [{ codice, quantita: qty, bancale, magazzino: mag }, ...prev];
+      if (i >= 0) { const copy = [...prev]; copy[i] = { ...copy[i], quantita: copy[i].quantita + qty, rilievi: (copy[i].rilievi || 1) + 1 }; return copy; }
+      return [{ codice, quantita: qty, bancale, magazzino: mag, rilievi: 1 }, ...prev];
     });
     if (matchedLine) {
       setPoLines(prev => prev.map(l => l.unique_key === matchedLine.unique_key ? { ...l, qty_loaded: (l.qty_loaded || 0) + qty } : l));
@@ -2817,8 +2819,8 @@ export default function App() {
                                 const agg = new Map();
                                 existing.forEach(c => {
                                   const key = `${c.codice}__${c.magazzino}__${c.bancale}`;
-                                  if (agg.has(key)) agg.get(key).quantita += (c.quantita || 0);
-                                  else agg.set(key, { codice: c.codice, quantita: c.quantita || 0, bancale: c.bancale, magazzino: c.magazzino });
+                                  if (agg.has(key)) { agg.get(key).quantita += (c.quantita || 0); agg.get(key).rilievi += 1; }
+                                  else agg.set(key, { codice: c.codice, quantita: c.quantita || 0, bancale: c.bancale, magazzino: c.magazzino, rilievi: 1 });
                                 });
                                 setArrivoQtyCartoni([...agg.values()]);
                                 const qtyMap = {};
@@ -2963,29 +2965,57 @@ export default function App() {
               </div>
             </div>
 
-            {/* Configurazione bancale */}
-            <div className="bg-white p-4 rounded-2xl border border-gray-200 shadow-xs space-y-3">
-              <span className="text-[10px] font-black text-gray-400 uppercase tracking-wider block">Bancale attivo</span>
-              <div className="grid grid-cols-2 gap-3">
-                <div className="space-y-1">
-                  <label className="block text-xs font-bold text-gray-500">Nome bancale <span className="text-red-500">*</span></label>
-                  <input value={arrivoQtyBancale} onChange={e => setArrivoQtyBancale(e.target.value)}
-                    placeholder="Es. BANCALE-001"
-                    className={`w-full bg-gray-50 rounded-xl p-2.5 text-sm focus:outline-hidden font-mono border ${!arrivoQtyBancale.trim() ? 'border-red-300 bg-red-50' : 'border-gray-300'}`} />
+            {/* Form nuovo bancale */}
+            {arrivoBancaleForm.open && (
+              <div className="bg-white p-4 rounded-2xl border-2 border-blue-300 shadow-xs space-y-3">
+                <span className="text-[10px] font-black text-blue-700 uppercase tracking-wider block">Nuovo bancale</span>
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                  <div className="space-y-1">
+                    <label className="block text-xs font-bold text-gray-500">Nome bancale</label>
+                    <input value={arrivoBancaleForm.nome} onChange={e => setArrivoBancaleForm(f => ({ ...f, nome: e.target.value }))}
+                      placeholder="Es. BANCALE-001" autoFocus
+                      className="w-full bg-gray-50 border border-gray-300 rounded-xl p-2.5 text-sm focus:outline-hidden font-mono" />
+                  </div>
+                  <div className="space-y-1">
+                    <label className="block text-xs font-bold text-gray-500">Magazzino</label>
+                    <select value={arrivoBancaleForm.magazzino} onChange={e => setArrivoBancaleForm(f => ({ ...f, magazzino: e.target.value }))}
+                      className="w-full bg-gray-50 border border-gray-300 rounded-xl p-2.5 text-sm focus:outline-hidden">
+                      <option value="GESSATE">GESSATE</option>
+                      <option value="ESPRINET">ESPRINET</option>
+                    </select>
+                  </div>
                 </div>
-                <div className="space-y-1">
-                  <label className="block text-xs font-bold text-gray-500">Magazzino</label>
-                  <select value={arrivoQtyMagazzino} onChange={e => setArrivoQtyMagazzino(e.target.value)}
-                    className="w-full bg-gray-50 border border-gray-300 rounded-xl p-2.5 text-sm focus:outline-hidden">
-                    <option value="GESSATE">GESSATE</option>
-                    <option value="ESPRINET">ESPRINET</option>
-                  </select>
+                <div className="flex gap-2">
+                  <button onClick={() => {
+                      if (!arrivoBancaleForm.nome.trim()) { alert('Inserisci il nome del bancale.'); return; }
+                      setArrivoQtyBancale(arrivoBancaleForm.nome.trim());
+                      setArrivoQtyMagazzino(arrivoBancaleForm.magazzino);
+                      setArrivoBancaleForm({ open: false, nome: '', magazzino: arrivoBancaleForm.magazzino });
+                    }}
+                    className="flex-1 bg-blue-600 hover:bg-blue-700 text-white text-sm font-bold py-2.5 rounded-xl cursor-pointer transition">Conferma bancale</button>
+                  <button onClick={() => setArrivoBancaleForm(f => ({ ...f, open: false }))}
+                    className="bg-gray-100 hover:bg-gray-200 text-gray-600 text-sm font-bold px-4 py-2.5 rounded-xl cursor-pointer transition">Annulla</button>
                 </div>
               </div>
-            </div>
+            )}
 
             {/* Scanner QR */}
             <div className="bg-white p-4 rounded-2xl border border-gray-200 shadow-xs space-y-3">
+              {/* Bancale in lavorazione */}
+              {arrivoQtyBancale.trim() ? (
+                <div className="flex items-center justify-between bg-blue-50 border border-blue-100 rounded-xl px-3 py-2">
+                  <span className="text-xs font-bold text-blue-800">
+                    📦 Bancale: <span className="font-mono">{arrivoQtyBancale}</span> <span className="text-blue-400">· {arrivoQtyMagazzino}</span>
+                  </span>
+                  <button onClick={() => setArrivoBancaleForm({ open: true, nome: '', magazzino: arrivoQtyMagazzino })}
+                    className="text-[11px] font-bold text-blue-600 hover:text-blue-800 cursor-pointer">Nuovo bancale</button>
+                </div>
+              ) : (
+                <button onClick={() => setArrivoBancaleForm({ open: true, nome: '', magazzino: arrivoQtyMagazzino || 'GESSATE' })}
+                  className="w-full bg-blue-600 hover:bg-blue-700 text-white text-sm font-bold py-2.5 rounded-xl cursor-pointer transition shadow-xs">
+                  + Nuovo bancale
+                </button>
+              )}
               <span className="text-[10px] font-black text-gray-400 uppercase tracking-wider block">Scansione QR (codice + quantità)</span>
               <form onSubmit={handleArrivoQtySubmit}>
                 <input type="text" ref={arrivoQtyScannerRef} value={arrivoQtyScanner}
@@ -3072,74 +3102,94 @@ export default function App() {
               const invoiceComplete = Object.values(summary).every(({ caricata, attesa }) => attesa > 0 && caricata >= attesa);
               return (
               <>
-              {/* Riepilogo per codice */}
+              {/* Riepilogo per codice — collassabile */}
               <div className="bg-white rounded-2xl border border-gray-200 shadow-xs overflow-hidden">
-                <div className="px-4 py-3 border-b border-gray-100">
-                  <span className="text-[10px] font-black text-gray-400 uppercase tracking-wider">Riepilogo per codice</span>
-                </div>
-                <div className="divide-y divide-gray-100">
-                  {Object.entries(summary).map(([codice, { caricata, attesa }]) => {
-                    const status = caricata === attesa ? 'ok' : caricata < attesa ? 'under' : 'over';
-                    return (
-                      <div key={codice} className={`flex items-center justify-between px-4 py-2.5 ${status === 'under' ? 'bg-yellow-50' : status === 'over' ? 'bg-red-50' : 'bg-green-50'}`}>
-                        <span className="font-mono font-bold text-sm text-gray-800">{codice}</span>
-                        <div className="flex items-center gap-3">
-                          <span className="text-xs text-gray-500">Attesi: <strong>{attesa}</strong></span>
-                          <span className={`text-sm font-black ${status === 'under' ? 'text-yellow-700' : status === 'over' ? 'text-red-700' : 'text-green-700'}`}>
-                            Caricati: {caricata}
-                          </span>
-                          <span className="text-base">{status === 'ok' ? '✅' : status === 'under' ? '🟡' : '🔴'}</span>
+                <button onClick={() => setRiepCodiceOpen(o => !o)}
+                  className="w-full flex items-center justify-between px-4 py-3 border-b border-gray-100 cursor-pointer hover:bg-gray-50">
+                  <span className="text-[10px] font-black text-gray-400 uppercase tracking-wider">Riepilogo per codice ({Object.keys(summary).length})</span>
+                  <span className="text-gray-400 text-sm">{riepCodiceOpen ? '▾' : '▸'}</span>
+                </button>
+                {riepCodiceOpen && (
+                  <div className="divide-y divide-gray-100">
+                    {Object.entries(summary).map(([codice, { caricata, attesa }]) => {
+                      const status = caricata === attesa ? 'ok' : caricata < attesa ? 'under' : 'over';
+                      return (
+                        <div key={codice} className={`flex items-center justify-between px-4 py-2.5 ${status === 'under' ? 'bg-yellow-50' : status === 'over' ? 'bg-red-50' : 'bg-green-50'}`}>
+                          <span className="font-mono font-bold text-sm text-gray-800">{codice}</span>
+                          <div className="flex items-center gap-3">
+                            <span className="text-xs text-gray-500">Attesi: <strong>{attesa}</strong></span>
+                            <span className={`text-sm font-black ${status === 'under' ? 'text-yellow-700' : status === 'over' ? 'text-red-700' : 'text-green-700'}`}>
+                              Caricati: {caricata}
+                            </span>
+                            <span className="text-base">{status === 'ok' ? '✅' : status === 'under' ? '🟡' : '🔴'}</span>
+                          </div>
                         </div>
-                      </div>
-                    );
-                  })}
-                </div>
+                      );
+                    })}
+                  </div>
+                )}
               </div>
 
-              <div className="bg-white rounded-2xl border border-gray-200 shadow-xs overflow-hidden">
-                <div className="flex items-center justify-between px-4 py-3 border-b border-gray-100">
-                  <span className="text-xs font-black text-gray-500 uppercase tracking-wider">{arrivoQtyCartoni.length} codici rilevati</span>
-                  <span className="text-sm font-black text-blue-600">
-                    Tot. pezzi: {arrivoQtyCartoni.reduce((s, c) => s + (c.quantita || 0), 0)}
-                  </span>
-                </div>
-                <table className="w-full text-xs">
-                  <thead className="bg-gray-50 border-b border-gray-100 text-[10px] font-black text-gray-500 uppercase">
-                    <tr>
-                      <th className="px-3 py-2 text-left">Codice</th>
-                      <th className="px-3 py-2 text-left">Magazzino</th>
-                      <th className="px-3 py-2 text-left">Bancale</th>
-                      <th className="px-3 py-2 text-right">Qtà</th>
-                      <th className="px-3 py-2"></th>
-                    </tr>
-                  </thead>
-                  <tbody className="divide-y divide-gray-100">
-                    {arrivoQtyCartoni.map(c => (
-                      <tr key={`${c.codice}__${c.magazzino}__${c.bancale}`} className="hover:bg-gray-50/80">
-                        <td className="px-3 py-2 font-mono font-bold text-blue-700">{c.codice}</td>
-                        <td className="px-3 py-2 text-gray-600">{c.magazzino}</td>
-                        <td className="px-3 py-2 text-gray-600">{c.bancale}</td>
-                        <td className="px-3 py-2 text-right font-black">{c.quantita}</td>
-                        <td className="px-3 py-2 text-right">
-                          <button onClick={() => removeCarton(c)} className="text-[10px] text-gray-400 hover:text-red-600 bg-gray-50 hover:bg-red-50 border border-gray-200 hover:border-red-300 px-2 py-1 rounded-lg cursor-pointer transition">✕</button>
-                        </td>
-                      </tr>
+              {/* Rilievi divisi per bancale */}
+              {(() => {
+                const perBancale = {};
+                arrivoQtyCartoni.forEach(c => {
+                  const key = `${c.magazzino}__${c.bancale}`;
+                  if (!perBancale[key]) perBancale[key] = { magazzino: c.magazzino, bancale: c.bancale, righe: [], rilievi: 0, pezzi: 0 };
+                  perBancale[key].righe.push(c);
+                  perBancale[key].rilievi += (c.rilievi || 1);
+                  perBancale[key].pezzi += (c.quantita || 0);
+                });
+                const bancali = Object.values(perBancale);
+                return (
+                  <div className="space-y-3">
+                    {bancali.map(b => (
+                      <div key={`${b.magazzino}__${b.bancale}`} className="bg-white rounded-2xl border border-gray-200 shadow-xs overflow-hidden">
+                        <div className="flex items-center justify-between px-4 py-2.5 bg-blue-50 border-b border-blue-100">
+                          <span className="text-xs font-black text-blue-800">📦 {b.bancale} <span className="text-blue-400 font-bold">· {b.magazzino}</span></span>
+                          <span className="text-[11px] font-bold text-blue-600">{b.rilievi} rilievi · {b.pezzi} pz</span>
+                        </div>
+                        <table className="w-full text-xs">
+                          <thead className="bg-gray-50 border-b border-gray-100 text-[10px] font-black text-gray-500 uppercase">
+                            <tr>
+                              <th className="px-3 py-2 text-left">Codice</th>
+                              <th className="px-3 py-2 text-center">Rilievi</th>
+                              <th className="px-3 py-2 text-right">Qtà</th>
+                              <th className="px-3 py-2"></th>
+                            </tr>
+                          </thead>
+                          <tbody className="divide-y divide-gray-100">
+                            {b.righe.map(c => (
+                              <tr key={`${c.codice}__${c.magazzino}__${c.bancale}`} className="hover:bg-gray-50/80">
+                                <td className="px-3 py-2 font-mono font-bold text-blue-700">{c.codice}</td>
+                                <td className="px-3 py-2 text-center text-gray-500">{c.rilievi || 1}</td>
+                                <td className="px-3 py-2 text-right font-black">{c.quantita}</td>
+                                <td className="px-3 py-2 text-right">
+                                  <button onClick={() => removeCarton(c)} className="text-[10px] text-gray-400 hover:text-red-600 bg-gray-50 hover:bg-red-50 border border-gray-200 hover:border-red-300 px-2 py-1 rounded-lg cursor-pointer transition">✕</button>
+                                </td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
                     ))}
-                  </tbody>
-                </table>
-                <div className="p-4 border-t border-gray-100 space-y-2">
-                  {!invoiceComplete && (
-                    <p className="text-xs text-center font-bold text-amber-600">
-                      ⚠ Invoice incompleta — completa tutti i codici prima di caricare
-                    </p>
-                  )}
-                  <button
-                    onClick={caricaArrivoSuInventario}
-                    disabled={!invoiceComplete}
-                    className={`w-full font-black p-4 rounded-xl text-base shadow-md transition flex items-center justify-center gap-2 ${!invoiceComplete ? 'bg-gray-200 text-gray-400 cursor-not-allowed' : 'bg-green-600 hover:bg-green-700 text-white cursor-pointer'}`}>
-                    ✓ Carica su Inventario Spare Parts
-                  </button>
-                </div>
+                  </div>
+                );
+              })()}
+
+              {/* Pulsante carico */}
+              <div className="bg-white rounded-2xl border border-gray-200 shadow-xs p-4 space-y-2">
+                {!invoiceComplete && (
+                  <p className="text-xs text-center font-bold text-amber-600">
+                    ⚠ Invoice incompleta — completa tutti i codici prima di caricare
+                  </p>
+                )}
+                <button
+                  onClick={caricaArrivoSuInventario}
+                  disabled={!invoiceComplete}
+                  className={`w-full font-black p-4 rounded-xl text-base shadow-md transition flex items-center justify-center gap-2 ${!invoiceComplete ? 'bg-gray-200 text-gray-400 cursor-not-allowed' : 'bg-green-600 hover:bg-green-700 text-white cursor-pointer'}`}>
+                  ✓ Carica su Inventario Spare Parts
+                </button>
               </div>
               </>);
             })()}
