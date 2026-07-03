@@ -2,7 +2,6 @@ import { useState, useEffect, useRef, Fragment } from 'react';
 import { supabase } from './supabaseClient';
 import * as XLSX from 'xlsx';
 import { useColumnWidths } from './useColumnWidths';
-import JsBarcode from 'jsbarcode';
 
 // Moduli work-in-progress da nascondere dal menu (impostare a true per riattivarli)
 const SHOW_WIP_MODULES = false;
@@ -121,8 +120,6 @@ export default function App() {
   const [arrivoQtyManuale, setArrivoQtyManuale] = useState({ codice: '', quantita: '' });
   const [arrivoQtyFeedback, setArrivoQtyFeedback] = useState({ text: '', type: '' });
   const arrivoQtyScannerRef = useRef(null);
-  const [barcodeToPrint] = useState(null); // reserved for future print implementation
-  const [printedCartons, setPrintedCartons] = useState(new Set());
   const [moveBancaleSrc, setMoveBancaleSrc] = useState('');
   const [moveBancaleDest, setMoveBancaleDest] = useState('GESSATE');
   const [moveBancaleLocazione, setMoveBancaleLocazione] = useState('');
@@ -171,18 +168,6 @@ export default function App() {
     fetchHardware();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
-
-  useEffect(() => {
-    if (!barcodeToPrint) return;
-    const el = document.getElementById('barcode-svg');
-    if (!el) return;
-    try {
-      JsBarcode(el, barcodeToPrint.id, {
-        format: 'CODE128', width: 2, height: 60,
-        displayValue: true, fontSize: 14, margin: 8
-      });
-    } catch { /* ignore */ }
-  }, [barcodeToPrint]);
 
 
   useEffect(() => {
@@ -507,19 +492,25 @@ export default function App() {
       const iBanc = headers.findIndex(h => h.includes('BANCALE'));
       const iLoc = idx('LOCAZIONE');
 
-      // Nessun dedup: ogni riga del file è un record a sé (modello "una riga per cartone")
-      const allRows = aoa.slice(headerIdx + 1)
-        .map(row => ({
-          locazione:      iLoc >= 0 ? String(row[iLoc] || '').trim() : '',
-          numero_bancale: iBanc >= 0 ? String(row[iBanc] || '').trim() : '',
-          magazzino:      iMag >= 0 ? String(row[iMag] || '').trim() : '',
-          codice:         String(row[iCod] || '').trim(),
-          stock:          parseFloat(row[iStock]) || 0,
-        }))
-        .filter(r => r.codice);
+      // Aggregazione per (codice, magazzino, bancale): somma le quantità di stock
+      const aggMap = new Map();
+      aoa.slice(headerIdx + 1).forEach(row => {
+        const codice = String(row[iCod] || '').trim();
+        if (!codice) return;
+        const magazzino = iMag >= 0 ? String(row[iMag] || '').trim() : '';
+        const numero_bancale = iBanc >= 0 ? String(row[iBanc] || '').trim() : '';
+        const locazione = iLoc >= 0 ? String(row[iLoc] || '').trim() : '';
+        const stock = parseFloat(row[iStock]) || 0;
+        const key = `${codice}__${magazzino}__${numero_bancale}`;
+        if (aggMap.has(key)) {
+          aggMap.get(key).stock += stock;
+        } else {
+          aggMap.set(key, { locazione, numero_bancale, magazzino, codice, stock });
+        }
+      });
 
-      // Solo righe con stock > 0 (le zero non vengono inserite)
-      const toInsert = allRows.filter(r => r.stock !== 0);
+      // Solo righe con stock > 0
+      const toInsert = [...aggMap.values()].filter(r => r.stock !== 0);
 
       // GUARDIA: non svuotare l'inventario se il file non produce righe valide
       if (toInsert.length === 0) {
@@ -603,6 +594,38 @@ export default function App() {
     ) || null;
   }
 
+  // Aggiunge/incrementa una quantità per codice alle coordinate correnti (magazzino + bancale)
+  async function addArrivoQty(codice, qty, matchedLine) {
+    const bancale = arrivoQtyBancale.trim();
+    const mag = arrivoQtyMagazzino;
+    // Cerca una riga pending esistente per queste coordinate
+    const { data: existing } = await supabase.from('carton_arrivals')
+      .select('id, quantita').eq('invoice', arrivoQtyInvoice).eq('codice', codice)
+      .eq('magazzino', mag).eq('bancale', bancale).eq('stato', 'pending').limit(1);
+    if (existing && existing.length > 0) {
+      const { error } = await supabase.from('carton_arrivals')
+        .update({ quantita: (existing[0].quantita || 0) + qty }).eq('id', existing[0].id);
+      if (error) { setArrivoQtyFeedback({ text: 'Errore DB: ' + error.message, type: 'error' }); return false; }
+    } else {
+      const synthId = `${arrivoQtyInvoice}__${codice}__${mag}__${bancale}`;
+      const { error } = await supabase.from('carton_arrivals').insert({
+        id_cartone: synthId, invoice: arrivoQtyInvoice, bancale, magazzino: mag,
+        codice, quantita: qty, qr_raw: null, stato: 'pending', po_line_key: matchedLine?.unique_key || null
+      });
+      if (error) { setArrivoQtyFeedback({ text: 'Errore DB: ' + error.message, type: 'error' }); return false; }
+    }
+    // Stato locale: aggrega per codice+bancale+magazzino
+    setArrivoQtyCartoni(prev => {
+      const i = prev.findIndex(c => c.codice === codice && c.bancale === bancale && c.magazzino === mag);
+      if (i >= 0) { const copy = [...prev]; copy[i] = { ...copy[i], quantita: copy[i].quantita + qty }; return copy; }
+      return [{ codice, quantita: qty, bancale, magazzino: mag }, ...prev];
+    });
+    if (matchedLine) {
+      setPoLines(prev => prev.map(l => l.unique_key === matchedLine.unique_key ? { ...l, qty_loaded: (l.qty_loaded || 0) + qty } : l));
+    }
+    return true;
+  }
+
   async function handleArrivoQtySubmit(e) {
     e.preventDefault();
     const raw = (arrivoQtyScannerRef.current?.value || arrivoQtyScanner).trim();
@@ -620,114 +643,49 @@ export default function App() {
       sounds.error(); triggerVibration([300]);
       return;
     }
-    if (!checkCodiceInPianoArrivi(parsed.codice)) {
+    const matchedLine = checkCodiceInPianoArrivi(parsed.codice);
+    if (!matchedLine) {
       setArrivoQtyFeedback({ text: `Codice ${parsed.codice} non previsto in arrivo per invoice ${arrivoQtyInvoice}. Bloccato.`, type: 'error' });
       sounds.error(); triggerVibration([300]);
       return;
     }
-    const duplicate = arrivoQtyCartoni.find(c => c.idCartone === raw);
-    if (duplicate) {
-      setArrivoQtyFeedback({ text: 'Duplicato! Cartone già rilevato.', type: 'error' });
-      sounds.error(); triggerVibration([300]);
-      return;
+    if (await addArrivoQty(parsed.codice, parsed.quantita, matchedLine)) {
+      setArrivoQtyFeedback({ text: `OK: ${parsed.codice} +${parsed.quantita} pz`, type: 'success' });
+      sounds.carton(); triggerVibration([150, 100, 150]);
     }
-    const matchedLine = checkCodiceInPianoArrivi(parsed.codice);
-    const record = { id_cartone: raw, invoice: arrivoQtyInvoice, bancale: arrivoQtyBancale, magazzino: arrivoQtyMagazzino, codice: parsed.codice, quantita: parsed.quantita, qr_raw: raw, stato: 'pending', po_line_key: matchedLine?.unique_key || null };
-    const { error: insErr } = await supabase.from('carton_arrivals').insert(record);
-    if (insErr) { setArrivoQtyFeedback({ text: 'Errore DB: ' + insErr.message, type: 'error' }); return; }
-    setArrivoQtyCartoni(prev => [{ ...parsed, idCartone: raw, bancale: arrivoQtyBancale, manuale: false }, ...prev]);
-    // Aggiorna qty_loaded direttamente in memoria
-    if (matchedLine) {
-      setPoLines(prev => prev.map(l => l.unique_key === matchedLine.unique_key ? { ...l, qty_loaded: (l.qty_loaded || 0) + parsed.quantita } : l));
-    }
-    setArrivoQtyFeedback({ text: `OK: ${parsed.codice} — qtà ${parsed.quantita}`, type: 'success' });
-    sounds.carton(); triggerVibration([150, 100, 150]);
   }
 
   async function addCartonManuale() {
     const { codice, quantita } = arrivoQtyManuale;
-    if (!arrivoQtyBancale.trim()) { alert('Inserisci il nome del bancale prima di aggiungere cartoni.'); return; }
+    if (!arrivoQtyBancale.trim()) { alert('Inserisci il nome del bancale prima di aggiungere.'); return; }
     if (!codice.trim() || !quantita) { alert('Inserisci codice e quantità.'); return; }
-    if (!checkCodiceInPianoArrivi(codice.trim())) {
+    const matchedLine = checkCodiceInPianoArrivi(codice.trim());
+    if (!matchedLine) {
       alert(`Il codice "${codice.trim()}" non è previsto in arrivo per invoice ${arrivoQtyInvoice}.\n\nOperazione bloccata.`);
       return;
     }
-    const matchedLine2 = checkCodiceInPianoArrivi(codice.trim());
     const qty = parseFloat(quantita);
-
-    // Genera id_cartone formato AAMMGG-X
-    const now = new Date();
-    const datePrefix = String(now.getFullYear()).slice(2).padStart(2,'0')
-      + String(now.getMonth() + 1).padStart(2,'0')
-      + String(now.getDate()).padStart(2,'0');
-    const { count } = await supabase.from('carton_arrivals')
-      .select('*', { count: 'exact', head: true })
-      .like('id_cartone', `${datePrefix}-%`);
-    const manualId = `${datePrefix}-${(count || 0) + 1}`;
-
-    const record = { id_cartone: manualId, invoice: arrivoQtyInvoice, bancale: arrivoQtyBancale, magazzino: arrivoQtyMagazzino, codice: codice.trim(), quantita: qty, qr_raw: null, stato: 'pending', po_line_key: matchedLine2?.unique_key || null };
-    const { error: insErr2 } = await supabase.from('carton_arrivals').insert(record);
-    if (insErr2) { alert('Errore DB: ' + insErr2.message); return; }
-    const dbId = manualId;
-    setArrivoQtyCartoni(prev => [{ codice: codice.trim(), quantita: qty, idCartone: dbId, qrRaw: null, bancale: arrivoQtyBancale, manuale: true }, ...prev]);
-    if (matchedLine2) {
-      setPoLines(prev => prev.map(l => l.unique_key === matchedLine2.unique_key ? { ...l, qty_loaded: (l.qty_loaded || 0) + qty } : l));
+    if (await addArrivoQty(codice.trim(), qty, matchedLine)) {
+      setArrivoQtyManuale({ codice: '', quantita: '' });
+      setArrivoQtyFeedback({ text: `Aggiunto: ${codice.trim()} +${qty} pz`, type: 'success' });
+      sounds.ok(); triggerVibration([150]);
     }
-    setArrivoQtyManuale({ codice: '', quantita: '' });
-    setArrivoQtyFeedback({ text: `Aggiunto: ${codice.trim()} — qtà ${quantita}`, type: 'success' });
   }
 
-  async function removeCarton(idCartone) {
-    await supabase.from('carton_arrivals').delete().eq('id_cartone', idCartone).eq('stato', 'pending');
-    setArrivoQtyCartoni(prev => prev.filter(c => c.idCartone !== idCartone));
+  async function removeCarton(item) {
+    await supabase.from('carton_arrivals').delete()
+      .eq('invoice', arrivoQtyInvoice).eq('codice', item.codice)
+      .eq('magazzino', item.magazzino).eq('bancale', item.bancale).eq('stato', 'pending');
+    setArrivoQtyCartoni(prev => prev.filter(c => !(c.codice === item.codice && c.bancale === item.bancale && c.magazzino === item.magazzino)));
     await fetchPOLines();
-  }
-
-  function printCartonLabel(carton) {
-    setPrintedCartons(prev => new Set(prev).add(carton.idCartone));
-    // Genera SVG barcode in memoria
-    const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
-    JsBarcode(svg, carton.idCartone, {
-      format: 'CODE128', width: 1.5, height: 28,
-      displayValue: true, fontSize: 8, margin: 2,
-      textMargin: 1
-    });
-    const svgData = new XMLSerializer().serializeToString(svg);
-
-    const win = window.open('', '_blank', 'width=300,height=200');
-    win.document.write(`<!DOCTYPE html><html><head><title>Etichetta</title>
-      <style>
-        @page { size: 51mm 19mm; margin: 0; }
-        * { margin: 0; padding: 0; box-sizing: border-box; }
-        body { width: 51mm; height: 19mm; display: flex; flex-direction: column; align-items: center; justify-content: center; font-family: monospace; overflow: hidden; }
-        svg { width: 47mm; height: 14mm; }
-        .info { font-size: 5pt; text-align: center; line-height: 1.2; width: 47mm; }
-      </style>
-    </head><body>
-      ${svgData}
-      <div class="info">${carton.codice} — Qtà: ${carton.quantita}</div>
-    </body></html>`);
-    win.document.close();
-    win.focus();
-    setTimeout(() => { win.print(); win.close(); }, 300);
   }
 
   async function annullaTuttoArrivo() {
     const total = arrivoQtyCartoni.length;
-    if (!window.confirm(`Annullare tutti i ${total} cartoni per invoice ${arrivoQtyInvoice}?\n\nVerranno rimossi dall'inventario e dal piano arrivi.`)) return;
+    if (!window.confirm(`Annullare le ${total} righe in corso per invoice ${arrivoQtyInvoice}?\n\nVerranno rimosse (lo stock non ancora registrato non viene toccato).`)) return;
 
-    // 1. Raccoglie gli id_cartone per pulire stock_inventory
-    const cartoneIds = arrivoQtyCartoni.map(c => c.idCartone).filter(Boolean);
-
-    // 2. Elimina tutti i carton_arrivals dell'invoice (pending + caricato)
-    await supabase.from('carton_arrivals').delete().eq('invoice', arrivoQtyInvoice);
-
-    // 3. Rimuove le righe stock_inventory create da questi cartoni
-    for (const cid of cartoneIds) {
-      await supabase.from('stock_inventory').delete().contains('carton_ids', [cid]);
-    }
-
-    // 4. Resetta is_user_confirmed sulle righe non serializzate
+    // Elimina i pending dell'invoice e resetta lo stato riga
+    await supabase.from('carton_arrivals').delete().eq('invoice', arrivoQtyInvoice).eq('stato', 'pending');
     await supabase.from('po_lines')
       .update({ is_user_confirmed: false })
       .eq('china_invoice', arrivoQtyInvoice)
@@ -742,8 +700,8 @@ export default function App() {
   }
 
   async function caricaArrivoSuInventario() {
-    if (arrivoQtyCartoni.length === 0) { alert('Nessun cartone da caricare.'); return; }
-    if (!window.confirm(`Caricare ${arrivoQtyCartoni.length} cartoni sull'Inventario Spare Parts?\n\nInvoice: ${arrivoQtyInvoice}\nMagazzino: ${arrivoQtyMagazzino}`)) return;
+    if (arrivoQtyCartoni.length === 0) { alert('Nessuna riga da caricare.'); return; }
+    if (!window.confirm(`Caricare ${arrivoQtyCartoni.length} righe sull'Inventario Spare Parts?\n\nInvoice: ${arrivoQtyInvoice}`)) return;
 
     setLoading(true);
     const errors = [];
@@ -761,23 +719,26 @@ export default function App() {
       .eq('china_invoice', arrivoQtyInvoice)
       .eq('sn_required', false);
 
-    // 2. Inserisci una riga per cartone in stock_inventory
+    // 2. Applica allo stock secondo le coordinate (codice + magazzino + bancale): incrementa o crea la riga
     for (const c of arrivoQtyCartoni) {
-      const { error } = await supabase.from('stock_inventory').insert({
-        codice:         c.codice,
-        stock:          c.quantita,
-        numero_bancale: c.bancale || arrivoQtyBancale,
-        magazzino:      arrivoQtyMagazzino,
-        carton_ids:     c.idCartone ? [c.idCartone] : [],
-        locazione:      '',
-      });
-      if (error) errors.push(`${c.codice}: ${error.message}`);
+      const { data: existing } = await supabase.from('stock_inventory')
+        .select('id, stock').eq('codice', c.codice).eq('magazzino', c.magazzino).eq('numero_bancale', c.bancale).limit(1);
+      if (existing && existing.length > 0) {
+        const { error } = await supabase.from('stock_inventory')
+          .update({ stock: (existing[0].stock || 0) + c.quantita }).eq('id', existing[0].id);
+        if (error) errors.push(`${c.codice}: ${error.message}`);
+      } else {
+        const { error } = await supabase.from('stock_inventory').insert({
+          codice: c.codice, stock: c.quantita, numero_bancale: c.bancale, magazzino: c.magazzino, locazione: '',
+        });
+        if (error) errors.push(`${c.codice}: ${error.message}`);
+      }
     }
 
     if (errors.length) {
       alert('Completato con errori:\n' + errors.join('\n'));
     } else {
-      alert(`${arrivoQtyCartoni.length} cartoni caricati con successo!`);
+      alert(`${arrivoQtyCartoni.length} righe caricate sull'inventario.`);
       setArrivoQtyCartoni([]);
       setArrivoQtyActive(false);
       setArrivoQtyInvoice('');
@@ -832,16 +793,16 @@ export default function App() {
     const { data: righe, error: errR } = await supabase.from('prelievi_righe').select('*').eq('prelievo_id', prelievo.id);
     if (errR) { alert('Errore: ' + errR.message); setPrelieviLoading(false); return; }
 
-    // 2. Ripristina lo stock per ogni riga
+    // 2. Ripristina lo stock per ogni riga: incrementa alle coordinate (codice, magazzino, bancale)
     for (const r of (righe || [])) {
-      const { data: existing } = await supabase.from('stock_inventory').select('id, stock').eq('id', r.stock_id).maybeSingle();
-      if (existing) {
-        const { error } = await supabase.from('stock_inventory').update({ stock: (existing.stock || 0) + (r.quantita || 0) }).eq('id', r.stock_id);
+      const { data: existing } = await supabase.from('stock_inventory')
+        .select('id, stock').eq('codice', r.codice).eq('magazzino', r.magazzino).eq('numero_bancale', r.numero_bancale).limit(1);
+      if (existing && existing.length > 0) {
+        const { error } = await supabase.from('stock_inventory').update({ stock: (existing[0].stock || 0) + (r.quantita || 0) }).eq('id', existing[0].id);
         if (error) errors.push(error.message);
       } else {
         const { error } = await supabase.from('stock_inventory').insert({
-          codice: r.codice, stock: r.quantita, numero_bancale: r.numero_bancale,
-          magazzino: r.magazzino, carton_ids: r.id_cartone ? [r.id_cartone] : [], locazione: '',
+          codice: r.codice, stock: r.quantita, numero_bancale: r.numero_bancale, magazzino: r.magazzino, locazione: '',
         });
         if (error) errors.push(error.message);
       }
@@ -889,26 +850,16 @@ export default function App() {
     if (prelievoScannerRef.current) prelievoScannerRef.current.value = '';
     if (!raw) return;
 
-    // Cerca riga stock per id_cartone (sia QR grezzo che id manuale)
-    const stockRow = stockItems.find(s => (s.carton_ids || []).includes(raw));
-    if (stockRow) {
-      if (addPrelievoRiga(stockRow, stockRow.stock)) {
-        setPrelievoFeedback({ text: `OK: ${stockRow.codice} — disp. ${stockRow.stock} (modificabile)`, type: 'success' });
-        sounds.carton(); triggerVibration([150, 100, 150]);
-      }
-      return;
-    }
-
-    // Non trovato come id_cartone: prova a interpretare il QR per estrarre codice + quantità
+    // Il QR fornisce codice + quantità: si precompila il form, poi l'utente sceglie l'ubicazione e conferma con +
     const parsed = parseCartonQR(raw);
     if (parsed) {
       setPrelievoManuale({ codice: parsed.codice, stockId: '', quantita: parsed.quantita });
-      setPrelievoFeedback({ text: `Cartone non in inventario per ID. Codice ${parsed.codice} (qtà ${parsed.quantita}) precompilato: seleziona l'ubicazione e premi +.`, type: 'warning' });
+      setPrelievoFeedback({ text: `Codice ${parsed.codice} (qtà ${parsed.quantita}) precompilato: seleziona l'ubicazione (bancale) e premi +.`, type: 'success' });
       sounds.carton(); triggerVibration([150, 100, 150]);
       return;
     }
 
-    setPrelievoFeedback({ text: `Nessun cartone trovato per ID: ${raw}`, type: 'error' });
+    setPrelievoFeedback({ text: `QR non riconosciuto: ${raw}`, type: 'error' });
     sounds.error(); triggerVibration([300]);
   }
 
@@ -2855,14 +2806,20 @@ export default function App() {
                               setArrivoQtyInvoice(group.invoice);
                               setArrivoQtyActive(true);
                               setArrivoQtyFeedback({ text: '', type: '' });
-                              // Carica cartoni pending E caricato (per "Modifica Arrivo")
+                              // Carica le righe pending, aggregate per codice + magazzino + bancale
                               const { data: existing } = await supabase.from('carton_arrivals')
-                                .select('*').eq('invoice', group.invoice)
-                                .order('data_arrivo', { ascending: true });
+                                .select('*').eq('invoice', group.invoice).eq('stato', 'pending')
+                                .order('id', { ascending: true });
                               if (existing && existing.length > 0) {
-                                setArrivoQtyBancale(existing[0].bancale || '');
-                                setArrivoQtyMagazzino(existing[0].magazzino || 'GESSATE');
-                                setArrivoQtyCartoni(existing.map(c => ({ codice: c.codice, quantita: c.quantita, idCartone: c.id_cartone, qrRaw: c.qr_raw, bancale: c.bancale, manuale: !c.qr_raw, stato: c.stato })));
+                                setArrivoQtyBancale(existing[existing.length - 1].bancale || '');
+                                setArrivoQtyMagazzino(existing[existing.length - 1].magazzino || 'GESSATE');
+                                const agg = new Map();
+                                existing.forEach(c => {
+                                  const key = `${c.codice}__${c.magazzino}__${c.bancale}`;
+                                  if (agg.has(key)) agg.get(key).quantita += (c.quantita || 0);
+                                  else agg.set(key, { codice: c.codice, quantita: c.quantita || 0, bancale: c.bancale, magazzino: c.magazzino });
+                                });
+                                setArrivoQtyCartoni([...agg.values()]);
                                 const qtyMap = {};
                                 existing.forEach(c => {
                                   if (c.po_line_key) qtyMap[c.po_line_key] = (qtyMap[c.po_line_key] || 0) + (c.quantita || 0);
@@ -3028,12 +2985,12 @@ export default function App() {
 
             {/* Scanner QR */}
             <div className="bg-white p-4 rounded-2xl border border-gray-200 shadow-xs space-y-3">
-              <span className="text-[10px] font-black text-gray-400 uppercase tracking-wider block">Scansione QR cartone</span>
+              <span className="text-[10px] font-black text-gray-400 uppercase tracking-wider block">Scansione QR (codice + quantità)</span>
               <form onSubmit={handleArrivoQtySubmit}>
                 <input type="text" ref={arrivoQtyScannerRef} value={arrivoQtyScanner}
                   onChange={e => setArrivoQtyScanner(e.target.value)}
                   autoComplete="off" autoCorrect="off" autoCapitalize="off" spellCheck="false"
-                  placeholder="Spara il QR del cartone..."
+                  placeholder="Spara il QR (stesso codice incrementa la quantità)..."
                   className="w-full bg-white border-2 border-blue-500 text-gray-800 font-mono text-base p-4 rounded-xl shadow-inner focus:outline-hidden text-center" />
               </form>
               {arrivoQtyFeedback.text && (
@@ -3049,7 +3006,7 @@ export default function App() {
 
             {/* Inserimento manuale */}
             <div className="bg-white p-4 rounded-2xl border border-gray-200 shadow-xs space-y-3">
-              <span className="text-[10px] font-black text-gray-400 uppercase tracking-wider block">Inserimento manuale (cartone senza QR)</span>
+              <span className="text-[10px] font-black text-gray-400 uppercase tracking-wider block">Inserimento manuale (codice + quantità)</span>
               <div className="flex gap-3 items-end">
                 <div className="flex-grow space-y-1">
                   <label className="block text-xs font-bold text-gray-500">Codice</label>
@@ -3120,7 +3077,7 @@ export default function App() {
 
               <div className="bg-white rounded-2xl border border-gray-200 shadow-xs overflow-hidden">
                 <div className="flex items-center justify-between px-4 py-3 border-b border-gray-100">
-                  <span className="text-xs font-black text-gray-500 uppercase tracking-wider">{arrivoQtyCartoni.length} cartoni rilevati</span>
+                  <span className="text-xs font-black text-gray-500 uppercase tracking-wider">{arrivoQtyCartoni.length} codici rilevati</span>
                   <span className="text-sm font-black text-blue-600">
                     Tot. pezzi: {arrivoQtyCartoni.reduce((s, c) => s + (c.quantita || 0), 0)}
                   </span>
@@ -3128,39 +3085,22 @@ export default function App() {
                 <table className="w-full text-xs">
                   <thead className="bg-gray-50 border-b border-gray-100 text-[10px] font-black text-gray-500 uppercase">
                     <tr>
-                      <th className="px-3 py-2 text-left">ID Cartone</th>
                       <th className="px-3 py-2 text-left">Codice</th>
+                      <th className="px-3 py-2 text-left">Magazzino</th>
                       <th className="px-3 py-2 text-left">Bancale</th>
                       <th className="px-3 py-2 text-right">Qtà</th>
-                      <th className="px-3 py-2 text-center">Tipo</th>
                       <th className="px-3 py-2"></th>
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-gray-100">
                     {arrivoQtyCartoni.map(c => (
-                      <tr key={c.idCartone} className="hover:bg-gray-50/80">
-                        <td className="px-3 py-2 font-mono text-[10px] text-gray-500 truncate max-w-[180px]" title={c.idCartone}>{c.idCartone}</td>
+                      <tr key={`${c.codice}__${c.magazzino}__${c.bancale}`} className="hover:bg-gray-50/80">
                         <td className="px-3 py-2 font-mono font-bold text-blue-700">{c.codice}</td>
+                        <td className="px-3 py-2 text-gray-600">{c.magazzino}</td>
                         <td className="px-3 py-2 text-gray-600">{c.bancale}</td>
                         <td className="px-3 py-2 text-right font-black">{c.quantita}</td>
-                        <td className="px-3 py-2 text-center">
-                          <div className="flex flex-col gap-0.5 items-center">
-                            {c.manuale
-                              ? <span className="text-[9px] bg-amber-50 text-amber-700 border border-amber-200 px-1.5 py-px rounded font-bold">MAN</span>
-                              : <span className="text-[9px] bg-green-50 text-green-700 border border-green-200 px-1.5 py-px rounded font-bold">QR</span>}
-                            {c.stato === 'caricato' && <span className="text-[9px] bg-green-50 text-green-700 border border-green-200 px-1.5 py-px rounded font-bold">✓</span>}
-                            {c.warning && <span className="text-[9px] bg-red-50 text-red-600 border border-red-200 px-1.5 py-px rounded font-bold">⚠</span>}
-                          </div>
-                        </td>
-                        <td className="px-3 py-2">
-                          <div className="flex items-center justify-end gap-3">
-                            {c.manuale && (
-                              <button onClick={() => printCartonLabel(c)} className={`text-[10px] font-bold px-2.5 py-1 rounded-lg cursor-pointer transition shadow-xs whitespace-nowrap ${printedCartons.has(c.idCartone) ? 'bg-gray-200 text-gray-500 border border-gray-300' : 'bg-blue-600 hover:bg-blue-700 text-white'}`}>
-                                🖨️ Stampa
-                              </button>
-                            )}
-                            <button onClick={() => removeCarton(c.idCartone)} className="text-[10px] text-gray-400 hover:text-red-600 bg-gray-50 hover:bg-red-50 border border-gray-200 hover:border-red-300 px-2 py-1 rounded-lg cursor-pointer transition">✕</button>
-                          </div>
+                        <td className="px-3 py-2 text-right">
+                          <button onClick={() => removeCarton(c)} className="text-[10px] text-gray-400 hover:text-red-600 bg-gray-50 hover:bg-red-50 border border-gray-200 hover:border-red-300 px-2 py-1 rounded-lg cursor-pointer transition">✕</button>
                         </td>
                       </tr>
                     ))}
@@ -3176,7 +3116,7 @@ export default function App() {
                     onClick={caricaArrivoSuInventario}
                     disabled={!invoiceComplete}
                     className={`w-full font-black p-4 rounded-xl text-base shadow-md transition flex items-center justify-center gap-2 ${!invoiceComplete ? 'bg-gray-200 text-gray-400 cursor-not-allowed' : 'bg-green-600 hover:bg-green-700 text-white cursor-pointer'}`}>
-                    ✓ Carica {arrivoQtyCartoni.length} cartoni su Inventario Spare Parts
+                    ✓ Carica su Inventario Spare Parts
                   </button>
                 </div>
               </div>
