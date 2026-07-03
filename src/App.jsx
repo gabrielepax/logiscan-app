@@ -475,45 +475,58 @@ export default function App() {
 
     const reader = new FileReader();
     reader.onload = async function(e) {
-      let rows;
+      const norm = s => String(s).trim().toUpperCase();
+      let aoa = null;
+      let headerIdx = -1;
       try {
         const wb = XLSX.read(e.target.result, { type: 'array' });
-        // Foglio 2
-        const sheetName = wb.SheetNames[1] || wb.SheetNames[0];
-        const ws = wb.Sheets[sheetName];
-        rows = XLSX.utils.sheet_to_json(ws, { defval: '' });
+        // Cerca in TUTTI i fogli quello che contiene una riga di intestazione con 'CODICE'
+        for (const sheetName of wb.SheetNames) {
+          const ws = wb.Sheets[sheetName];
+          const rows = XLSX.utils.sheet_to_json(ws, { header: 1, defval: '', blankrows: false, raw: false });
+          const hIdx = rows.findIndex(row => row.some(c => norm(c) === 'CODICE'));
+          if (hIdx !== -1) { aoa = rows; headerIdx = hIdx; break; }
+        }
       } catch {
         alert("Errore: impossibile leggere il file Excel.");
         setStockLoading(false);
         return;
       }
 
-      if (rows.length === 0) {
-        alert("Nessun dato trovato nel foglio.");
+      if (!aoa || headerIdx === -1) {
+        alert("Errore: impossibile trovare la colonna 'CODICE' in nessun foglio del file.\nControlla che il file contenga le intestazioni (LOCAZIONE, NUMERO BANCALE, MAGAZZINO, CODICE, STOCK).");
         setStockLoading(false);
         return;
       }
 
-      const seen = new Set();
-      const allRows = rows
-        .filter(r => {
-          const codice = String(r['CODICE'] || '').trim();
-          if (!codice) return false;
-          const key = `${codice}__${String(r['MAGAZZINO']||'').trim()}__${String(r['NUMERO BANCALE']||'').trim()}`;
-          if (seen.has(key)) return false;
-          seen.add(key);
-          return true;
-        })
-        .map(r => ({
-          locazione:      String(r['LOCAZIONE'] || '').trim(),
-          numero_bancale: String(r['NUMERO BANCALE'] || '').trim(),
-          magazzino:      String(r['MAGAZZINO'] || '').trim(),
-          codice:         String(r['CODICE'] || '').trim(),
-          stock:          parseFloat(r['STOCK']) || 0,
-        }));
+      const headers = aoa[headerIdx].map(h => norm(h));
+      const idx = (name) => headers.indexOf(name);
+      const iCod = idx('CODICE');
+      const iStock = idx('STOCK');
+      const iMag = idx('MAGAZZINO');
+      const iBanc = headers.findIndex(h => h.includes('BANCALE'));
+      const iLoc = idx('LOCAZIONE');
+
+      // Nessun dedup: ogni riga del file è un record a sé (modello "una riga per cartone")
+      const allRows = aoa.slice(headerIdx + 1)
+        .map(row => ({
+          locazione:      iLoc >= 0 ? String(row[iLoc] || '').trim() : '',
+          numero_bancale: iBanc >= 0 ? String(row[iBanc] || '').trim() : '',
+          magazzino:      iMag >= 0 ? String(row[iMag] || '').trim() : '',
+          codice:         String(row[iCod] || '').trim(),
+          stock:          parseFloat(row[iStock]) || 0,
+        }))
+        .filter(r => r.codice);
 
       // Solo righe con stock > 0 (le zero non vengono inserite)
       const toInsert = allRows.filter(r => r.stock !== 0);
+
+      // GUARDIA: non svuotare l'inventario se il file non produce righe valide
+      if (toInsert.length === 0) {
+        alert("Il file non contiene righe valide con stock > 0. Import annullato (l'inventario attuale NON è stato modificato).");
+        setStockLoading(false);
+        return;
+      }
 
       // L'import Excel è uno snapshot completo: SOSTITUISCE l'intero inventario
       if (!window.confirm(`ATTENZIONE: l'import Excel SOSTITUISCE l'intero Inventario Spare Parts.\n\nTutte le righe attuali (incluse quelle create dai processi di arrivo) verranno eliminate e rimpiazzate con le ${toInsert.length} righe del file.\n\nProcedere?`)) {
