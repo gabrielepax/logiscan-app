@@ -118,6 +118,7 @@ export default function App() {
   const [arrivoQtyCartoni, setArrivoQtyCartoni] = useState([]);
   const [arrivoQtyScanner, setArrivoQtyScanner] = useState('');
   const [arrivoQtyManuale, setArrivoQtyManuale] = useState({ codice: '', quantita: '' });
+  const [arrivoCodiceOpen, setArrivoCodiceOpen] = useState(false);
   const [arrivoQtyFeedback, setArrivoQtyFeedback] = useState({ text: '', type: '' });
   const arrivoQtyScannerRef = useRef(null);
   const [moveBancaleSrc, setMoveBancaleSrc] = useState('');
@@ -3008,15 +3009,35 @@ export default function App() {
             <div className="bg-white p-4 rounded-2xl border border-gray-200 shadow-xs space-y-3">
               <span className="text-[10px] font-black text-gray-400 uppercase tracking-wider block">Inserimento manuale (codice + quantità)</span>
               <div className="flex gap-3 items-end">
-                <div className="flex-grow space-y-1">
+                <div className="flex-grow space-y-1 relative">
                   <label className="block text-xs font-bold text-gray-500">Codice</label>
-                  <input list="arrivo-codici-attesi" value={arrivoQtyManuale.codice} onChange={e => setArrivoQtyManuale(v => ({...v, codice: e.target.value}))}
+                  <input value={arrivoQtyManuale.codice}
+                    onChange={e => { setArrivoQtyManuale(v => ({...v, codice: e.target.value})); setArrivoCodiceOpen(true); }}
+                    onFocus={() => setArrivoCodiceOpen(true)}
+                    onBlur={() => setTimeout(() => setArrivoCodiceOpen(false), 200)}
+                    autoComplete="off"
                     placeholder="Cerca tra i codici attesi..."
                     className="w-full bg-gray-50 border border-gray-300 rounded-xl p-2.5 text-xs font-mono focus:outline-hidden" />
-                  <datalist id="arrivo-codici-attesi">
-                    {poLines.filter(l => l.china_invoice === arrivoQtyInvoice && l.sn_required === false)
-                      .map(l => <option key={l.unique_key} value={l.item_code}>{l.description} — attesi {l.qty_expected}</option>)}
-                  </datalist>
+                  {arrivoCodiceOpen && (() => {
+                    const q = arrivoQtyManuale.codice.trim().toLowerCase();
+                    const opts = poLines
+                      .filter(l => l.china_invoice === arrivoQtyInvoice && l.sn_required === false)
+                      .filter(l => !q || (l.item_code || '').toLowerCase().includes(q) || (l.description || '').toLowerCase().includes(q))
+                      .slice(0, 30);
+                    if (opts.length === 0) return null;
+                    return (
+                      <div className="absolute z-30 left-0 right-0 mt-1 bg-white border border-gray-200 rounded-xl shadow-lg max-h-56 overflow-y-auto">
+                        {opts.map(l => (
+                          <button key={l.unique_key} type="button"
+                            onMouseDown={(ev) => { ev.preventDefault(); setArrivoQtyManuale(v => ({...v, codice: l.item_code})); setArrivoCodiceOpen(false); }}
+                            className="w-full text-left px-3 py-2 hover:bg-blue-50 border-b border-gray-100 last:border-none">
+                            <div className="font-mono font-bold text-xs text-blue-700">{l.item_code}</div>
+                            <div className="text-[10px] text-gray-500 truncate">{l.description} — attesi {l.qty_expected}</div>
+                          </button>
+                        ))}
+                      </div>
+                    );
+                  })()}
                 </div>
                 <div className="w-28 space-y-1">
                   <label className="block text-xs font-bold text-gray-500">Quantità</label>
