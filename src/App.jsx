@@ -512,23 +512,28 @@ export default function App() {
           stock:          parseFloat(r['STOCK']) || 0,
         }));
 
-      // Righe con stock > 0: upsert; righe con stock = 0: elimina dal DB
-      const toUpsert = allRows.filter(r => r.stock !== 0);
-      const toDelete = allRows.filter(r => r.stock === 0);
+      // Solo righe con stock > 0 (le zero non vengono inserite)
+      const toInsert = allRows.filter(r => r.stock !== 0);
 
-      const { error } = await supabase
-        .from('stock_inventory')
-        .upsert(toUpsert, { onConflict: 'codice,magazzino,numero_bancale' });
-
-      if (toDelete.length > 0) {
-        for (const r of toDelete) {
-          await supabase.from('stock_inventory').delete()
-            .eq('codice', r.codice).eq('magazzino', r.magazzino).eq('numero_bancale', r.numero_bancale);
-        }
+      // L'import Excel è uno snapshot completo: SOSTITUISCE l'intero inventario
+      if (!window.confirm(`ATTENZIONE: l'import Excel SOSTITUISCE l'intero Inventario Spare Parts.\n\nTutte le righe attuali (incluse quelle create dai processi di arrivo) verranno eliminate e rimpiazzate con le ${toInsert.length} righe del file.\n\nProcedere?`)) {
+        setStockLoading(false);
+        return;
       }
 
-      if (error) { alert("Errore salvataggio stock: " + error.message); }
-      else { await fetchStock(); alert(`${toUpsert.length} record caricati, ${toDelete.length} a zero rimossi.`); }
+      // 1. Svuota la tabella
+      const { error: delErr } = await supabase.from('stock_inventory').delete().gte('id', 0);
+      if (delErr) { alert("Errore durante lo svuotamento: " + delErr.message); setStockLoading(false); return; }
+
+      // 2. Inserimento a blocchi
+      let insErr = null;
+      for (let i = 0; i < toInsert.length; i += 500) {
+        const { error } = await supabase.from('stock_inventory').insert(toInsert.slice(i, i + 500));
+        if (error) { insErr = error; break; }
+      }
+
+      if (insErr) { alert("Errore salvataggio stock: " + insErr.message); }
+      else { await fetchStock(); alert(`Inventario sostituito: ${toInsert.length} record caricati.`); }
     };
     reader.readAsArrayBuffer(file);
   }
