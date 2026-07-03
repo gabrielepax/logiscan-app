@@ -603,17 +603,17 @@ export default function App() {
     const mag = arrivoQtyMagazzino;
     // Cerca una riga pending esistente per queste coordinate
     const { data: existing } = await supabase.from('carton_arrivals')
-      .select('id, quantita').eq('invoice', arrivoQtyInvoice).eq('codice', codice)
+      .select('id, quantita, rilievi').eq('invoice', arrivoQtyInvoice).eq('codice', codice)
       .eq('magazzino', mag).eq('bancale', bancale).eq('stato', 'pending').limit(1);
     if (existing && existing.length > 0) {
       const { error } = await supabase.from('carton_arrivals')
-        .update({ quantita: (existing[0].quantita || 0) + qty }).eq('id', existing[0].id);
+        .update({ quantita: (existing[0].quantita || 0) + qty, rilievi: (existing[0].rilievi || 1) + 1 }).eq('id', existing[0].id);
       if (error) { setArrivoQtyFeedback({ text: 'Errore DB: ' + error.message, type: 'error' }); return false; }
     } else {
       const synthId = `${arrivoQtyInvoice}__${codice}__${mag}__${bancale}`;
       const { error } = await supabase.from('carton_arrivals').insert({
         id_cartone: synthId, invoice: arrivoQtyInvoice, bancale, magazzino: mag,
-        codice, quantita: qty, qr_raw: null, stato: 'pending', po_line_key: matchedLine?.unique_key || null
+        codice, quantita: qty, rilievi: 1, qr_raw: null, stato: 'pending', po_line_key: matchedLine?.unique_key || null
       });
       if (error) { setArrivoQtyFeedback({ text: 'Errore DB: ' + error.message, type: 'error' }); return false; }
     }
@@ -2819,8 +2819,8 @@ export default function App() {
                                 const agg = new Map();
                                 existing.forEach(c => {
                                   const key = `${c.codice}__${c.magazzino}__${c.bancale}`;
-                                  if (agg.has(key)) { agg.get(key).quantita += (c.quantita || 0); agg.get(key).rilievi += 1; }
-                                  else agg.set(key, { codice: c.codice, quantita: c.quantita || 0, bancale: c.bancale, magazzino: c.magazzino, rilievi: 1 });
+                                  if (agg.has(key)) { agg.get(key).quantita += (c.quantita || 0); agg.get(key).rilievi += (c.rilievi || 1); }
+                                  else agg.set(key, { codice: c.codice, quantita: c.quantita || 0, bancale: c.bancale, magazzino: c.magazzino, rilievi: c.rilievi || 1 });
                                 });
                                 setArrivoQtyCartoni([...agg.values()]);
                                 const qtyMap = {};
@@ -3003,16 +3003,18 @@ export default function App() {
             <div className="bg-white p-4 rounded-2xl border border-gray-200 shadow-xs space-y-3">
               {/* Bancale in lavorazione */}
               {arrivoQtyBancale.trim() ? (
-                <div className="flex items-center justify-between bg-blue-50 border border-blue-100 rounded-xl px-3 py-2">
-                  <span className="text-xs font-bold text-blue-800">
-                    📦 Bancale: <span className="font-mono">{arrivoQtyBancale}</span> <span className="text-blue-400">· {arrivoQtyMagazzino}</span>
-                  </span>
+                <div className="flex items-center justify-between bg-blue-50 border border-blue-200 rounded-xl px-4 py-3 gap-3">
+                  <div className="min-w-0">
+                    <span className="text-[9px] font-black text-blue-400 uppercase tracking-wider block">Bancale in lavorazione</span>
+                    <span className="text-lg sm:text-xl font-black text-blue-800 font-mono truncate block">📦 {arrivoQtyBancale}</span>
+                    <span className="text-[10px] font-bold text-blue-400 uppercase">{arrivoQtyMagazzino}</span>
+                  </div>
                   <button onClick={() => setArrivoBancaleForm({ open: true, nome: '', magazzino: arrivoQtyMagazzino })}
-                    className="text-[11px] font-bold text-blue-600 hover:text-blue-800 cursor-pointer">Nuovo bancale</button>
+                    className="shrink-0 bg-blue-600 hover:bg-blue-700 text-white text-xs font-bold px-3 py-2 rounded-xl cursor-pointer transition shadow-xs whitespace-nowrap">+ Nuovo bancale</button>
                 </div>
               ) : (
                 <button onClick={() => setArrivoBancaleForm({ open: true, nome: '', magazzino: arrivoQtyMagazzino || 'GESSATE' })}
-                  className="w-full bg-blue-600 hover:bg-blue-700 text-white text-sm font-bold py-2.5 rounded-xl cursor-pointer transition shadow-xs">
+                  className="w-full bg-blue-600 hover:bg-blue-700 text-white text-sm font-bold py-3 rounded-xl cursor-pointer transition shadow-xs">
                   + Nuovo bancale
                 </button>
               )}
@@ -3145,9 +3147,18 @@ export default function App() {
                   <div className="space-y-3">
                     {bancali.map(b => (
                       <div key={`${b.magazzino}__${b.bancale}`} className="bg-white rounded-2xl border border-gray-200 shadow-xs overflow-hidden">
-                        <div className="flex items-center justify-between px-4 py-2.5 bg-blue-50 border-b border-blue-100">
-                          <span className="text-xs font-black text-blue-800">📦 {b.bancale} <span className="text-blue-400 font-bold">· {b.magazzino}</span></span>
-                          <span className="text-[11px] font-bold text-blue-600">{b.rilievi} rilievi · {b.pezzi} pz</span>
+                        <div className="flex items-center justify-between px-4 py-2.5 bg-blue-50 border-b border-blue-100 gap-2">
+                          <span className="text-xs font-black text-blue-800 min-w-0 truncate">📦 {b.bancale} <span className="text-blue-400 font-bold">· {b.magazzino}</span></span>
+                          <div className="flex items-center gap-2 shrink-0">
+                            <span className="text-[11px] font-bold text-blue-600">{b.rilievi} rilievi · {b.pezzi} pz</span>
+                            {(arrivoQtyBancale !== b.bancale || arrivoQtyMagazzino !== b.magazzino) && (
+                              <button onClick={() => { setArrivoQtyBancale(b.bancale); setArrivoQtyMagazzino(b.magazzino); window.scrollTo({ top: 0, behavior: 'smooth' }); }}
+                                className="text-[10px] font-bold text-white bg-blue-600 hover:bg-blue-700 px-2 py-1 rounded-lg cursor-pointer transition whitespace-nowrap">✎ Modifica</button>
+                            )}
+                            {arrivoQtyBancale === b.bancale && arrivoQtyMagazzino === b.magazzino && (
+                              <span className="text-[9px] font-black text-green-700 bg-green-100 border border-green-200 px-2 py-1 rounded-lg">IN LAVORAZIONE</span>
+                            )}
+                          </div>
                         </div>
                         <table className="w-full text-xs">
                           <thead className="bg-gray-50 border-b border-gray-100 text-[10px] font-black text-gray-500 uppercase">
