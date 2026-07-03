@@ -108,6 +108,7 @@ export default function App() {
   const [stockEditMode, setStockEditMode] = useState(false);
   const [stockSearch2, setStockSearch2] = useState('');
   const [stockPendingChanges, setStockPendingChanges] = useState({});
+  const [stockNewRows, setStockNewRows] = useState([]); // righe nuove da inserire (in modalità modifica)
   const [moveBancaleOpen, setMoveBancaleOpen] = useState(false);
 
   // Arrivo Quantità
@@ -963,9 +964,12 @@ export default function App() {
 
   async function saveAllStockChanges() {
     const entries = Object.entries(stockPendingChanges);
-    if (entries.length === 0) return;
+    const validNewRows = stockNewRows.filter(r => (r.codice || '').trim());
+    if (entries.length === 0 && validNewRows.length === 0) return;
     setStockLoading(true);
     let errors = [];
+
+    // 1. Aggiorna righe esistenti modificate
     for (const [id, changes] of entries) {
       const original = stockItems.find(s => String(s.id) === String(id));
       const merged = { ...original, ...changes, stock: parseFloat(changes.stock ?? original?.stock) || 0 };
@@ -976,15 +980,26 @@ export default function App() {
         .eq('id', Number(id));
       if (error) errors.push(error.message);
     }
+
+    // 2. Inserisci righe nuove
+    const toInsert = validNewRows.map(r => ({
+      locazione: (r.locazione || '').trim(),
+      numero_bancale: (r.numero_bancale || '').trim(),
+      magazzino: r.magazzino || 'GESSATE',
+      codice: r.codice.trim(),
+      stock: parseFloat(r.stock) || 0,
+    }));
+    if (toInsert.length > 0) {
+      const { error } = await supabase.from('stock_inventory').insert(toInsert);
+      if (error) errors.push('Nuove righe: ' + error.message);
+    }
+
     if (errors.length > 0) { alert("Errori: " + errors.join('\n')); }
     else {
-      setStockItems(prev => prev.map(s => {
-        const changes = stockPendingChanges[s.id];
-        if (!changes) return s;
-        return { ...s, ...changes, stock: parseFloat(changes.stock ?? s.stock) || 0 };
-      }));
       setStockPendingChanges({});
+      setStockNewRows([]);
       setStockEditMode(false);
+      await fetchStock();
     }
     setStockLoading(false);
   }
@@ -1069,6 +1084,23 @@ export default function App() {
         });
         return key ? String(row[key] || '').trim() : '';
       };
+
+      // Controllo righe duplicate nel file (stessa PO INTERNAL ID + Line ID): il file NON deve contenerle
+      const keyCount = new Map();
+      records.forEach(row => {
+        const key = `${row["PO INTERNAL ID"]}_${row["Line ID"]}`;
+        keyCount.set(key, (keyCount.get(key) || 0) + 1);
+      });
+      const dupKeys = [...keyCount.entries()].filter(([, n]) => n > 1);
+      if (dupKeys.length > 0) {
+        const dettaglio = dupKeys.slice(0, 15).map(([k, n]) => {
+          const [po, line] = k.split('_');
+          return `• PO ${po} / Linea ${line} — ${n} volte`;
+        }).join('\n');
+        alert(`CARICAMENTO BLOCCATO — il file contiene ${dupKeys.length} righe duplicate (stessa PO INTERNAL ID + Line ID):\n\n${dettaglio}${dupKeys.length > 15 ? '\n...' : ''}\n\nCorreggi il file di origine rimuovendo i duplicati e ricaricalo.`);
+        setLoading(false);
+        return;
+      }
 
       const rowsToUpsert = records.map(row => {
         const poInternalId = row["PO INTERNAL ID"];
@@ -2150,10 +2182,16 @@ export default function App() {
                         📥 Esporta XLS ({filtered.length})
                       </button>
                     )}
-                    <button onClick={() => setStockEditMode(v => !v)}
+                    <button onClick={() => { setStockEditMode(v => !v); if (stockEditMode) setStockNewRows([]); }}
                       className={`text-[10px] font-bold px-2.5 py-1 rounded-lg border transition cursor-pointer ${stockEditMode ? 'bg-amber-500 text-white border-amber-600' : 'bg-gray-50 text-gray-500 hover:bg-gray-100 border-gray-200'}`}>
                       {stockEditMode ? '✏️ Modifica ON' : '✏️ Modifica'}
                     </button>
+                    {stockEditMode && (
+                      <button onClick={() => setStockNewRows(prev => [{ tempId: Date.now() + Math.random(), locazione: '', numero_bancale: '', magazzino: 'GESSATE', codice: '', stock: '' }, ...prev])}
+                        className="text-[10px] font-bold text-white bg-green-600 hover:bg-green-700 px-2.5 py-1 rounded-lg transition cursor-pointer">
+                        + Aggiungi riga
+                      </button>
+                    )}
                     <button onClick={() => { setStockSearch(''); setStockSearch2(''); setStockFilterMagazzino(''); setStockFilterLocazione(''); setStockFilterBancale(''); setStockFilterNoMatch(false); setStockPage(0); }}
                       className="text-[10px] font-bold text-gray-400 hover:text-red-600 bg-gray-50 hover:bg-red-50 border border-gray-200 hover:border-red-200 px-2.5 py-1 rounded-lg transition cursor-pointer">
                       ✕ Reset filtri
@@ -2184,6 +2222,32 @@ export default function App() {
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-gray-100">
+                      {/* Righe nuove in inserimento (modalità modifica) */}
+                      {stockEditMode && stockNewRows.map(r => {
+                        const nCls = "w-full bg-green-50 border border-green-300 rounded px-1 py-0.5 text-xs focus:outline-none";
+                        const upd = (field, val) => setStockNewRows(prev => prev.map(x => x.tempId === r.tempId ? { ...x, [field]: val } : x));
+                        return (
+                          <tr key={r.tempId} className="bg-green-50/40">
+                            <td className="px-2 py-1"><input className={nCls} value={r.locazione} onChange={e => upd('locazione', e.target.value)} placeholder="Locazione" /></td>
+                            <td className="px-2 py-1"><input className={nCls} value={r.numero_bancale} onChange={e => upd('numero_bancale', e.target.value)} placeholder="Bancale" /></td>
+                            <td className="px-2 py-1">
+                              <select className={nCls} value={r.magazzino} onChange={e => upd('magazzino', e.target.value)}>
+                                <option value="GESSATE">GESSATE</option><option value="ESPRINET">ESPRINET</option>
+                              </select>
+                            </td>
+                            <td className="px-2 py-1"><input className={nCls + ' font-mono font-bold text-blue-700'} value={r.codice} onChange={e => upd('codice', e.target.value)} placeholder="Codice *" /></td>
+                            <td className="px-2 py-2 text-gray-300 text-[10px]">nuovo</td>
+                            <td className="px-1 py-2"></td>
+                            <td className="px-2 py-2"></td>
+                            <td className="px-2 py-2"></td>
+                            <td className="px-2 py-1 text-right"><input className={nCls + ' text-right font-mono font-black'} value={r.stock} onChange={e => upd('stock', e.target.value)} placeholder="0" /></td>
+                            <td className="px-2 py-2 text-center">
+                              <button onClick={() => setStockNewRows(prev => prev.filter(x => x.tempId !== r.tempId))}
+                                className="text-[10px] text-gray-400 hover:text-red-500 cursor-pointer" title="Rimuovi riga">✕</button>
+                            </td>
+                          </tr>
+                        );
+                      })}
                       {filtered.slice(stockPage * 100, stockPage * 100 + 100).map((s, rowIndex) => {
                           const pending = stockPendingChanges[s.id];
                           const d = pending ? { ...s, ...pending } : s;
@@ -3432,19 +3496,19 @@ export default function App() {
         </div>
       )}
 
-      {activeModule === 'stock' && Object.keys(stockPendingChanges).length > 0 && (
+      {activeModule === 'stock' && (Object.keys(stockPendingChanges).length > 0 || stockNewRows.length > 0) && (
         <div className="fixed bottom-0 left-0 right-0 z-50 bg-white border-t border-amber-200 shadow-lg px-4 py-3 flex items-center justify-between gap-4">
           <span className="text-sm font-bold text-amber-700">
-            ✏️ {Object.keys(stockPendingChanges).length} riga/righe modificate non salvate
+            ✏️ {Object.keys(stockPendingChanges).length} modificate{stockNewRows.length > 0 ? ` · ${stockNewRows.length} nuove` : ''}
           </span>
           <div className="flex gap-2">
-            <button onClick={() => setStockPendingChanges({})}
+            <button onClick={() => { setStockPendingChanges({}); setStockNewRows([]); }}
               className="text-sm font-bold px-4 py-2 rounded-xl bg-gray-100 hover:bg-gray-200 text-gray-600 cursor-pointer transition">
               Annulla tutto
             </button>
             <button onClick={saveAllStockChanges}
               className="text-sm font-bold px-4 py-2 rounded-xl bg-green-600 hover:bg-green-700 text-white cursor-pointer transition shadow-xs">
-              ✓ Salva {Object.keys(stockPendingChanges).length} modifiche
+              ✓ Salva
             </button>
           </div>
         </div>
