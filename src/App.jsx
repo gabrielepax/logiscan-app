@@ -152,6 +152,7 @@ export default function App() {
   const [prelievoManuale, setPrelievoManuale] = useState({ codice: '', stockId: '', quantita: '' });
   const [prelievoShowEsprinet, setPrelievoShowEsprinet] = useState(false);
   const prelievoScannerRef = useRef(null);
+  const registraLockRef = useRef(false); // guard anti doppio-submit prelievo
 
   // Anagrafica Terminali (tipoterminale.xlsx → foglio "famiglie", chiave CODICE = PNIT del DB spare parts)
   const [anagrafica, setAnagrafica] = useState([]);
@@ -1197,51 +1198,58 @@ export default function App() {
     }
     if (!window.confirm(`Registrare il prelievo di ${prelievoRighe.length} righe?\n\nLe giacenze verranno decurtate dall'inventario.`)) return;
 
+    // Guard sincrono anti doppio-submit: blocca una seconda invocazione ravvicinata
+    if (registraLockRef.current) return;
+    registraLockRef.current = true;
     setLoading(true);
     const errors = [];
 
-    // Genera id_prelievo AAMMGG-X
-    const now = new Date();
-    const datePrefix = String(now.getFullYear()).slice(2).padStart(2,'0')
-      + String(now.getMonth() + 1).padStart(2,'0')
-      + String(now.getDate()).padStart(2,'0');
-    const { count } = await supabase.from('prelievi')
-      .select('*', { count: 'exact', head: true })
-      .like('id_prelievo', `${datePrefix}-%`);
-    const idPrelievo = `${datePrefix}-${(count || 0) + 1}`;
+    try {
+      // Genera id_prelievo AAMMGG-X
+      const now = new Date();
+      const datePrefix = String(now.getFullYear()).slice(2).padStart(2,'0')
+        + String(now.getMonth() + 1).padStart(2,'0')
+        + String(now.getDate()).padStart(2,'0');
+      const { count } = await supabase.from('prelievi')
+        .select('*', { count: 'exact', head: true })
+        .like('id_prelievo', `${datePrefix}-%`);
+      const idPrelievo = `${datePrefix}-${(count || 0) + 1}`;
 
-    // 1. Crea testata prelievo
-    const { data: testata, error: errT } = await supabase.from('prelievi')
-      .insert({ id_prelievo: idPrelievo, utente: user, destinazione: prelievoDest.trim() || null })
-      .select('id').single();
-    if (errT) { alert('Errore creazione prelievo: ' + errT.message); setLoading(false); return; }
+      // 1. Crea testata prelievo
+      const { data: testata, error: errT } = await supabase.from('prelievi')
+        .insert({ id_prelievo: idPrelievo, utente: user, destinazione: prelievoDest.trim() || null })
+        .select('id').single();
+      if (errT) { alert('Errore creazione prelievo: ' + errT.message); return; }
 
-    // 2. Righe + decurtazione stock
-    for (const r of prelievoRighe) {
-      const q = parseFloat(r.quantita);
-      await supabase.from('prelievi_righe').insert({
-        prelievo_id: testata.id, stock_id: r.stockId, id_cartone: r.idCartone,
-        codice: r.codice, numero_bancale: r.numero_bancale, magazzino: r.magazzino, quantita: q,
-      });
-      const nuovoStock = r.qtaDisponibile - q;
-      if (nuovoStock <= 0) {
-        const { error } = await supabase.from('stock_inventory').delete().eq('id', r.stockId);
-        if (error) errors.push(`${r.codice}: ${error.message}`);
-      } else {
-        const { error } = await supabase.from('stock_inventory').update({ stock: nuovoStock }).eq('id', r.stockId);
-        if (error) errors.push(`${r.codice}: ${error.message}`);
+      // 2. Righe + decurtazione stock
+      for (const r of prelievoRighe) {
+        const q = parseFloat(r.quantita);
+        await supabase.from('prelievi_righe').insert({
+          prelievo_id: testata.id, stock_id: r.stockId, id_cartone: r.idCartone,
+          codice: r.codice, numero_bancale: r.numero_bancale, magazzino: r.magazzino, quantita: q,
+        });
+        const nuovoStock = r.qtaDisponibile - q;
+        if (nuovoStock <= 0) {
+          const { error } = await supabase.from('stock_inventory').delete().eq('id', r.stockId);
+          if (error) errors.push(`${r.codice}: ${error.message}`);
+        } else {
+          const { error } = await supabase.from('stock_inventory').update({ stock: nuovoStock }).eq('id', r.stockId);
+          if (error) errors.push(`${r.codice}: ${error.message}`);
+        }
       }
-    }
 
-    if (errors.length) alert('Completato con errori:\n' + errors.join('\n'));
-    else alert(`Prelievo ${idPrelievo} registrato (${prelievoRighe.length} righe).`);
-    setPrelievoRighe([]);
-    setPrelievoDest('');
-    setPrelievoFeedback({ text: '', type: '' });
-    setPrelievoView('list');
-    await fetchStock();
-    await fetchPrelievi();
-    setLoading(false);
+      if (errors.length) alert('Completato con errori:\n' + errors.join('\n'));
+      else alert(`Prelievo ${idPrelievo} registrato (${prelievoRighe.length} righe).`);
+      setPrelievoRighe([]);
+      setPrelievoDest('');
+      setPrelievoFeedback({ text: '', type: '' });
+      setPrelievoView('list');
+      await fetchStock();
+      await fetchPrelievi();
+    } finally {
+      registraLockRef.current = false;
+      setLoading(false);
+    }
   }
 
   function handleStockKeyNav(e, rowIndex, field) {
@@ -3442,9 +3450,9 @@ export default function App() {
                   </table>
                   </div>
                   <div className="p-4 border-t border-gray-100">
-                    <button onClick={registraPrelievo}
-                      className="w-full bg-green-600 hover:bg-green-700 text-white font-black p-4 rounded-xl text-base shadow-md transition cursor-pointer flex items-center justify-center gap-2">
-                      ✓ Registra prelievo ({prelievoRighe.length} righe — {totalePezzi} pz)
+                    <button onClick={registraPrelievo} disabled={loading}
+                      className="w-full bg-green-600 hover:bg-green-700 disabled:opacity-50 disabled:cursor-not-allowed text-white font-black p-4 rounded-xl text-base shadow-md transition cursor-pointer flex items-center justify-center gap-2">
+                      {loading ? 'Registrazione in corso…' : `✓ Registra prelievo (${prelievoRighe.length} righe — ${totalePezzi} pz)`}
                     </button>
                   </div>
                 </div>
