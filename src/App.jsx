@@ -4,8 +4,9 @@ import * as XLSX from 'xlsx';
 import { useColumnWidths } from './useColumnWidths';
 
 // Moduli work-in-progress da nascondere dal menu (impostare a true per riattivarli)
-const SHOW_WIP_MODULES = false;
-const WIP_MODULE_IDS = ['riepilogo', 'anagrafica'];
+// Moduli WIP visibili solo in sviluppo locale (npm run dev), nascosti nella build di produzione (Vercel)
+const SHOW_WIP_MODULES = import.meta.env.DEV;
+const WIP_MODULE_IDS = ['riepilogo', 'anagrafica', 'matrice'];
 
 const SP_DEFAULT_WIDTHS = {
   pn: 130, terminal_pn: 120, modello: 60, pnit: 80, english_name: 110,
@@ -134,12 +135,14 @@ export default function App() {
   const [spPage, setSpPage] = useState(0);
   const [spEditMode, setSpEditMode] = useState(false);
   const [spPendingChanges, setSpPendingChanges] = useState({});
+  const [spNewRows, setSpNewRows] = useState([]); // righe nuove da inserire (in modalità modifica)
   const [downloadedKeys, setDownloadedKeys] = useState(new Set());
 
   // Prelievi
   const [prelievoView, setPrelievoView] = useState('list'); // 'list' | 'new' | 'detail'
   const [prelieviList, setPrelieviList] = useState([]);
   const [prelievoDetail, setPrelievoDetail] = useState(null); // { testata, righe }
+  const [prelievoTab, setPrelievoTab] = useState('attivi'); // 'attivi' | 'registrati'
   const [prelieviLoading, setPrelieviLoading] = useState(false);
   const [prelievoUtente, setPrelievoUtente] = useState('');
   const [prelievoDest, setPrelievoDest] = useState('');
@@ -150,9 +153,10 @@ export default function App() {
   const [prelievoShowEsprinet, setPrelievoShowEsprinet] = useState(false);
   const prelievoScannerRef = useRef(null);
 
-  // Anagrafica Hardware
-  const [hardware, setHardware] = useState([]);
-  const [hwLoading, setHwLoading] = useState(false);
+  // Anagrafica Terminali (tipoterminale.xlsx → foglio "famiglie", chiave CODICE = PNIT del DB spare parts)
+  const [anagrafica, setAnagrafica] = useState([]);
+  const [anagLoading, setAnagLoading] = useState(false);
+  const [anagSearch, setAnagSearch] = useState('');
 
   // Riepilogo Stock
   const [riepSearch, setRiepSearch] = useState('');
@@ -161,6 +165,17 @@ export default function App() {
   const [riepFilterRef, setRiepFilterRef] = useState(false);
   const [riepFilterRplus, setRiepFilterRplus] = useState(false);
   const [riepExpanded, setRiepExpanded] = useState(new Set());
+  const [riepGroupMode, setRiepGroupMode] = useState('type'); // 'type' = TYPE→Gruppo, 'gruppo' = Gruppo→TYPE
+  const [ordini, setOrdini] = useState({}); // codice -> { in_arrivo, in_ordine }
+  const [ordiniLoading, setOrdiniLoading] = useState(false);
+  const [importMeta, setImportMeta] = useState({}); // chiave -> updated_at ISO
+  const [matriceSearch, setMatriceSearch] = useState('');
+  const [matriceSort, setMatriceSort] = useState({ col: 'pnit', dir: 'asc' });
+  const [consumi, setConsumi] = useState({}); // id (pnit+type) -> { media, nomaterial }
+  const [consumiLoading, setConsumiLoading] = useState(false);
+  const [mesiCopertura, setMesiCopertura] = useState(3);
+  const [matriceSoloStima, setMatriceSoloStima] = useState(false);
+  const [matriceSoloDaOrdinare, setMatriceSoloDaOrdinare] = useState(false);
 
   const scannerInputRef = useRef(null);
 
@@ -169,7 +184,10 @@ export default function App() {
     fetchSpareParts();
     fetchStock();
     fetchPrelievi();
-    fetchHardware();
+    fetchAnagrafica();
+    fetchOrdini();
+    fetchConsumi();
+    fetchImportMeta();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -260,80 +278,88 @@ export default function App() {
     setSpLoading(false);
   }
 
-  async function fetchHardware() {
-    setHwLoading(true);
+  async function fetchAnagrafica() {
+    setAnagLoading(true);
     const pageSize = 1000;
     let all = [];
     let from = 0;
     while (true) {
-      const { data, error } = await supabase.from('hardware').select('*').order('internal_id', { ascending: true }).range(from, from + pageSize - 1);
+      const { data, error } = await supabase.from('anagrafica_terminali').select('*').order('codice', { ascending: true }).range(from, from + pageSize - 1);
       if (error) break;
       all = [...all, ...(data || [])];
       if (!data || data.length < pageSize) break;
       from += pageSize;
     }
-    setHardware(all);
-    setHwLoading(false);
+    setAnagrafica(all);
+    setAnagLoading(false);
   }
 
-  async function handleHardwareUpload(event) {
+  async function handleAnagraficaUpload(event) {
     const file = event.target.files[0];
     if (!file) return;
     event.target.value = '';
-    setHwLoading(true);
+    setAnagLoading(true);
 
     const reader = new FileReader();
     reader.onload = async function(e) {
       let rows;
       try {
         const wb = XLSX.read(e.target.result, { type: 'array' });
-        const ws = wb.Sheets[wb.SheetNames[0]];
+        // Preferisci il foglio "famiglie"; altrimenti il primo
+        const shName = wb.SheetNames.find(n => n.toLowerCase() === 'famiglie') || wb.SheetNames[0];
+        const ws = wb.Sheets[shName];
         rows = XLSX.utils.sheet_to_json(ws, { defval: '', blankrows: false, raw: false });
       } catch {
         alert("Errore: impossibile leggere il file.");
-        setHwLoading(false);
+        setAnagLoading(false);
         return;
       }
-      if (rows.length === 0) { alert("File vuoto."); setHwLoading(false); return; }
+      if (rows.length === 0) { alert("File vuoto."); setAnagLoading(false); return; }
 
       // Ricerca flessibile delle colonne
       const norm = s => String(s).toLowerCase().replace(/[^a-z0-9]/g, '');
       const cols = Object.keys(rows[0]);
       const colFor = (...cands) => cols.find(k => cands.includes(norm(k)));
-      const cInternal = colFor('internalid');
-      const cName = colFor('name');
-      const cDisplay = colFor('displayname');
-      const cCluster = colFor('paxclusteritem', 'clusteritem', 'cluster');
-
-      if (!cInternal || !cName) {
-        alert("Colonne obbligatorie mancanti: servono almeno 'Internal ID' e 'Name'.");
-        setHwLoading(false);
+      const cCodice = colFor('codice');
+      if (!cCodice) {
+        alert("Colonna obbligatoria mancante: serve 'CODICE' (foglio 'famiglie').");
+        setAnagLoading(false);
         return;
       }
+      const c = {
+        tipo: colFor('tipo'), modello: colFor('modello'), blocco: colFor('blocco'),
+        famiglia: colFor('famiglia'), famigliakey: colFor('famigliakey'),
+        descrizione: colFor('descrizione'), gruppo: colFor('gruppo'), gruppo2a: colFor('gruppo2a'),
+        family: colFor('family'), microfamily: colFor('microfamily'),
+        note: colFor('note'), versione_pci: colFor('versionepci'),
+      };
+      const g = (r, col) => col ? String(r[col] || '').trim() : '';
 
       const seen = new Set();
       const toUpsert = rows.filter(r => {
-        const id = String(r[cInternal] || '').trim();
-        if (!id || seen.has(id)) return false;
-        seen.add(id);
+        const cod = String(r[cCodice] || '').trim();
+        if (!cod || seen.has(cod)) return false;
+        seen.add(cod);
         return true;
       }).map(r => ({
-        internal_id: String(r[cInternal] || '').trim(),
-        name: String(r[cName] || '').trim(),
-        display_name: cDisplay ? String(r[cDisplay] || '').trim() : '',
-        cluster_item: cCluster ? String(r[cCluster] || '').trim() : '',
+        codice: String(r[cCodice] || '').trim(),
+        tipo: g(r, c.tipo), modello: g(r, c.modello), blocco: g(r, c.blocco),
+        famiglia: g(r, c.famiglia), famigliakey: g(r, c.famigliakey),
+        descrizione: g(r, c.descrizione), gruppo: g(r, c.gruppo), gruppo2a: g(r, c.gruppo2a),
+        family: g(r, c.family), microfamily: g(r, c.microfamily),
+        note: g(r, c.note), versione_pci: g(r, c.versione_pci),
       }));
 
       // Upsert a blocchi
       const CHUNK = 500;
       let err = null;
       for (let i = 0; i < toUpsert.length; i += CHUNK) {
-        const { error } = await supabase.from('hardware').upsert(toUpsert.slice(i, i + CHUNK), { onConflict: 'internal_id' });
+        const { error } = await supabase.from('anagrafica_terminali').upsert(toUpsert.slice(i, i + CHUNK), { onConflict: 'codice' });
         if (error) { err = error; break; }
       }
       if (err) alert("Errore salvataggio: " + err.message);
-      else { await fetchHardware(); alert(`${toUpsert.length} articoli anagrafica caricati.${cCluster ? '' : '\n\n(Nota: colonna "Cluster Item" non trovata nel file.)'}`); }
-      setHwLoading(false);
+      else { await fetchAnagrafica(); await recordImportMeta('anagrafica'); alert(`${toUpsert.length} terminali caricati in anagrafica.`); }
+      setAnagLoading(false);
     };
     reader.readAsArrayBuffer(file);
   }
@@ -390,7 +416,7 @@ export default function App() {
 
       const { error } = await supabase.from('spare_parts').upsert(toUpsert, { onConflict: 'pn,terminal_pn' });
       if (error) { alert("Errore salvataggio: " + error.message); }
-      else { await fetchSpareParts(); alert(`${toUpsert.length} ricambi caricati.`); }
+      else { await fetchSpareParts(); await recordImportMeta('spare_parts'); alert(`${toUpsert.length} ricambi caricati.`); }
     };
     reader.readAsArrayBuffer(file);
   }
@@ -409,30 +435,57 @@ export default function App() {
       user = name;
     }
     const entries = Object.entries(spPendingChanges);
-    if (!entries.length) return;
+    const validNewRows = spNewRows.filter(r => (r.pn || '').trim() && (r.terminal_pn || '').trim());
+    if (!entries.length && validNewRows.length === 0) return;
     setSpLoading(true);
     const errors = [];
+    const calc = (m) => {
+      const pnit = (m.pnit || '').trim();
+      const type = (m.type || '').trim();
+      const eol = (m.eol || '').trim();
+      const to_order = (m.to_order || '').trim();
+      return {
+        pnit, type, eol, to_order,
+        codice: [pnit, type].filter(Boolean).join(''),
+        locked: (eol === 'EOL' || eol === 'CLI' || to_order === 'NO' || type === 'NO') ? 'Y' : '',
+      };
+    };
+
+    // 1. Aggiornamenti righe esistenti
     for (const [rowKey, changes] of entries) {
       const original = spareParts.find(p => `${p.pn}_${p.terminal_pn}` === rowKey);
       const merged = { ...original, ...changes };
-      const pnit = (merged.pnit || '').trim();
-      const type = (merged.type || '').trim();
-      const eol = (merged.eol || '').trim();
-      const to_order = (merged.to_order || '').trim();
-      const codice = [pnit, type].filter(Boolean).join('');
-      const locked = (eol === 'EOL' || eol === 'CLI' || to_order === 'NO' || type === 'NO') ? 'Y' : '';
+      const c = calc(merged);
       const { error } = await supabase.from('spare_parts').update({
-        eol, english_name: merged.english_name, type, to_order,
+        eol: c.eol, english_name: merged.english_name, type: c.type, to_order: c.to_order,
         qty: parseFloat(merged.qty) || 0, descrizione: merged.descrizione,
-        pnit, ref: merged.ref, rplus: merged.rplus,
-        price: parseFloat(merged.price) || 0, locked, codice, modified_by: user,
+        pnit: c.pnit, ref: merged.ref, rplus: merged.rplus,
+        price: parseFloat(merged.price) || 0, locked: c.locked, codice: c.codice, modified_by: user,
       }).eq('pn', original.pn).eq('terminal_pn', original.terminal_pn);
       if (error) errors.push(error.message);
-      else setSpareParts(prev => prev.map(p => `${p.pn}_${p.terminal_pn}` === rowKey ? { ...p, ...merged, codice, locked, modified_by: user } : p));
     }
+
+    // 2. Inserimento righe nuove
+    const toInsert = validNewRows.map(r => {
+      const c = calc(r);
+      return {
+        pn: r.pn.trim(), terminal_pn: r.terminal_pn.trim(),
+        eol: c.eol, english_name: (r.english_name || '').trim(), type: c.type, to_order: c.to_order,
+        qty: 0, descrizione: (r.descrizione || '').trim(), pnit: c.pnit,
+        ref: r.ref || '', rplus: r.rplus || '', price: parseFloat(r.price) || 0,
+        locked: c.locked, codice: c.codice, modified_by: user,
+      };
+    });
+    if (toInsert.length > 0) {
+      const { error } = await supabase.from('spare_parts').upsert(toInsert, { onConflict: 'pn,terminal_pn' });
+      if (error) errors.push('Nuove righe: ' + error.message);
+    }
+
     if (errors.length) alert('Errori:\n' + errors.join('\n'));
     setSpPendingChanges({});
+    setSpNewRows([]);
     setSpEditMode(false);
+    await fetchSpareParts();
     setSpLoading(false);
   }
 
@@ -541,7 +594,175 @@ export default function App() {
       }
 
       if (insErr) { alert("Errore salvataggio stock: " + insErr.message); }
-      else { await fetchStock(); alert(`Inventario sostituito: ${toInsert.length} record caricati.`); }
+      else { await fetchStock(); await recordImportMeta('stock'); alert(`Inventario sostituito: ${toInsert.length} record caricati.`); }
+    };
+    reader.readAsArrayBuffer(file);
+  }
+
+  // ===== Meta "ultimo aggiornamento" per tutti gli import CSV/Excel =====
+  async function fetchImportMeta() {
+    const { data } = await supabase.from('import_meta').select('*');
+    const map = {};
+    (data || []).forEach(r => { map[r.chiave] = r.updated_at; });
+    setImportMeta(map);
+  }
+  async function recordImportMeta(chiave) {
+    const now = new Date().toISOString();
+    await supabase.from('import_meta').upsert({ chiave, updated_at: now, updated_by: currentUser || 'import' }, { onConflict: 'chiave' });
+    setImportMeta(prev => ({ ...prev, [chiave]: now }));
+  }
+
+  // ===== Quantità IN ORDINE / IN ARRIVO (stock_ordini) =====
+  async function fetchOrdini() {
+    const pageSize = 1000;
+    let all = [];
+    let from = 0;
+    while (true) {
+      const { data, error } = await supabase.from('stock_ordini').select('*').order('codice', { ascending: true }).range(from, from + pageSize - 1);
+      if (error) break;
+      all = [...all, ...(data || [])];
+      if (!data || data.length < pageSize) break;
+      from += pageSize;
+    }
+    const map = {};
+    all.forEach(r => { map[r.codice] = { in_arrivo: r.in_arrivo || 0, in_ordine: r.in_ordine || 0 }; });
+    setOrdini(map);
+  }
+
+  async function handleOrdiniUpload(event) {
+    const file = event.target.files[0];
+    if (!file) return;
+    event.target.value = '';
+    setOrdiniLoading(true);
+
+    const reader = new FileReader();
+    reader.onload = async function(e) {
+      let rows;
+      try {
+        const wb = XLSX.read(e.target.result, { type: 'array' });
+        const ws = wb.Sheets[wb.SheetNames[0]];
+        rows = XLSX.utils.sheet_to_json(ws, { defval: '', blankrows: false, raw: false });
+      } catch {
+        alert("Errore: impossibile leggere il file.");
+        setOrdiniLoading(false);
+        return;
+      }
+      if (rows.length === 0) { alert("File vuoto."); setOrdiniLoading(false); return; }
+
+      const norm = s => String(s).toLowerCase().replace(/[^a-z0-9]/g, '');
+      const cols = Object.keys(rows[0]);
+      const colFor = (...cands) => cols.find(k => cands.includes(norm(k)));
+      const cPnit = colFor('pnit');
+      const cPend = colFor('pendingqty');
+      if (!cPnit || !cPend) {
+        alert("Colonne mancanti: servono 'PNIT' e 'Pending Qty' (in ordine).");
+        setOrdiniLoading(false);
+        return;
+      }
+      const toNum = v => parseFloat(String(v || '').replace(/[^0-9.-]/g, '')) || 0;
+
+      // Aggregazione per PNIT: somma Pending Qty (in ordine). L'in arrivo NON viene dal CSV
+      // ma dal Piano Arrivi (po_lines) aggregato per codice.
+      const agg = new Map();
+      rows.forEach(r => {
+        const cod = String(r[cPnit] || '').trim();
+        if (!cod) return;
+        if (cod.toUpperCase().startsWith('BULK')) return; // codice BULK non considerato
+        if (!agg.has(cod)) agg.set(cod, { codice: cod, in_ordine: 0 });
+        agg.get(cod).in_ordine += toNum(r[cPend]);
+      });
+      const nowIso = new Date().toISOString();
+      const toInsert = [...agg.values()].map(a => ({
+        codice: a.codice, in_arrivo: 0, in_ordine: Math.round(a.in_ordine), updated_at: nowIso,
+      }));
+      if (toInsert.length === 0) { alert("Nessuna riga valida (PNIT mancante)."); setOrdiniLoading(false); return; }
+
+      // Snapshot completo: sostituisce l'intera tabella ordini/arrivi
+      const { error: delErr } = await supabase.from('stock_ordini').delete().gte('codice', '');
+      if (delErr) { alert("Errore svuotamento: " + delErr.message); setOrdiniLoading(false); return; }
+      let insErr = null;
+      for (let i = 0; i < toInsert.length; i += 500) {
+        const { error } = await supabase.from('stock_ordini').insert(toInsert.slice(i, i + 500));
+        if (error) { insErr = error; break; }
+      }
+      if (insErr) { alert("Errore salvataggio: " + insErr.message); }
+      else { await fetchOrdini(); await recordImportMeta('ordini'); alert(`${toInsert.length} codici aggiornati (in ordine / in arrivo).`); }
+      setOrdiniLoading(false);
+    };
+    reader.readAsArrayBuffer(file);
+  }
+
+  // ===== Consumi medi mensili + NoMaterial (matrice_consumi), chiave ID = PNIT+TYPE =====
+  async function fetchConsumi() {
+    const pageSize = 1000;
+    let all = [];
+    let from = 0;
+    while (true) {
+      const { data, error } = await supabase.from('matrice_consumi').select('*').order('id', { ascending: true }).range(from, from + pageSize - 1);
+      if (error) break;
+      all = [...all, ...(data || [])];
+      if (!data || data.length < pageSize) break;
+      from += pageSize;
+    }
+    const map = {};
+    all.forEach(r => { map[r.id] = { media: r.media || 0, nomaterial: r.nomaterial || 0 }; });
+    setConsumi(map);
+  }
+
+  async function handleConsumiUpload(event) {
+    const file = event.target.files[0];
+    if (!file) return;
+    event.target.value = '';
+    setConsumiLoading(true);
+
+    const reader = new FileReader();
+    reader.onload = async function(e) {
+      let rows;
+      try {
+        const wb = XLSX.read(e.target.result, { type: 'array' });
+        const ws = wb.Sheets[wb.SheetNames[0]];
+        rows = XLSX.utils.sheet_to_json(ws, { defval: '', blankrows: false, raw: false });
+      } catch {
+        alert("Errore: impossibile leggere il file.");
+        setConsumiLoading(false);
+        return;
+      }
+      if (rows.length === 0) { alert("File vuoto."); setConsumiLoading(false); return; }
+
+      const norm = s => String(s).toLowerCase().replace(/[^a-z0-9]/g, '');
+      const cols = Object.keys(rows[0]);
+      const colFor = (...cands) => cols.find(k => cands.includes(norm(k)));
+      const cId = colFor('id');
+      const cMedia = colFor('media');
+      const cNoMat = colFor('nomaterial');
+      if (!cId || !cMedia) {
+        alert("Colonne mancanti: servono 'ID' (PNIT+TYPE) e 'MEDIA'.");
+        setConsumiLoading(false);
+        return;
+      }
+      const toNum = v => parseFloat(String(v || '').replace(',', '.').replace(/[^0-9.-]/g, '')) || 0;
+
+      const seen = new Set();
+      const toInsert = [];
+      rows.forEach(r => {
+        const id = String(r[cId] || '').trim();
+        if (!id || seen.has(id)) return;
+        seen.add(id);
+        toInsert.push({ id, media: toNum(r[cMedia]), nomaterial: cNoMat ? toNum(r[cNoMat]) : 0, updated_at: new Date().toISOString() });
+      });
+      if (toInsert.length === 0) { alert("Nessuna riga valida."); setConsumiLoading(false); return; }
+
+      // Snapshot completo
+      const { error: delErr } = await supabase.from('matrice_consumi').delete().gte('id', '');
+      if (delErr) { alert("Errore svuotamento: " + delErr.message); setConsumiLoading(false); return; }
+      let insErr = null;
+      for (let i = 0; i < toInsert.length; i += 500) {
+        const { error } = await supabase.from('matrice_consumi').insert(toInsert.slice(i, i + 500));
+        if (error) { insErr = error; break; }
+      }
+      if (insErr) { alert("Errore salvataggio: " + insErr.message); }
+      else { await fetchConsumi(); await recordImportMeta('consumi'); alert(`${toInsert.length} righe consumi/NoMaterial caricate.`); }
+      setConsumiLoading(false);
     };
     reader.readAsArrayBuffer(file);
   }
@@ -778,6 +999,74 @@ export default function App() {
     setPrelieviLoading(false);
   }
 
+  async function exportPrelieviRettifica() {
+    // Esporta solo i prelievi ATTIVI (non ancora registrati)
+    const attivi = prelieviList.filter(p => p.stato !== 'registrato');
+    if (attivi.length === 0) { alert('Nessun prelievo attivo da esportare.'); return; }
+    if (!window.confirm(`Esportare ${attivi.length} prelievi?\n\nDopo il download verranno marcati come REGISTRATI e non saranno più eliminabili né modificabili.`)) return;
+
+    setPrelieviLoading(true);
+    const attiviIds = new Set(attivi.map(p => String(p.id)));
+    const [{ data: testate }, { data: righe }] = await Promise.all([
+      supabase.from('prelievi').select('*'),
+      supabase.from('prelievi_righe').select('*')
+    ]);
+    const testataById = {};
+    (testate || []).forEach(t => { if (attiviIds.has(String(t.id))) testataById[t.id] = t; });
+
+    // Raggruppa per prelievo → (codice + magazzino) sommando le quantità (solo prelievi attivi)
+    const byPrelievo = {};
+    (righe || []).forEach(r => {
+      if (!attiviIds.has(String(r.prelievo_id))) return;
+      if (!byPrelievo[r.prelievo_id]) byPrelievo[r.prelievo_id] = {};
+      const key = `${r.codice}__${r.magazzino}`;
+      if (!byPrelievo[r.prelievo_id][key]) byPrelievo[r.prelievo_id][key] = { codice: r.codice, magazzino: r.magazzino, qty: 0 };
+      byPrelievo[r.prelievo_id][key].qty += (r.quantita || 0);
+    });
+
+    const locName = (mag) => mag === 'ESPRINET' ? 'ESVAL - PAX NUOVO CAVENAGO' : '0MAG03 - PAX NUOVO GESSATE';
+    const fmtDate = (iso) => { if (!iso) return ''; const d = new Date(iso); return `${String(d.getDate()).padStart(2,'0')}/${String(d.getMonth()+1).padStart(2,'0')}/${d.getFullYear()}`; };
+
+    const header = 'data;line;item;Inventory Location: Name;Adjust Qty. By;extid;[PAX] Document Type';
+    const rows = [];
+    // ordina per id_prelievo per raggruppare le righe dello stesso extid
+    Object.keys(byPrelievo)
+      .sort((a, b) => (testataById[a]?.id_prelievo || '').localeCompare(testataById[b]?.id_prelievo || ''))
+      .forEach(pid => {
+        const t = testataById[pid];
+        const data = fmtDate(t?.data_prelievo);
+        const extid = t?.id_prelievo || '';
+        const docType = t?.destinazione || '';
+        let line = 0;
+        Object.values(byPrelievo[pid]).forEach(g => {
+          line += 1;
+          rows.push([data, line, g.codice, locName(g.magazzino), -Math.abs(g.qty), extid, docType].join(';'));
+        });
+      });
+
+    if (rows.length === 0) { alert('Nessun prelievo da esportare.'); setPrelieviLoading(false); return; }
+    const csv = [header, ...rows].join('\r\n');
+    const blob = new Blob(['﻿' + csv], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a'); a.href = url;
+    a.download = `rettifica_prelievi_${new Date().toISOString().slice(0,10)}.csv`; a.click();
+    URL.revokeObjectURL(url);
+
+    // Marca i prelievi esportati come REGISTRATI (non più eliminabili/modificabili)
+    const idsToMark = [...attiviIds];
+    const { error: markErr } = await supabase
+      .from('prelievi')
+      .update({ stato: 'registrato' })
+      .in('id', idsToMark);
+    if (markErr) {
+      alert('File scaricato, ma errore nel marcare i prelievi come registrati: ' + markErr.message);
+    } else {
+      setPrelieviList(prev => prev.map(p => attiviIds.has(String(p.id)) ? { ...p, stato: 'registrato' } : p));
+      setPrelievoTab('registrati');
+    }
+    setPrelieviLoading(false);
+  }
+
   async function openPrelievoDetail(prelievo) {
     setPrelieviLoading(true);
     const { data: righe, error } = await supabase.from('prelievi_righe')
@@ -789,6 +1078,7 @@ export default function App() {
   }
 
   async function deletePrelievo(prelievo) {
+    if (prelievo.stato === 'registrato') { alert('Prelievo registrato: non può essere eliminato.'); return; }
     if (!window.confirm(`Eliminare il prelievo ${prelievo.id_prelievo}?\n\nLe ${prelievo.n_righe} righe verranno ripristinate nell'inventario.`)) return;
     setPrelieviLoading(true);
     const errors = [];
@@ -1139,6 +1429,7 @@ export default function App() {
       } else {
         const removedCount = toRemove.length;
         await fetchPOLines();
+        await recordImportMeta('po_lines');
         if (removedCount > 0) {
           alert(`Aggiornamento completato. ${removedCount} riga/righe non più presenti nel file sono state rimosse.`);
         }
@@ -1648,6 +1939,7 @@ export default function App() {
                 { id: 'spare-parts', label: 'DB Spare Parts', icon: '🔧' },
                 { id: 'stock', label: 'Inventario Spare Parts', icon: '🗄️' },
                 { id: 'riepilogo', label: 'Riepilogo Stock', icon: '📊' },
+                { id: 'matrice', label: 'Matrice PNIT × TYPE', icon: '🧮' },
                 { id: 'prelievi', label: 'Prelievi', icon: '📤' },
                 { id: 'anagrafica', label: 'Anagrafica', icon: '📇' },
               ].filter(mod => SHOW_WIP_MODULES || !WIP_MODULE_IDS.includes(mod.id)).map(mod => (
@@ -1681,6 +1973,7 @@ export default function App() {
               {activeModule === 'spare-parts' && 'DB Spare Parts'}
               {activeModule === 'stock' && 'Inventario Spare Parts'}
               {activeModule === 'riepilogo' && 'Riepilogo Stock'}
+              {activeModule === 'matrice' && 'Matrice PNIT × TYPE'}
               {activeModule === 'prelievi' && 'Prelievi'}
               {activeModule === 'anagrafica' && 'Anagrafica'}
             </h1>
@@ -1761,7 +2054,10 @@ export default function App() {
                   </button>
                   <input type="file" accept=".xls,.xlsx" className="absolute inset-0 w-full h-full opacity-0 cursor-pointer" onChange={handleSparePartsUpload} />
                 </div>
-                <p className="text-xs text-gray-400 flex-grow">Importa il file Excel del DB Spare Parts (Foglio 1). L&apos;import aggiorna i record esistenti per PN + Terminal PN.</p>
+                <div className="flex-grow">
+                  <p className="text-xs text-gray-400">Importa il file Excel del DB Spare Parts (Foglio 1). L&apos;import aggiorna i record esistenti per PN + Terminal PN.</p>
+                  {importMeta.spare_parts && <p className="text-[11px] text-gray-400">Ultimo aggiornamento: {new Date(importMeta.spare_parts).toLocaleString('it-IT')}</p>}
+                </div>
                 {spareParts.length > 0 && (
                   <span className="text-sm bg-blue-50 text-blue-600 font-black px-3 py-1 rounded-full border border-blue-100 shrink-0">
                     {spareParts.length} ricambi
@@ -1847,10 +2143,16 @@ export default function App() {
                         📥 Esporta XLS ({filtered.length})
                       </button>
                     )}
-                    <button onClick={() => { setSpEditMode(v => !v); if (Object.keys(spPendingChanges).length === 0) setSpPendingChanges({}); }}
+                    <button onClick={() => { setSpEditMode(v => !v); if (spEditMode) setSpNewRows([]); }}
                       className={`text-[10px] font-bold px-2.5 py-1 rounded-lg border transition cursor-pointer ${spEditMode ? 'bg-amber-500 text-white border-amber-600' : 'bg-gray-50 text-gray-500 hover:bg-gray-100 border-gray-200'}`}>
                       {spEditMode ? '✏️ Modifica ON' : '✏️ Modifica'}
                     </button>
+                    {spEditMode && (
+                      <button onClick={() => setSpNewRows(prev => [{ tempId: Date.now() + Math.random(), pn: '', terminal_pn: '', pnit: '', english_name: '', descrizione: '', type: '', eol: '', ref: '', rplus: '', to_order: 'SI', price: '' }, ...prev])}
+                        className="text-[10px] font-bold text-white bg-green-600 hover:bg-green-700 px-2.5 py-1 rounded-lg transition cursor-pointer">
+                        + Aggiungi riga
+                      </button>
+                    )}
                     <button onClick={() => { setSpSearch(''); setSpSearch2(''); setSpFilterTerminalPN(''); setSpFilterType(''); setSpFilterEOL(''); setSpFilterToOrder(''); setSpFilterRef(''); setSpFilterRplus(''); setSpPage(0); }}
                       className="text-[10px] font-bold text-gray-400 hover:text-red-600 bg-gray-50 hover:bg-red-50 border border-gray-200 hover:border-red-200 px-2.5 py-1 rounded-lg transition cursor-pointer">
                       ✕ Reset filtri
@@ -1892,6 +2194,43 @@ export default function App() {
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-gray-100">
+                      {/* Righe nuove in inserimento (modalità modifica) */}
+                      {spEditMode && spNewRows.map(r => {
+                        const nCls = "w-full bg-green-50 border border-green-300 rounded px-1 py-0.5 text-xs focus:outline-none";
+                        const upd = (field, val) => setSpNewRows(prev => prev.map(x => x.tempId === r.tempId ? { ...x, [field]: val } : x));
+                        const locked = (r.eol === 'EOL' || r.eol === 'CLI' || r.to_order === 'NO' || r.type === 'NO') ? 'Y' : '';
+                        return (
+                          <tr key={r.tempId} className="bg-green-50/40">
+                            <td className="px-2 py-1"><input className={nCls + ' font-mono font-bold text-blue-700'} value={r.pn} onChange={e => upd('pn', e.target.value)} placeholder="PN *" /></td>
+                            <td className="px-2 py-1"><input className={nCls + ' font-mono text-[10px]'} value={r.terminal_pn} onChange={e => upd('terminal_pn', e.target.value)} placeholder="Terminal PN *" /></td>
+                            <td className="px-2 py-2 font-mono text-[10px] text-gray-400">{(r.terminal_pn || '').split('-')[0]}</td>
+                            <td className="px-2 py-1"><input className={nCls + ' font-mono'} value={r.pnit} onChange={e => upd('pnit', e.target.value)} placeholder="PNIT" /></td>
+                            <td className="px-2 py-1 hidden md:table-cell"><input className={nCls} value={r.english_name} onChange={e => upd('english_name', e.target.value)} placeholder="English Name" /></td>
+                            <td className="px-2 py-1 hidden md:table-cell"><input className={nCls} value={r.descrizione} onChange={e => upd('descrizione', e.target.value)} placeholder="Descrizione" /></td>
+                            <td className="px-2 py-1"><input className={nCls} value={r.type} onChange={e => upd('type', e.target.value)} placeholder="TYPE" /></td>
+                            <td className="px-1 py-1 text-center">
+                              <select className={nCls} value={r.eol} onChange={e => upd('eol', e.target.value)}>
+                                <option value="">—</option><option value="EOL">EOL</option><option value="ALT">ALT</option><option value="CLI">CLI</option>
+                              </select>
+                            </td>
+                            <td className="px-1 py-1 text-center">
+                              <select className={nCls} value={r.ref} onChange={e => upd('ref', e.target.value)}><option value="">—</option><option value="X">X</option></select>
+                            </td>
+                            <td className="px-1 py-1 text-center">
+                              <select className={nCls} value={r.rplus} onChange={e => upd('rplus', e.target.value)}><option value="">—</option><option value="X">X</option></select>
+                            </td>
+                            <td className="px-1 py-1 text-center">
+                              <select className={nCls} value={r.to_order} onChange={e => upd('to_order', e.target.value)}><option value="SI">SI</option><option value="NO">NO</option></select>
+                            </td>
+                            <td className="px-2 py-1 text-right"><input className={nCls + ' text-right'} value={r.price} onChange={e => upd('price', e.target.value)} placeholder="0" /></td>
+                            <td className="px-2 py-2 text-center text-[11px]">{locked === 'Y' ? '🔒' : '—'}</td>
+                            <td className="px-2 py-2 text-center">
+                              <button onClick={() => setSpNewRows(prev => prev.filter(x => x.tempId !== r.tempId))}
+                                className="text-[10px] text-gray-400 hover:text-red-500 cursor-pointer" title="Rimuovi riga">✕</button>
+                            </td>
+                          </tr>
+                        );
+                      })}
                       {filtered.slice(spPage * 100, spPage * 100 + 100).map((p, rowIndex) => {
                         const rowKey = `${p.pn}_${p.terminal_pn}`;
                         const pending = spPendingChanges[rowKey];
@@ -2048,7 +2387,10 @@ export default function App() {
                   </button>
                   <input type="file" accept=".xls,.xlsx" className="absolute inset-0 w-full h-full opacity-0 cursor-pointer" onChange={handleStockUpload} />
                 </div>
-                <p className="text-xs text-gray-400 flex-grow">Importa il file Excel dello Stock (Foglio 2). Chiave: Codice + Magazzino + Bancale.</p>
+                <div className="flex-grow">
+                  <p className="text-xs text-gray-400">Importa il file Excel dello Stock (Foglio 2). Chiave: Codice + Magazzino + Bancale.</p>
+                  {importMeta.stock && <p className="text-[11px] text-gray-400">Ultimo aggiornamento: {new Date(importMeta.stock).toLocaleString('it-IT')}</p>}
+                </div>
                 {stockItems.length > 0 && (
                   <span className="text-sm bg-blue-50 text-blue-600 font-black px-3 py-1 rounded-full border border-blue-100 shrink-0">
                     {filtered.length} record
@@ -2309,11 +2651,24 @@ export default function App() {
           const stockByCodice = {};
           stockItems.forEach(s => { if (s.stock > 0) stockByCodice[s.codice] = (stockByCodice[s.codice] || 0) + s.stock; });
 
+          // IN ARRIVO per codice: dal Piano Arrivi (po_lines), somma qty_expected per item_code
+          const arrivoByCodice = {};
+          poLines.forEach(l => {
+            const cod = String(l.item_code || '').trim();
+            if (!cod || cod === 'N/D') return;
+            arrivoByCodice[cod] = (arrivoByCodice[cod] || 0) + (l.qty_expected || 0);
+          });
+
+          // Anagrafica terminali per codice (= PNIT): gruppo = MODELLO - VERSIONE PCI - NOTE
+          const anagByCodice = {};
+          anagrafica.forEach(a => { anagByCodice[String(a.codice || '').trim()] = a; });
+          const gruppoDesc = (a) => a ? [a.modello, a.versione_pci, a.note].map(x => String(x || '').trim()).filter(Boolean).join(' - ') : '';
+
           // Info per pn dal DB spare parts
           const pnInfo = {};
           spareParts.forEach(p => {
             const mod = (p.terminal_pn || '').split('-')[0];
-            if (!pnInfo[p.pn]) pnInfo[p.pn] = { models: new Set(), type: '', ref: '', rplus: '', descrizione: '', eol: '', pnits: new Set() };
+            if (!pnInfo[p.pn]) pnInfo[p.pn] = { models: new Set(), gruppi: new Set(), type: '', ref: '', rplus: '', descrizione: '', eol: '', pnits: new Set() };
             const inf = pnInfo[p.pn];
             if (mod) inf.models.add(mod);
             if (!inf.type && p.type) inf.type = p.type;
@@ -2321,7 +2676,12 @@ export default function App() {
             if (!inf.rplus && p.rplus) inf.rplus = p.rplus;
             if (!inf.eol && p.eol) inf.eol = p.eol;
             if (!inf.descrizione && (p.descrizione || p.english_name)) inf.descrizione = p.descrizione || p.english_name;
-            if ((p.pnit || '').trim()) inf.pnits.add(p.pnit.trim());
+            const pnit = (p.pnit || '').trim();
+            if (pnit) {
+              inf.pnits.add(pnit);
+              const g = gruppoDesc(anagByCodice[pnit]);
+              if (g) inf.gruppi.add(g);
+            }
           });
 
           // Liste filtri CONNESSE: la selezione su un filtro restringe le opzioni dell'altro
@@ -2343,30 +2703,56 @@ export default function App() {
           const q = riepSearch.trim().toLowerCase();
           // Costruisci elenco codici con stock, applicando filtri
           const codici = Object.keys(stockByCodice).filter(c => {
-            const inf = pnInfo[c] || { models: new Set(), type: '', ref: '', rplus: '', descrizione: '', pnits: new Set() };
+            const inf = pnInfo[c] || { models: new Set(), gruppi: new Set(), type: '', ref: '', rplus: '', descrizione: '', pnits: new Set() };
             if (riepFilterRef && inf.ref !== 'X') return false;
             if (riepFilterRplus && inf.rplus !== 'X') return false;
             if (riepFilterModello && !inf.models.has(riepFilterModello)) return false;
             if (riepFilterPnit && !inf.pnits.has(riepFilterPnit)) return false;
             if (q) {
-              const hay = `${c} ${inf.type} ${inf.descrizione} ${[...inf.models].join(' ')} ${[...inf.pnits].join(' ')}`.toLowerCase();
+              const hay = `${c} ${inf.type} ${inf.descrizione} ${[...inf.models].join(' ')} ${[...inf.gruppi].join(' ')} ${[...inf.pnits].join(' ')}`.toLowerCase();
               if (!hay.includes(q)) return false;
             }
             return true;
           });
 
-          // Raggruppamento per TYPE
+          // Raggruppamento a due livelli, ordine dei livelli in base a riepGroupMode:
+          //  'type'   → livello1 = TYPE,   livello2 = Gruppo
+          //  'gruppo' → livello1 = Gruppo, livello2 = TYPE
           const groups = {};
           codici.forEach(c => {
-            const inf = pnInfo[c] || { models: new Set(), type: '', ref: '', rplus: '', descrizione: '' };
+            const inf = pnInfo[c] || { models: new Set(), gruppi: new Set(), pnits: new Set(), type: '', ref: '', rplus: '', descrizione: '' };
             const stock = stockByCodice[c];
             const type = inf.type || '—';
-            if (!groups[type]) groups[type] = { key: type, type, totale: 0, codici: [] };
-            groups[type].totale += stock;
-            groups[type].codici.push({ codice: c, descrizione: inf.descrizione, ref: inf.ref, rplus: inf.rplus, eol: inf.eol, models: [...inf.models], stock });
+            const pnitsList = inf.pnits.size > 0 ? [...inf.pnits] : ['—'];
+            const pnitKey = pnitsList.join(', ');
+            // In vista 'gruppo' (PNIT → TYPE) il codice viene duplicato su ogni singolo PNIT.
+            // In vista 'type' (TYPE → PNIT) resta un'unica riga con i PNIT concatenati.
+            const branches = riepGroupMode === 'gruppo'
+              ? pnitsList.map(g => ({ lvl1: g, lvl2: type, gruppoLabel: g }))
+              : [{ lvl1: type, lvl2: pnitKey, gruppoLabel: pnitKey }];
+            const inArrivo = arrivoByCodice[c] || 0;
+            const inOrdine = ordini[c]?.in_ordine || 0;
+            branches.forEach(({ lvl1, lvl2, gruppoLabel }) => {
+              if (!groups[lvl1]) groups[lvl1] = { key: lvl1, type: lvl1, totale: 0, inArrivo: 0, inOrdine: 0, nCodici: 0, models: {} };
+              groups[lvl1].totale += stock;
+              groups[lvl1].inArrivo += inArrivo;
+              groups[lvl1].inOrdine += inOrdine;
+              groups[lvl1].nCodici += 1;
+              if (!groups[lvl1].models[lvl2]) groups[lvl1].models[lvl2] = { key: `${lvl1}||${lvl2}`, modello: lvl2, totale: 0, inArrivo: 0, inOrdine: 0, codici: [] };
+              const mg = groups[lvl1].models[lvl2];
+              mg.totale += stock;
+              mg.inArrivo += inArrivo;
+              mg.inOrdine += inOrdine;
+              mg.codici.push({ codice: c, descrizione: inf.descrizione, ref: inf.ref, rplus: inf.rplus, eol: inf.eol, modello: gruppoLabel, stock, inArrivo, inOrdine });
+            });
           });
-          const groupList = Object.values(groups).sort((a, b) => a.type.localeCompare(b.type));
-          const totaleGenerale = groupList.reduce((s, g) => s + g.totale, 0);
+          const groupList = Object.values(groups)
+            .map(g => ({ ...g, modelList: Object.values(g.models).sort((a, b) => a.modello.localeCompare(b.modello)) }))
+            .sort((a, b) => a.type.localeCompare(b.type));
+          // Stock totale reale (unico per codice) — non conta le duplicazioni tra gruppi
+          const totaleGenerale = codici.reduce((s, c) => s + (stockByCodice[c] || 0), 0);
+          const totArrivo = codici.reduce((s, c) => s + (arrivoByCodice[c] || 0), 0);
+          const totOrdine = codici.reduce((s, c) => s + (ordini[c]?.in_ordine || 0), 0);
 
           const toggleGroup = (key) => setRiepExpanded(prev => { const n = new Set(prev); if (n.has(key)) n.delete(key); else n.add(key); return n; });
 
@@ -2397,9 +2783,23 @@ export default function App() {
                     <span className="text-xs font-semibold text-gray-700">Solo R+</span>
                   </label>
                 </div>
-                <div className="flex items-center justify-between text-[11px] text-gray-500">
-                  <span>{groupList.length} gruppi · {codici.length} codici</span>
-                  <span className="font-black text-blue-600">Stock totale: {totaleGenerale}</span>
+                <div className="flex items-center justify-between text-[11px] text-gray-500 flex-wrap gap-2">
+                  <div className="flex items-center gap-2">
+                    <span className="font-semibold text-gray-600">Vista:</span>
+                    <div className="flex gap-1 bg-gray-100 p-1 rounded-lg">
+                      {[
+                        { id: 'type', label: 'TYPE → PNIT' },
+                        { id: 'gruppo', label: 'PNIT → TYPE' },
+                      ].map(v => (
+                        <button key={v.id} onClick={() => { setRiepGroupMode(v.id); setRiepExpanded(new Set()); }}
+                          className={`text-[11px] font-bold px-3 py-1 rounded-md cursor-pointer transition ${riepGroupMode === v.id ? 'bg-white text-gray-800 shadow-xs' : 'text-gray-500 hover:text-gray-700'}`}>
+                          {v.label}
+                        </button>
+                      ))}
+                    </div>
+                    <span>· {groupList.length} {riepGroupMode === 'gruppo' ? 'PNIT' : 'type'} · {codici.length} codici</span>
+                  </div>
+                  <span className="font-black text-blue-600">Stock: {totaleGenerale} · <span className="text-emerald-600">In arrivo: {totArrivo}</span> · <span className="text-amber-600">In ordine: {totOrdine}</span></span>
                 </div>
               </div>
 
@@ -2410,9 +2810,11 @@ export default function App() {
                     <thead className="bg-gray-50 border-b border-gray-200 text-[10px] font-black text-gray-500 uppercase tracking-wider">
                       <tr>
                         <th className="px-3 py-3 w-8"></th>
-                        <th className="px-3 py-3">Type</th>
+                        <th className="px-3 py-3">{riepGroupMode === 'gruppo' ? 'PNIT' : 'Type'}</th>
                         <th className="px-3 py-3 text-right">N. Codici</th>
                         <th className="px-3 py-3 text-right">Stock Totale</th>
+                        <th className="px-3 py-3 text-right text-emerald-600">In arrivo</th>
+                        <th className="px-3 py-3 text-right text-amber-600">In ordine</th>
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-gray-100">
@@ -2421,43 +2823,61 @@ export default function App() {
                           <tr className="hover:bg-blue-50/50 transition cursor-pointer font-bold" onClick={() => toggleGroup(g.key)}>
                             <td className="px-3 py-2.5 text-gray-400">{riepExpanded.has(g.key) ? '▾' : '▸'}</td>
                             <td className="px-3 py-2.5 text-gray-700">{g.type}</td>
-                            <td className="px-3 py-2.5 text-right font-mono">{g.codici.length}</td>
+                            <td className="px-3 py-2.5 text-right font-mono">{g.nCodici}</td>
                             <td className="px-3 py-2.5 text-right font-mono font-black text-blue-700">{g.totale}</td>
+                            <td className="px-3 py-2.5 text-right font-mono font-black text-emerald-600">{g.inArrivo || ''}</td>
+                            <td className="px-3 py-2.5 text-right font-mono font-black text-amber-600">{g.inOrdine || ''}</td>
                           </tr>
-                          {riepExpanded.has(g.key) && (
-                            <tr>
-                              <td colSpan={4} className="p-0">
-                                <table className="w-full text-[11px] bg-gray-50/60">
-                                  <thead className="text-[9px] font-black text-gray-400 uppercase">
-                                    <tr>
-                                      <th className="px-3 py-1.5 text-left pl-10">Codice</th>
-                                      <th className="px-3 py-1.5 text-left">Descrizione</th>
-                                      <th className="px-3 py-1.5 text-left">Modelli</th>
-                                      <th className="px-3 py-1.5 text-center">ST.</th>
-                                      <th className="px-3 py-1.5 text-center">REF</th>
-                                      <th className="px-3 py-1.5 text-center">R+</th>
-                                      <th className="px-3 py-1.5 text-right">Stock</th>
-                                    </tr>
-                                  </thead>
-                                  <tbody>
-                                    {g.codici.sort((a, b) => b.stock - a.stock).map(c => (
-                                      <tr key={c.codice} className="border-t border-gray-100">
-                                        <td className="px-3 py-1.5 pl-10 font-mono font-bold text-blue-700">{c.codice}</td>
-                                        <td className="px-3 py-1.5 text-gray-600">{c.descrizione || '—'}</td>
-                                        <td className="px-3 py-1.5 font-mono text-gray-500 text-[10px]">{c.models.join(', ') || '—'}</td>
-                                        <td className="px-3 py-1.5 text-center">
-                                          {c.eol ? <span className={`px-1 py-px rounded font-black text-[9px] border ${c.eol === 'EOL' ? 'bg-red-50 text-red-600 border-red-100' : c.eol === 'ALT' ? 'bg-amber-50 text-amber-700 border-amber-100' : 'bg-blue-50 text-blue-700 border-blue-100'}`}>{c.eol}</span> : ''}
-                                        </td>
-                                        <td className="px-3 py-1.5 text-center">{c.ref === 'X' ? '✓' : ''}</td>
-                                        <td className="px-3 py-1.5 text-center">{c.rplus === 'X' ? '✓' : ''}</td>
-                                        <td className="px-3 py-1.5 text-right font-mono font-black">{c.stock}</td>
-                                      </tr>
-                                    ))}
-                                  </tbody>
-                                </table>
-                              </td>
-                            </tr>
-                          )}
+                          {riepExpanded.has(g.key) && g.modelList.map(m => (
+                            <Fragment key={m.key}>
+                              <tr className="bg-indigo-50/40 hover:bg-indigo-50 transition cursor-pointer font-bold border-t border-indigo-100" onClick={() => toggleGroup(m.key)}>
+                                <td className="px-3 py-2 text-indigo-400 pl-8">{riepExpanded.has(m.key) ? '▾' : '▸'}</td>
+                                <td className="px-3 py-2 font-mono font-black text-indigo-800">{m.modello}</td>
+                                <td className="px-3 py-2 text-right font-mono text-gray-500">{m.codici.length}</td>
+                                <td className="px-3 py-2 text-right font-mono font-black text-indigo-700">{m.totale}</td>
+                                <td className="px-3 py-2 text-right font-mono font-black text-emerald-600">{m.inArrivo || ''}</td>
+                                <td className="px-3 py-2 text-right font-mono font-black text-amber-600">{m.inOrdine || ''}</td>
+                              </tr>
+                              {riepExpanded.has(m.key) && (
+                                <tr>
+                                  <td colSpan={6} className="p-0">
+                                    <table className="w-full text-[11px] bg-gray-50/60">
+                                      <thead className="text-[9px] font-black text-gray-400 uppercase">
+                                        <tr>
+                                          <th className="px-3 py-1.5 text-left pl-14">PNIT</th>
+                                          <th className="px-3 py-1.5 text-left">Codice</th>
+                                          <th className="px-3 py-1.5 text-left">Descrizione</th>
+                                          <th className="px-3 py-1.5 text-center">ST.</th>
+                                          <th className="px-3 py-1.5 text-center">REF</th>
+                                          <th className="px-3 py-1.5 text-center">R+</th>
+                                          <th className="px-3 py-1.5 text-right">Stock</th>
+                                          <th className="px-3 py-1.5 text-right text-emerald-600">In arrivo</th>
+                                          <th className="px-3 py-1.5 text-right text-amber-600">In ordine</th>
+                                        </tr>
+                                      </thead>
+                                      <tbody>
+                                        {m.codici.sort((a, b) => b.stock - a.stock).map(c => (
+                                          <tr key={c.codice} className="border-t border-gray-100">
+                                            <td className="px-3 py-1.5 pl-14 font-mono font-black text-indigo-700">{c.modello}</td>
+                                            <td className="px-3 py-1.5 font-mono font-bold text-blue-700">{c.codice}</td>
+                                            <td className="px-3 py-1.5 text-gray-600">{c.descrizione || '—'}</td>
+                                            <td className="px-3 py-1.5 text-center">
+                                              {c.eol ? <span className={`px-1 py-px rounded font-black text-[9px] border ${c.eol === 'EOL' ? 'bg-red-50 text-red-600 border-red-100' : c.eol === 'ALT' ? 'bg-amber-50 text-amber-700 border-amber-100' : 'bg-blue-50 text-blue-700 border-blue-100'}`}>{c.eol}</span> : ''}
+                                            </td>
+                                            <td className="px-3 py-1.5 text-center">{c.ref === 'X' ? '✓' : ''}</td>
+                                            <td className="px-3 py-1.5 text-center">{c.rplus === 'X' ? '✓' : ''}</td>
+                                            <td className="px-3 py-1.5 text-right font-mono font-black">{c.stock}</td>
+                                            <td className="px-3 py-1.5 text-right font-mono text-emerald-600">{c.inArrivo || ''}</td>
+                                            <td className="px-3 py-1.5 text-right font-mono text-amber-600">{c.inOrdine || ''}</td>
+                                          </tr>
+                                        ))}
+                                      </tbody>
+                                    </table>
+                                  </td>
+                                </tr>
+                              )}
+                            </Fragment>
+                          ))}
                         </Fragment>
                       ))}
                     </tbody>
@@ -2470,31 +2890,254 @@ export default function App() {
           );
         })()}
 
-        {/* ==================== MODULO ANAGRAFICA ==================== */}
-        {activeModule === 'anagrafica' && (
-          <div className="max-w-xl mx-auto space-y-5">
-            <div className="bg-white p-6 rounded-2xl border border-gray-200 shadow-xs space-y-4 text-center">
-              <div className="space-y-1">
-                <span className="text-3xl block">📇</span>
-                <h2 className="text-lg font-black text-gray-800">Anagrafica Hardware</h2>
-                <p className="text-sm text-gray-500">Importa il CSV anagrafica (NetSuite Items). Vengono mappati Internal ID, Name, Display Name e Cluster Item.</p>
-              </div>
-              <div className="border-2 border-dashed border-gray-300 rounded-xl p-6 bg-gray-50 hover:bg-gray-100 transition relative cursor-pointer group">
-                <input type="file" accept=".csv,.xls,.xlsx" className="absolute inset-0 w-full h-full opacity-0 cursor-pointer" onChange={handleHardwareUpload} />
-                <div className="space-y-2 pointer-events-none">
-                  <span className="text-3xl block group-hover:scale-110 transition-transform">📥</span>
-                  <p className="text-sm font-bold text-blue-600">Seleziona il file anagrafica</p>
+        {/* ==================== MODULO MATRICE PNIT × TYPE ==================== */}
+        {activeModule === 'matrice' && (() => {
+          // Stock / in arrivo / in ordine per codice
+          const stockByCodice = {};
+          stockItems.forEach(s => { if (s.stock > 0) stockByCodice[s.codice] = (stockByCodice[s.codice] || 0) + s.stock; });
+          const arrivoByCodice = {};
+          poLines.forEach(l => {
+            const cod = String(l.item_code || '').trim();
+            if (!cod || cod === 'N/D') return;
+            arrivoByCodice[cod] = (arrivoByCodice[cod] || 0) + (l.qty_expected || 0);
+          });
+
+          // Prezzo unitario e stato locked per pn (dal DB spare parts)
+          const priceByPn = {};
+          const lockedByPn = {};
+          spareParts.forEach(p => {
+            const pn = (p.pn || '').trim();
+            if (!pn) return;
+            if (!priceByPn[pn]) priceByPn[pn] = p.price || 0;
+            // un pn è ordinabile se almeno una sua riga non è locked
+            if ((p.locked || '').trim().toUpperCase() !== 'Y') lockedByPn[pn] = false;
+            else if (lockedByPn[pn] === undefined) lockedByPn[pn] = true;
+          });
+
+          // Tutte le combinazioni (PNIT, TYPE) presenti nel DB spare parts.
+          // Ogni combinazione raccoglie i propri codici (pn) su cui sommare le quantità.
+          const comboMap = {};
+          spareParts.forEach(p => {
+            const pnit = (p.pnit || '').trim() || '—';
+            const type = (p.type || '').trim() || '—';
+            const pn = (p.pn || '').trim();
+            if (!pn) return;
+            const key = `${pnit}||${type}`;
+            if (!comboMap[key]) comboMap[key] = { pnit, type, codici: new Set(), orderable: new Set() };
+            comboMap[key].codici.add(pn);
+            // ordinabile = non locked (esclude EOL/CLI, TO ORDER=NO, TYPE=NO)
+            if ((p.locked || '').trim().toUpperCase() !== 'Y') comboMap[key].orderable.add(pn);
+          });
+
+          const mesi = parseFloat(mesiCopertura) || 0;
+          let combos = Object.values(comboMap).map(c => {
+            const codici = [...c.codici];
+            // Codice da ordinare: il più idoneo (ordinabile); se più d'uno equivalente, il primo per codice
+            const orderable = [...c.orderable].sort();
+            const codiceOrdine = (orderable.length > 0 ? orderable : codici.slice().sort())[0] || '';
+            const nOrderable = orderable.length;
+            const stock = codici.reduce((s, k) => s + (stockByCodice[k] || 0), 0);
+            const inArrivo = codici.reduce((s, k) => s + (arrivoByCodice[k] || 0), 0);
+            const inOrdine = codici.reduce((s, k) => s + (ordini[k]?.in_ordine || 0), 0);
+            const cons = consumi[`${c.pnit}${c.type}`] || { media: 0, nomaterial: 0 };
+            const media = cons.media || 0;
+            const nomaterial = cons.nomaterial || 0;
+            const stima = Math.round(media * mesi + nomaterial);
+            // Se il codice da ordinare è locked, la quantità da ordinare è 0
+            const locked = !!lockedByPn[codiceOrdine];
+            const fabbisogno = stima - stock - inOrdine;
+            // Arrotonda per eccesso a multipli di 100
+            const daOrdinare = (locked || fabbisogno <= 0) ? 0 : Math.ceil(fabbisogno / 100) * 100;
+            const prezzo = priceByPn[codiceOrdine] || 0;
+            const ptot = daOrdinare > 0 ? prezzo * daOrdinare : 0;
+            return { pnit: c.pnit, type: c.type, nCodici: codici.length, codiceOrdine, nOrderable, locked, media, nomaterial, stock, inArrivo, inOrdine, stima, daOrdinare, prezzo, ptot };
+          });
+
+          const q = matriceSearch.trim().toLowerCase();
+          if (q) combos = combos.filter(c => `${c.pnit} ${c.type}`.toLowerCase().includes(q));
+          if (matriceSoloStima) combos = combos.filter(c => c.stima > 0);
+          if (matriceSoloDaOrdinare) combos = combos.filter(c => c.daOrdinare > 0);
+
+          const { col, dir } = matriceSort;
+          const mul = dir === 'asc' ? 1 : -1;
+          combos.sort((a, b) => {
+            const va = a[col], vb = b[col];
+            if (typeof va === 'number') return (va - vb) * mul;
+            return String(va).localeCompare(String(vb)) * mul;
+          });
+
+          const tot = combos.reduce((acc, c) => { acc.stock += c.stock; acc.inArrivo += c.inArrivo; acc.inOrdine += c.inOrdine; acc.ptot += c.ptot; return acc; }, { stock: 0, inArrivo: 0, inOrdine: 0, ptot: 0 });
+          const fmtEuro = (n) => (n || 0).toLocaleString('it-IT', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+          const toggleSort = (c) => setMatriceSort(prev => prev.col === c ? { col: c, dir: prev.dir === 'asc' ? 'desc' : 'asc' } : { col: c, dir: 'asc' });
+          const arrow = (c) => matriceSort.col === c ? (matriceSort.dir === 'asc' ? ' ▲' : ' ▼') : '';
+
+          return (
+            <div className="space-y-5">
+              <div className="flex items-center justify-between flex-wrap gap-3">
+                <div>
+                  <h2 className="text-lg font-black text-gray-800">🧮 Matrice PNIT × TYPE</h2>
+                  <p className="text-xs text-gray-500">Tutte le combinazioni PNIT + TYPE del DB spare parts, con stock, in arrivo (Piano Arrivi) e in ordine.</p>
+                </div>
+                <div className="flex items-center gap-3 flex-wrap">
+                  <input value={matriceSearch} onChange={e => setMatriceSearch(e.target.value)}
+                    placeholder="Cerca per PNIT o TYPE..."
+                    className="min-w-[220px] bg-gray-50 border border-gray-300 rounded-xl p-2.5 text-xs focus:outline-hidden" />
+                  <label className="flex items-center gap-2 cursor-pointer">
+                    <input type="checkbox" checked={matriceSoloStima} onChange={e => setMatriceSoloStima(e.target.checked)} className="w-4 h-4 accent-blue-600 cursor-pointer" />
+                    <span className="text-xs font-semibold text-gray-700">Solo con stima necessaria</span>
+                  </label>
+                  <label className="flex items-center gap-2 cursor-pointer">
+                    <input type="checkbox" checked={matriceSoloDaOrdinare} onChange={e => setMatriceSoloDaOrdinare(e.target.checked)} className="w-4 h-4 accent-blue-600 cursor-pointer" />
+                    <span className="text-xs font-semibold text-gray-700">Solo da ordinare</span>
+                  </label>
                 </div>
               </div>
-              {hwLoading && <p className="text-xs font-bold text-amber-600 animate-pulse">Elaborazione in corso...</p>}
-              {!hwLoading && hardware.length > 0 && (
-                <p className="text-sm bg-blue-50 text-blue-600 font-black px-3 py-2 rounded-xl border border-blue-100">
-                  {hardware.length} articoli in anagrafica
-                </p>
+
+              {/* Upload file quantità in ordine */}
+              <div className="bg-white p-3 rounded-2xl border border-gray-200 shadow-xs flex items-center justify-between flex-wrap gap-2">
+                <label className="bg-emerald-50 hover:bg-emerald-100 text-emerald-700 border border-emerald-200 text-xs font-bold px-3 py-2 rounded-xl cursor-pointer transition relative">
+                  📥 Aggiorna quantità in ordine (CSV)
+                  <input type="file" accept=".csv,.xls,.xlsx" className="absolute inset-0 w-full h-full opacity-0 cursor-pointer" onChange={handleOrdiniUpload} />
+                </label>
+                <label className="bg-purple-50 hover:bg-purple-100 text-purple-700 border border-purple-200 text-xs font-bold px-3 py-2 rounded-xl cursor-pointer transition relative">
+                  📥 Aggiorna consumi / NoMaterial
+                  <input type="file" accept=".csv,.xls,.xlsx" className="absolute inset-0 w-full h-full opacity-0 cursor-pointer" onChange={handleConsumiUpload} />
+                </label>
+                <span className="text-[11px] text-gray-400">In arrivo dal Piano Arrivi</span>
+                {(ordiniLoading || consumiLoading) && <span className="text-[11px] font-bold text-amber-600 animate-pulse">Caricamento...</span>}
+                {importMeta.ordini && <span className="text-[11px] text-gray-400">In ordine: {new Date(importMeta.ordini).toLocaleString('it-IT')}</span>}
+                {importMeta.consumi && <span className="text-[11px] text-gray-400">Consumi: {new Date(importMeta.consumi).toLocaleString('it-IT')}</span>}
+              </div>
+
+              <div className="flex items-center justify-between text-[11px] text-gray-500 flex-wrap gap-2">
+                <div className="flex items-center gap-2">
+                  <span className="font-semibold text-gray-600">Mesi copertura:</span>
+                  <input type="number" min="0" step="1" value={mesiCopertura}
+                    onChange={e => setMesiCopertura(e.target.value)}
+                    className="w-20 bg-gray-50 border border-gray-300 rounded-lg p-1.5 text-xs text-right focus:outline-hidden" />
+                  <span className="text-gray-400">· Stima = consumo medio × mesi + NoMaterial</span>
+                  <span>· {combos.length} combinazioni</span>
+                </div>
+                <span className="font-black text-blue-600">Stock: {tot.stock} · <span className="text-emerald-600">In arrivo: {tot.inArrivo}</span> · <span className="text-amber-600">In ordine: {tot.inOrdine}</span> · <span className="text-gray-800">Valore d&apos;acquisto: {fmtEuro(tot.ptot)} $</span></span>
+              </div>
+
+              {combos.length > 0 ? (
+                <div className="bg-white rounded-2xl border border-gray-200 shadow-xs overflow-x-auto">
+                  <table className="w-full min-w-[1300px] text-left border-collapse text-xs">
+                    <thead className="bg-gray-50 border-b border-gray-200 text-[10px] font-black text-gray-500 uppercase tracking-wider">
+                      <tr>
+                        <th className="px-3 py-3 cursor-pointer select-none whitespace-nowrap hover:bg-gray-100 transition" onClick={() => toggleSort('pnit')}>PNIT{arrow('pnit')}</th>
+                        <th className="px-3 py-3 cursor-pointer select-none whitespace-nowrap hover:bg-gray-100 transition" onClick={() => toggleSort('type')}>TYPE{arrow('type')}</th>
+                        <th className="px-3 py-3 cursor-pointer select-none whitespace-nowrap hover:bg-gray-100 transition" onClick={() => toggleSort('codiceOrdine')}>Codice da ordinare{arrow('codiceOrdine')}</th>
+                        <th className="px-3 py-3 text-right cursor-pointer select-none whitespace-nowrap hover:bg-gray-100 transition" onClick={() => toggleSort('nCodici')}>N. Codici{arrow('nCodici')}</th>
+                        <th className="px-3 py-3 text-right text-purple-600 cursor-pointer select-none whitespace-nowrap hover:bg-gray-100 transition" onClick={() => toggleSort('media')}>Cons. medio/mese{arrow('media')}</th>
+                        <th className="px-3 py-3 text-right text-rose-600 cursor-pointer select-none whitespace-nowrap hover:bg-gray-100 transition" onClick={() => toggleSort('nomaterial')}>NoMaterial{arrow('nomaterial')}</th>
+                        <th className="px-3 py-3 text-right text-blue-700 cursor-pointer select-none whitespace-nowrap hover:bg-gray-100 transition" onClick={() => toggleSort('stima')}>Stima necessaria{arrow('stima')}</th>
+                        <th className="px-3 py-3 text-right cursor-pointer select-none whitespace-nowrap hover:bg-gray-100 transition" onClick={() => toggleSort('stock')}>Stock{arrow('stock')}</th>
+                        <th className="px-3 py-3 text-right text-emerald-600 cursor-pointer select-none whitespace-nowrap hover:bg-gray-100 transition" onClick={() => toggleSort('inArrivo')}>In arrivo{arrow('inArrivo')}</th>
+                        <th className="px-3 py-3 text-right text-amber-600 cursor-pointer select-none whitespace-nowrap hover:bg-gray-100 transition" onClick={() => toggleSort('inOrdine')}>In ordine{arrow('inOrdine')}</th>
+                        <th className="px-3 py-3 text-right text-red-700 cursor-pointer select-none whitespace-nowrap hover:bg-gray-100 transition" onClick={() => toggleSort('daOrdinare')}>Da ordinare{arrow('daOrdinare')}</th>
+                        <th className="px-3 py-3 text-center cursor-pointer select-none whitespace-nowrap hover:bg-gray-100 transition" onClick={() => toggleSort('locked')}>Locked{arrow('locked')}</th>
+                        <th className="px-3 py-3 text-right cursor-pointer select-none whitespace-nowrap hover:bg-gray-100 transition" onClick={() => toggleSort('prezzo')}>Prezzo unit.{arrow('prezzo')}</th>
+                        <th className="px-3 py-3 text-right text-gray-800 cursor-pointer select-none whitespace-nowrap hover:bg-gray-100 transition" onClick={() => toggleSort('ptot')}>P.tot{arrow('ptot')}</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-gray-100">
+                      {combos.map(c => (
+                        <tr key={`${c.pnit}||${c.type}`} className="hover:bg-blue-50/50 transition">
+                          <td className="px-3 py-2.5 font-mono font-bold text-indigo-800">{c.pnit}</td>
+                          <td className="px-3 py-2.5 text-gray-700">{c.type}</td>
+                          <td className="px-3 py-2.5 font-mono font-bold text-blue-700">{c.codiceOrdine || '—'}{c.nOrderable > 1 && <span className="ml-1 text-[9px] font-black text-amber-600" title={`${c.nOrderable} codici equivalenti`}>⚑{c.nOrderable}</span>}</td>
+                          <td className="px-3 py-2.5 text-right font-mono text-gray-500">{c.nCodici}</td>
+                          <td className="px-3 py-2.5 text-right font-mono text-purple-600">{c.media ? c.media.toFixed(1) : ''}</td>
+                          <td className="px-3 py-2.5 text-right font-mono text-rose-600">{c.nomaterial || ''}</td>
+                          <td className="px-3 py-2.5 text-right font-mono font-black text-blue-800">{c.stima || ''}</td>
+                          <td className="px-3 py-2.5 text-right font-mono font-black text-blue-700">{c.stock}</td>
+                          <td className="px-3 py-2.5 text-right font-mono font-black text-emerald-600">{c.inArrivo || ''}</td>
+                          <td className="px-3 py-2.5 text-right font-mono font-black text-amber-600">{c.inOrdine || ''}</td>
+                          <td className={`px-3 py-2.5 text-right font-mono font-black ${c.daOrdinare > 0 ? 'text-red-700' : 'text-gray-300'}`}>{c.daOrdinare > 0 ? c.daOrdinare : ''}</td>
+                          <td className="px-3 py-2.5 text-center">{c.locked ? <span className="text-[9px] font-black text-red-600 bg-red-50 border border-red-100 px-1.5 py-0.5 rounded">🔒 LOCKED</span> : ''}</td>
+                          <td className="px-3 py-2.5 text-right font-mono text-gray-600">{c.prezzo ? fmtEuro(c.prezzo) : ''}</td>
+                          <td className="px-3 py-2.5 text-right font-mono font-black text-gray-800">{c.ptot ? fmtEuro(c.ptot) : ''}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              ) : (
+                <div className="text-center py-16 text-gray-400 text-sm">Nessuna combinazione da visualizzare.</div>
               )}
             </div>
+          );
+        })()}
+
+        {/* ==================== MODULO ANAGRAFICA TERMINALI ==================== */}
+        {activeModule === 'anagrafica' && (() => {
+          const gruppoDesc = (a) => [a.modello, a.versione_pci, a.note].map(x => String(x || '').trim()).filter(Boolean).join(' - ');
+          const q = anagSearch.trim().toLowerCase();
+          const list = anagrafica.filter(a => {
+            if (!q) return true;
+            return `${a.codice} ${a.tipo} ${a.modello} ${a.famiglia} ${a.descrizione} ${gruppoDesc(a)}`.toLowerCase().includes(q);
+          });
+          return (
+          <div className="space-y-5">
+            <div className="flex items-center justify-between flex-wrap gap-3">
+              <div>
+                <h2 className="text-lg font-black text-gray-800">📇 Anagrafica Terminali</h2>
+                <p className="text-xs text-gray-500">Chiave <strong>CODICE = PNIT</strong> del DB spare parts. Import da <em>tipoterminale.xlsx</em> (foglio &quot;famiglie&quot;).</p>
+                {importMeta.anagrafica && <p className="text-[11px] text-gray-400">Ultimo aggiornamento: {new Date(importMeta.anagrafica).toLocaleString('it-IT')}</p>}
+              </div>
+              <div className="flex gap-2 flex-wrap">
+                <button onClick={fetchAnagrafica} className="bg-gray-100 hover:bg-gray-200 text-gray-600 text-sm font-bold px-3 py-2.5 rounded-xl cursor-pointer transition" title="Aggiorna">↻</button>
+                <label className="bg-blue-600 hover:bg-blue-700 text-white text-sm font-bold px-4 py-2.5 rounded-xl cursor-pointer transition shadow-xs relative">
+                  📥 Importa file
+                  <input type="file" accept=".csv,.xls,.xlsx" className="absolute inset-0 w-full h-full opacity-0 cursor-pointer" onChange={handleAnagraficaUpload} />
+                </label>
+              </div>
+            </div>
+
+            <div className="flex items-center gap-3 flex-wrap">
+              <input value={anagSearch} onChange={e => setAnagSearch(e.target.value)}
+                placeholder="Cerca per codice, modello, famiglia, descrizione..."
+                className="flex-grow min-w-[200px] bg-gray-50 border border-gray-300 rounded-xl p-2.5 text-xs focus:outline-hidden" />
+              <span className="text-[11px] text-gray-500">{list.length} / {anagrafica.length} terminali</span>
+            </div>
+
+            {anagLoading && <div className="text-center py-4 text-xs font-bold text-amber-600 animate-pulse">Caricamento...</div>}
+
+            {!anagLoading && anagrafica.length === 0 && (
+              <div className="text-center py-16 text-gray-400 text-sm">Nessun terminale in anagrafica. Importa il file tipoterminale.xlsx.</div>
+            )}
+
+            {!anagLoading && list.length > 0 && (
+              <div className="bg-white rounded-2xl border border-gray-200 shadow-xs overflow-x-auto">
+                <table className="w-full min-w-[720px] text-left border-collapse text-xs">
+                  <thead className="bg-gray-50 border-b border-gray-200 text-[10px] font-black text-gray-500 uppercase tracking-wider">
+                    <tr>
+                      <th className="px-3 py-3">Codice (PNIT)</th>
+                      <th className="px-3 py-3">Gruppo</th>
+                      <th className="px-3 py-3">Tipo</th>
+                      <th className="px-3 py-3">Famiglia</th>
+                      <th className="px-3 py-3">Descrizione</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-gray-100">
+                    {list.map(a => (
+                      <tr key={a.codice} className="hover:bg-blue-50/50 transition">
+                        <td className="px-3 py-2.5 font-mono font-bold text-blue-700">{a.codice}</td>
+                        <td className="px-3 py-2.5 font-black text-indigo-800">{gruppoDesc(a) || '—'}</td>
+                        <td className="px-3 py-2.5 text-gray-600">{a.tipo || '—'}</td>
+                        <td className="px-3 py-2.5 text-gray-600">{a.famiglia || '—'}</td>
+                        <td className="px-3 py-2.5 text-gray-600">{a.descrizione || '—'}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
           </div>
-        )}
+          );
+        })()}
 
         {/* ==================== MODULO PRELIEVI — LISTA ==================== */}
         {activeModule === 'prelievi' && prelievoView === 'list' && (
@@ -2502,13 +3145,19 @@ export default function App() {
             <div className="flex items-center justify-between">
               <div>
                 <h2 className="text-lg font-black text-gray-800">📤 Prelievi effettuati</h2>
-                <p className="text-xs text-gray-500">{prelieviList.length} prelievi registrati</p>
+                <p className="text-xs text-gray-500">{prelieviList.length} prelievi totali</p>
               </div>
-              <div className="flex gap-2">
+              <div className="flex gap-2 flex-wrap">
                 <button onClick={fetchPrelievi}
                   className="bg-gray-100 hover:bg-gray-200 text-gray-600 text-sm font-bold px-3 py-2.5 rounded-xl cursor-pointer transition" title="Aggiorna">
                   ↻
                 </button>
+                {prelieviList.some(p => p.stato !== 'registrato') && (
+                  <button onClick={exportPrelieviRettifica}
+                    className="bg-green-50 hover:bg-green-100 text-green-700 border border-green-200 text-sm font-bold px-4 py-2.5 rounded-xl cursor-pointer transition">
+                    📥 Esporta rettifica
+                  </button>
+                )}
                 <button onClick={() => { setPrelievoView('new'); setPrelievoRighe([]); setPrelievoFeedback({ text: '', type: '' }); setTimeout(() => prelievoScannerRef.current?.focus(), 100); }}
                   className="bg-blue-600 hover:bg-blue-700 text-white text-sm font-bold px-4 py-2.5 rounded-xl cursor-pointer transition shadow-xs">
                   + Nuovo prelievo
@@ -2516,11 +3165,34 @@ export default function App() {
               </div>
             </div>
 
+            {/* Sotto-schede: Attivi / Registrati */}
+            <div className="flex gap-1 bg-gray-100 p-1 rounded-xl w-fit">
+              {[
+                { id: 'attivi', label: 'Attivi', n: prelieviList.filter(p => p.stato !== 'registrato').length },
+                { id: 'registrati', label: 'Registrati', n: prelieviList.filter(p => p.stato === 'registrato').length },
+              ].map(t => (
+                <button key={t.id} onClick={() => setPrelievoTab(t.id)}
+                  className={`text-xs font-bold px-4 py-2 rounded-lg cursor-pointer transition ${prelievoTab === t.id ? 'bg-white text-gray-800 shadow-xs' : 'text-gray-500 hover:text-gray-700'}`}>
+                  {t.label} <span className="ml-1 text-[10px] opacity-70">({t.n})</span>
+                </button>
+              ))}
+            </div>
+
             {prelieviLoading && <div className="text-center py-4 text-xs font-bold text-amber-600 animate-pulse">Caricamento...</div>}
 
-            {!prelieviLoading && prelieviList.length > 0 && (
+            {(() => {
+              const filtered = prelieviList.filter(p => prelievoTab === 'registrati' ? p.stato === 'registrato' : p.stato !== 'registrato');
+              if (prelieviLoading) return null;
+              if (filtered.length === 0) return (
+                <div className="text-center py-16 text-gray-400 text-sm">
+                  {prelievoTab === 'registrati'
+                    ? 'Nessun prelievo registrato. Esporta la rettifica dagli attivi per registrarli.'
+                    : 'Nessun prelievo attivo. Clicca "Nuovo prelievo" per iniziare.'}
+                </div>
+              );
+              return (
               <div className="bg-white rounded-2xl border border-gray-200 shadow-xs overflow-x-auto">
-                <table className="w-full text-left border-collapse text-xs">
+                <table className="w-full min-w-[680px] text-left border-collapse text-xs">
                   <thead className="bg-gray-50 border-b border-gray-200 text-[10px] font-black text-gray-500 uppercase tracking-wider">
                     <tr>
                       <th className="px-3 py-3">ID Prelievo</th>
@@ -2533,30 +3205,30 @@ export default function App() {
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-gray-100">
-                    {prelieviList.map(p => (
+                    {filtered.map(p => (
                       <tr key={p.id} className="hover:bg-blue-50/50 transition cursor-pointer" onClick={() => openPrelievoDetail(p)}>
-                        <td className="px-3 py-2.5 font-mono font-bold text-blue-700 underline">{p.id_prelievo}</td>
+                        <td className="px-3 py-2.5 font-mono font-bold text-blue-700 underline">
+                          {p.id_prelievo}
+                          {p.stato === 'registrato' && <span className="ml-2 text-[9px] font-black text-emerald-700 bg-emerald-50 border border-emerald-200 px-1.5 py-0.5 rounded-md uppercase tracking-wide">Registrato</span>}
+                        </td>
                         <td className="px-3 py-2.5 text-gray-600">{p.data_prelievo ? new Date(p.data_prelievo).toLocaleString('it-IT') : '—'}</td>
                         <td className="px-3 py-2.5 text-gray-700">{p.utente || '—'}</td>
                         <td className="px-3 py-2.5 text-gray-600">{p.destinazione || '—'}</td>
                         <td className="px-3 py-2.5 text-right font-mono">{p.n_righe}</td>
                         <td className="px-3 py-2.5 text-right font-mono font-black">{p.n_pezzi}</td>
                         <td className="px-3 py-2.5 text-center">
-                          <button onClick={(e) => { e.stopPropagation(); deletePrelievo(p); }}
-                            className="text-[10px] text-gray-400 hover:text-red-600 bg-gray-50 hover:bg-red-50 border border-gray-200 hover:border-red-300 px-2 py-1 rounded-lg cursor-pointer transition" title="Elimina e ripristina inventario">🗑</button>
+                          {p.stato === 'registrato'
+                            ? <span className="text-[10px] text-gray-300" title="Prelievo registrato: non eliminabile">🔒</span>
+                            : <button onClick={(e) => { e.stopPropagation(); deletePrelievo(p); }}
+                                className="text-[10px] text-gray-400 hover:text-red-600 bg-gray-50 hover:bg-red-50 border border-gray-200 hover:border-red-300 px-2 py-1 rounded-lg cursor-pointer transition" title="Elimina e ripristina inventario">🗑</button>}
                         </td>
                       </tr>
                     ))}
                   </tbody>
                 </table>
               </div>
-            )}
-
-            {!prelieviLoading && prelieviList.length === 0 && (
-              <div className="text-center py-16 text-gray-400 text-sm">
-                Nessun prelievo registrato. Clicca &quot;Nuovo prelievo&quot; per iniziare.
-              </div>
-            )}
+              );
+            })()}
           </div>
         )}
 
@@ -2565,7 +3237,9 @@ export default function App() {
           <div className="space-y-5 max-w-4xl mx-auto">
             <div className="flex items-center justify-between">
               <div>
-                <h2 className="text-lg font-black text-gray-800">📤 Prelievo {prelievoDetail.testata.id_prelievo}</h2>
+                <h2 className="text-lg font-black text-gray-800">📤 Prelievo {prelievoDetail.testata.id_prelievo}
+                  {prelievoDetail.testata.stato === 'registrato' && <span className="ml-2 text-[10px] align-middle font-black text-emerald-700 bg-emerald-50 border border-emerald-200 px-2 py-0.5 rounded-md uppercase tracking-wide">🔒 Registrato</span>}
+                </h2>
                 <p className="text-xs text-gray-500">
                   {prelievoDetail.testata.data_prelievo ? new Date(prelievoDetail.testata.data_prelievo).toLocaleString('it-IT') : '—'}
                   {' · '}Operatore: <strong>{prelievoDetail.testata.utente || '—'}</strong>
@@ -2578,12 +3252,13 @@ export default function App() {
               </button>
             </div>
 
-            <div className="bg-white rounded-2xl border border-gray-200 shadow-xs overflow-x-auto">
+            <div className="bg-white rounded-2xl border border-gray-200 shadow-xs overflow-hidden">
               <div className="flex items-center justify-between px-4 py-3 border-b border-gray-100">
                 <span className="text-xs font-black text-gray-500 uppercase tracking-wider">{prelievoDetail.righe.length} righe</span>
                 <span className="text-sm font-black text-blue-600">Tot. pezzi: {prelievoDetail.righe.reduce((s, r) => s + (r.quantita || 0), 0)}</span>
               </div>
-              <table className="w-full text-left border-collapse text-xs">
+              <div className="overflow-x-auto">
+              <table className="w-full min-w-[560px] text-left border-collapse text-xs">
                 <thead className="bg-gray-50 border-b border-gray-200 text-[10px] font-black text-gray-500 uppercase tracking-wider">
                   <tr>
                     <th className="px-3 py-3">Codice</th>
@@ -2605,6 +3280,7 @@ export default function App() {
                   ))}
                 </tbody>
               </table>
+              </div>
             </div>
           </div>
         )}
@@ -2730,7 +3406,8 @@ export default function App() {
                     <span className="text-xs font-black text-gray-500 uppercase tracking-wider">{prelievoRighe.length} righe da prelevare</span>
                     <span className="text-sm font-black text-blue-600">Tot. pezzi: {totalePezzi}</span>
                   </div>
-                  <table className="w-full text-xs">
+                  <div className="overflow-x-auto">
+                  <table className="w-full min-w-[620px] text-xs">
                     <thead className="bg-gray-50 border-b border-gray-100 text-[10px] font-black text-gray-500 uppercase">
                       <tr>
                         <th className="px-3 py-2 text-left">Codice</th>
@@ -2763,6 +3440,7 @@ export default function App() {
                       ))}
                     </tbody>
                   </table>
+                  </div>
                   <div className="p-4 border-t border-gray-100">
                     <button onClick={registraPrelievo}
                       className="w-full bg-green-600 hover:bg-green-700 text-white font-black p-4 rounded-xl text-base shadow-md transition cursor-pointer flex items-center justify-center gap-2">
@@ -2807,6 +3485,7 @@ export default function App() {
                   )}
                 </div>
               </div>
+              {importMeta.po_lines && <p className="text-[11px] text-gray-400 mt-2 text-center sm:text-left">Ultimo aggiornamento piano arrivi: {new Date(importMeta.po_lines).toLocaleString('it-IT')}</p>}
             </div>
 
             {poLines.length > 0 && (
@@ -3482,15 +4161,15 @@ export default function App() {
       </main>
 
 
-      {activeModule === 'spare-parts' && Object.keys(spPendingChanges).length > 0 && (
+      {activeModule === 'spare-parts' && (Object.keys(spPendingChanges).length > 0 || spNewRows.length > 0) && (
         <div className="fixed bottom-0 left-0 right-0 z-50 bg-white border-t border-amber-200 shadow-lg px-4 py-3 flex items-center justify-between gap-4">
-          <span className="text-sm font-bold text-amber-700">✏️ {Object.keys(spPendingChanges).length} riga/righe modificate non salvate</span>
+          <span className="text-sm font-bold text-amber-700">✏️ {Object.keys(spPendingChanges).length} modificate{spNewRows.length > 0 ? ` · ${spNewRows.length} nuove` : ''}</span>
           <div className="flex gap-2">
-            <button onClick={() => { setSpPendingChanges({}); setSpEditMode(false); }}
+            <button onClick={() => { setSpPendingChanges({}); setSpNewRows([]); setSpEditMode(false); }}
               className="text-sm font-bold px-4 py-2 rounded-xl bg-gray-100 hover:bg-gray-200 text-gray-600 cursor-pointer transition">Annulla tutto</button>
             <button onClick={saveAllSpChanges}
               className="text-sm font-bold px-4 py-2 rounded-xl bg-green-600 hover:bg-green-700 text-white cursor-pointer transition shadow-xs">
-              ✓ Salva {Object.keys(spPendingChanges).length} modifiche
+              ✓ Salva
             </button>
           </div>
         </div>
