@@ -6,7 +6,19 @@ import { useColumnWidths } from './useColumnWidths';
 // Moduli work-in-progress da nascondere dal menu (impostare a true per riattivarli)
 // Moduli WIP visibili solo in sviluppo locale (npm run dev), nascosti nella build di produzione (Vercel)
 const SHOW_WIP_MODULES = import.meta.env.DEV;
-const WIP_MODULE_IDS = ['riepilogo', 'anagrafica', 'matrice'];
+const WIP_MODULE_IDS = ['riepilogo', 'anagrafica', 'matrice']; // default iniziale, poi gestito da DB (moduli_config)
+
+// Catalogo moduli gestibili a livello di permessi ruolo (esclude 'utenti', sempre admin-only)
+const APP_MODULES = [
+  { id: 'arrivi', label: 'Piano Arrivi', group: 'Magazzino', upload: true },
+  { id: 'prelievi', label: 'Prelievi', group: 'Magazzino' },
+  { id: 'sposta-bancale', label: 'Sposta Bancale', group: 'Magazzino' },
+  { id: 'stock', label: 'Inventario Spare Parts', group: 'Magazzino', upload: true, edit: true },
+  { id: 'riepilogo', label: 'Riepilogo Stock', group: 'Magazzino' },
+  { id: 'spare-parts', label: 'DB Spare Parts', group: 'Repair', upload: true, edit: true },
+  { id: 'matrice', label: 'Matrice PNIT × TYPE', group: 'Repair', upload: true },
+  { id: 'anagrafica', label: 'Anagrafica', group: 'Repair', upload: true },
+];
 
 const SP_DEFAULT_WIDTHS = {
   pn: 130, terminal_pn: 120, modello: 60, pnit: 80, english_name: 110,
@@ -64,6 +76,165 @@ export default function App() {
   const [menuOpen, setMenuOpen] = useState(false);
   const [currentUser, setCurrentUser] = useState(() => localStorage.getItem('logiscan_username') || '');
 
+  // Autenticazione (utenti gestiti su DB via RPC)
+  const [authUser, setAuthUser] = useState(() => {
+    try { const s = localStorage.getItem('logiscan_auth'); return s ? JSON.parse(s) : null; } catch { return null; }
+  });
+  const [loginUser, setLoginUser] = useState('');
+  const [loginPsw, setLoginPsw] = useState('');
+  const [loginError, setLoginError] = useState('');
+  const [loginLoading, setLoginLoading] = useState(false);
+  const [cpOld, setCpOld] = useState('');
+  const [cpNew, setCpNew] = useState('');
+  const [cpNew2, setCpNew2] = useState('');
+  const [cpError, setCpError] = useState('');
+  const [cpLoading, setCpLoading] = useState(false);
+
+  async function handleLogin(e) {
+    if (e) e.preventDefault();
+    const u = loginUser.trim();
+    if (!u || !loginPsw) { setLoginError('Inserisci utente e password.'); return; }
+    setLoginLoading(true);
+    setLoginError('');
+    const { data, error } = await supabase.rpc('verifica_login', { p_username: u, p_password: loginPsw });
+    setLoginLoading(false);
+    if (error) { setLoginError('Errore di accesso: ' + error.message); return; }
+    const row = Array.isArray(data) ? data[0] : data;
+    if (!row) { setLoginError('Credenziali non valide.'); return; }
+    const sess = { username: row.username, ruolo: row.ruolo, must_change_pw: !!row.must_change_pw };
+    localStorage.setItem('logiscan_auth', JSON.stringify(sess));
+    localStorage.setItem('logiscan_username', row.username);
+    setAuthUser(sess);
+    setCurrentUser(row.username);
+    setCpOld(loginPsw); // precompila la password attuale per l'eventuale cambio forzato
+    setLoginUser(''); setLoginPsw('');
+  }
+
+  async function handleChangePassword(e) {
+    if (e) e.preventDefault();
+    if (!cpNew || cpNew.length < 4) { setCpError('La nuova password deve avere almeno 4 caratteri.'); return; }
+    if (cpNew !== cpNew2) { setCpError('Le due password non coincidono.'); return; }
+    setCpLoading(true); setCpError('');
+    const { data, error } = await supabase.rpc('cambia_password', { p_username: authUser.username, p_old: cpOld, p_new: cpNew });
+    setCpLoading(false);
+    if (error) { setCpError('Errore: ' + error.message); return; }
+    if (data !== true) { setCpError('Password attuale errata.'); return; }
+    const sess = { ...authUser, must_change_pw: false };
+    localStorage.setItem('logiscan_auth', JSON.stringify(sess));
+    setAuthUser(sess);
+    setCpOld(''); setCpNew(''); setCpNew2('');
+  }
+
+  function handleLogout() {
+    localStorage.removeItem('logiscan_auth');
+    setAuthUser(null);
+  }
+
+  // Gestione utenti (modulo admin)
+  const [utentiList, setUtentiList] = useState([]);
+  const [utentiLoading, setUtentiLoading] = useState(false);
+  const [utentiTab, setUtentiTab] = useState('utenti'); // 'utenti' | 'ruoli'
+  const [nuovoUtente, setNuovoUtente] = useState({ username: '', password: '', ruolo: 'admin' });
+  const [ruoliList, setRuoliList] = useState([]);
+  const [nuovoRuolo, setNuovoRuolo] = useState({ nome: '', descrizione: '' });
+  const [permessi, setPermessi] = useState({}); // ruolo -> { modulo: livello }
+  const [permRuoloSel, setPermRuoloSel] = useState('');
+  const [moduliSper, setModuliSper] = useState(() => new Set(WIP_MODULE_IDS)); // moduli sperimentali (SP)
+
+  async function fetchModuliConfig() {
+    const { data, error } = await supabase.rpc('elenco_moduli_config');
+    if (error) return; // in mancanza, resta il default
+    const s = new Set();
+    (data || []).forEach(r => { if (r.sperimentale) s.add(r.modulo); });
+    setModuliSper(s);
+  }
+
+  async function setModuloSper(modulo, sper) {
+    setModuliSper(prev => { const n = new Set(prev); if (sper) n.add(modulo); else n.delete(modulo); return n; });
+    const { error } = await supabase.rpc('set_modulo_sper', { p_modulo: modulo, p_sper: sper });
+    if (error) { alert('Errore: ' + error.message); fetchModuliConfig(); }
+  }
+
+  async function fetchPermessi() {
+    const { data } = await supabase.rpc('elenco_permessi');
+    const map = {};
+    (data || []).forEach(r => { (map[r.ruolo] = map[r.ruolo] || {})[r.modulo] = r.livello; });
+    setPermessi(map);
+  }
+
+  async function setPermesso(ruolo, modulo, livello) {
+    setPermessi(prev => ({ ...prev, [ruolo]: { ...(prev[ruolo] || {}), [modulo]: livello } }));
+    const { error } = await supabase.rpc('set_permesso', { p_ruolo: ruolo, p_modulo: modulo, p_livello: livello });
+    if (error) { alert('Errore salvataggio permesso: ' + error.message); fetchPermessi(); }
+  }
+
+  async function fetchUtenti() {
+    setUtentiLoading(true);
+    const [{ data: uData }, { data: rData }] = await Promise.all([
+      supabase.rpc('elenco_utenti'),
+      supabase.rpc('elenco_ruoli'),
+    ]);
+    setUtentiList(uData || []);
+    setRuoliList(rData || []);
+    await fetchPermessi();
+    setUtentiLoading(false);
+  }
+
+  async function salvaRuolo() {
+    const n = nuovoRuolo.nome.trim();
+    if (!n) { alert('Inserisci il nome del ruolo.'); return; }
+    setUtentiLoading(true);
+    const { error } = await supabase.rpc('crea_ruolo', { p_nome: n, p_descrizione: nuovoRuolo.descrizione.trim() || null });
+    if (error) { alert('Errore: ' + error.message); setUtentiLoading(false); return; }
+    setNuovoRuolo({ nome: '', descrizione: '' });
+    await fetchUtenti();
+  }
+
+  async function eliminaRuolo(nome) {
+    if (nome.toLowerCase() === 'admin') { alert('Il ruolo admin non può essere eliminato.'); return; }
+    const inUso = utentiList.filter(u => (u.ruolo || '').toLowerCase() === nome.toLowerCase()).length;
+    if (inUso > 0 && !window.confirm(`Il ruolo "${nome}" è assegnato a ${inUso} utente/i. Eliminarlo comunque?`)) return;
+    setUtentiLoading(true);
+    const { error } = await supabase.rpc('elimina_ruolo', { p_nome: nome });
+    if (error) alert('Errore: ' + error.message);
+    await fetchUtenti();
+  }
+
+  async function salvaUtente() {
+    const u = nuovoUtente.username.trim();
+    if (!u || !nuovoUtente.password) { alert('Inserisci username e password.'); return; }
+    setUtentiLoading(true);
+    const { error } = await supabase.rpc('crea_utente', { p_username: u, p_password: nuovoUtente.password, p_ruolo: nuovoUtente.ruolo || 'admin' });
+    if (error) { alert('Errore: ' + error.message); setUtentiLoading(false); return; }
+    setNuovoUtente({ username: '', password: '', ruolo: 'admin' });
+    await fetchUtenti();
+    alert(`Utente "${u}" salvato.`);
+  }
+
+  async function toggleUtenteAttivo(user) {
+    if (user.username === authUser?.username) { alert('Non puoi disattivare il tuo stesso account.'); return; }
+    setUtentiLoading(true);
+    const { error } = await supabase.rpc('set_utente_attivo', { p_username: user.username, p_attivo: !user.attivo });
+    if (error) alert('Errore: ' + error.message);
+    await fetchUtenti();
+  }
+
+  async function toggleMustChange(user) {
+    setUtentiLoading(true);
+    const { error } = await supabase.rpc('set_must_change', { p_username: user.username, p_flag: !user.must_change_pw });
+    if (error) alert('Errore: ' + error.message);
+    await fetchUtenti();
+  }
+
+  async function eliminaUtente(user) {
+    if (user.username === authUser?.username) { alert('Non puoi eliminare il tuo stesso account.'); return; }
+    if (!window.confirm(`Eliminare l'utente "${user.username}"?`)) return;
+    setUtentiLoading(true);
+    const { error } = await supabase.rpc('elimina_utente', { p_username: user.username });
+    if (error) alert('Errore: ' + error.message);
+    await fetchUtenti();
+  }
+
   const { widths: spWidths, startResize: spStartResize, resetWidths: spResetWidths } = useColumnWidths('logiscan_sp_cols', SP_DEFAULT_WIDTHS);
   const { widths: stWidths, startResize: stStartResize, resetWidths: stResetWidths } = useColumnWidths('logiscan_stock_cols', STOCK_DEFAULT_WIDTHS);
   const [currentView, setCurrentView] = useState('dashboard');
@@ -110,7 +281,6 @@ export default function App() {
   const [stockSearch2, setStockSearch2] = useState('');
   const [stockPendingChanges, setStockPendingChanges] = useState({});
   const [stockNewRows, setStockNewRows] = useState([]); // righe nuove da inserire (in modalità modifica)
-  const [moveBancaleOpen, setMoveBancaleOpen] = useState(false);
 
   // Arrivo Quantità
   const [, setArrivoQtyActive] = useState(false);
@@ -189,6 +359,9 @@ export default function App() {
     fetchOrdini();
     fetchConsumi();
     fetchImportMeta();
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    fetchPermessi();
+    fetchModuliConfig();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -791,7 +964,6 @@ export default function App() {
     if (error) { alert('Errore: ' + error.message); }
     else {
       setStockItems(prev => prev.map(s => s.numero_bancale === moveBancaleSrc ? { ...s, ...updates } : s));
-      setMoveBancaleOpen(false);
       setMoveBancaleSrc('');
       setMoveBancaleLocazione('');
     }
@@ -1929,6 +2101,96 @@ export default function App() {
     invoiceGroups[groupKey].lines.push(line);
   });
 
+  // ==================== PERMESSI DI RUOLO ====================
+  const myRole = (authUser?.ruolo || '').toLowerCase();
+  const isAdmin = myRole === 'admin';
+  const hasPerm = (key) => (((permessi[myRole] || {})[key]) || 'none') !== 'none';
+  const canRead = (mod) => mod === 'utenti' ? isAdmin : (isAdmin || hasPerm(mod));
+  const canUpload = (mod) => isAdmin || hasPerm(`${mod}:upload`); // caricamenti Excel/CSV per modulo
+  const canEdit = (mod) => isAdmin || hasPerm(`${mod}:edit`);     // pulsante Modifica per modulo
+  const isSper = (mod) => moduliSper.has(mod);                    // modulo sperimentale (SP)
+
+  // Se il modulo attivo non è accessibile col ruolo corrente, spostati sul primo consentito
+  useEffect(() => {
+    if (!authUser || isAdmin) return;
+    if (!canRead(activeModule)) {
+      const first = APP_MODULES.find(m => canRead(m.id));
+      // eslint-disable-next-line react-hooks/set-state-in-effect
+      setActiveModule(first ? first.id : 'no-access');
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [authUser, permessi, activeModule]);
+
+  // ==================== CANCELLO DI LOGIN ====================
+  if (!authUser) {
+    return (
+      <div className="bg-gray-50 font-sans min-h-screen text-gray-800 flex items-center justify-center p-4">
+        <form onSubmit={handleLogin} className="bg-white w-full max-w-sm rounded-2xl border border-gray-200 shadow-sm p-8 space-y-5">
+          <div className="text-center space-y-2">
+            <img src="/logo.png" alt="Logo" className="h-16 w-auto object-contain mx-auto" />
+            <h1 className="text-lg font-black text-gray-800 uppercase tracking-widest">Accesso</h1>
+            <p className="text-xs text-gray-400">Inserisci le tue credenziali per continuare.</p>
+          </div>
+          <div className="space-y-3">
+            <div className="space-y-1">
+              <label className="block text-[10px] font-bold text-gray-500 uppercase">Utente</label>
+              <input value={loginUser} onChange={e => setLoginUser(e.target.value)} autoFocus autoComplete="username"
+                className="w-full bg-gray-50 border border-gray-300 rounded-xl p-2.5 text-sm focus:outline-hidden" />
+            </div>
+            <div className="space-y-1">
+              <label className="block text-[10px] font-bold text-gray-500 uppercase">Password</label>
+              <input type="password" value={loginPsw} onChange={e => setLoginPsw(e.target.value)} autoComplete="current-password"
+                className="w-full bg-gray-50 border border-gray-300 rounded-xl p-2.5 text-sm focus:outline-hidden" />
+            </div>
+          </div>
+          {loginError && <p className="text-xs font-bold text-red-600 bg-red-50 border border-red-100 rounded-lg px-3 py-2">{loginError}</p>}
+          <button type="submit" disabled={loginLoading}
+            className="w-full bg-blue-600 hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed text-white font-black py-2.5 rounded-xl cursor-pointer transition shadow-xs">
+            {loginLoading ? 'Accesso in corso…' : 'Accedi'}
+          </button>
+        </form>
+      </div>
+    );
+  }
+
+  // ==================== CAMBIO PASSWORD OBBLIGATORIO ====================
+  if (authUser.must_change_pw) {
+    return (
+      <div className="bg-gray-50 font-sans min-h-screen text-gray-800 flex items-center justify-center p-4">
+        <form onSubmit={handleChangePassword} className="bg-white w-full max-w-sm rounded-2xl border border-gray-200 shadow-sm p-8 space-y-5">
+          <div className="text-center space-y-2">
+            <span className="text-3xl block">🔑</span>
+            <h1 className="text-lg font-black text-gray-800 uppercase tracking-widest">Cambio password</h1>
+            <p className="text-xs text-gray-400">Al primo accesso devi impostare una nuova password per <strong>{authUser.username}</strong>.</p>
+          </div>
+          <div className="space-y-3">
+            <div className="space-y-1">
+              <label className="block text-[10px] font-bold text-gray-500 uppercase">Password attuale</label>
+              <input type="password" value={cpOld} onChange={e => setCpOld(e.target.value)} autoComplete="current-password"
+                className="w-full bg-gray-50 border border-gray-300 rounded-xl p-2.5 text-sm focus:outline-hidden" />
+            </div>
+            <div className="space-y-1">
+              <label className="block text-[10px] font-bold text-gray-500 uppercase">Nuova password</label>
+              <input type="password" value={cpNew} onChange={e => setCpNew(e.target.value)} autoFocus autoComplete="new-password"
+                className="w-full bg-gray-50 border border-gray-300 rounded-xl p-2.5 text-sm focus:outline-hidden" />
+            </div>
+            <div className="space-y-1">
+              <label className="block text-[10px] font-bold text-gray-500 uppercase">Conferma nuova password</label>
+              <input type="password" value={cpNew2} onChange={e => setCpNew2(e.target.value)} autoComplete="new-password"
+                className="w-full bg-gray-50 border border-gray-300 rounded-xl p-2.5 text-sm focus:outline-hidden" />
+            </div>
+          </div>
+          {cpError && <p className="text-xs font-bold text-red-600 bg-red-50 border border-red-100 rounded-lg px-3 py-2">{cpError}</p>}
+          <button type="submit" disabled={cpLoading}
+            className="w-full bg-blue-600 hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed text-white font-black py-2.5 rounded-xl cursor-pointer transition shadow-xs">
+            {cpLoading ? 'Aggiornamento…' : 'Aggiorna password'}
+          </button>
+          <button type="button" onClick={handleLogout} className="w-full text-xs font-bold text-gray-400 hover:text-gray-600 cursor-pointer">Esci</button>
+        </form>
+      </div>
+    );
+  }
+
   return (
     <div className="bg-gray-50 font-sans min-h-screen text-gray-800 flex flex-col justify-between">
 
@@ -1941,26 +2203,60 @@ export default function App() {
               <img src="/logo.png" alt="Logo" className="h-10 w-auto object-contain" />
               <button onClick={() => setMenuOpen(false)} className="text-gray-400 hover:text-gray-700 text-2xl leading-none cursor-pointer">✕</button>
             </div>
-            <nav className="flex-grow p-4 space-y-1">
+            <nav className="flex-grow p-4 space-y-4 overflow-y-auto">
               {[
-                { id: 'arrivi', label: 'Piano Arrivi', icon: '📦' },
-                { id: 'spare-parts', label: 'DB Spare Parts', icon: '🔧' },
-                { id: 'stock', label: 'Inventario Spare Parts', icon: '🗄️' },
-                { id: 'riepilogo', label: 'Riepilogo Stock', icon: '📊' },
-                { id: 'matrice', label: 'Matrice PNIT × TYPE', icon: '🧮' },
-                { id: 'prelievi', label: 'Prelievi', icon: '📤' },
-                { id: 'anagrafica', label: 'Anagrafica', icon: '📇' },
-              ].filter(mod => SHOW_WIP_MODULES || !WIP_MODULE_IDS.includes(mod.id)).map(mod => (
-                <button
-                  key={mod.id}
-                  onClick={() => { setActiveModule(mod.id); setMenuOpen(false); setCurrentView('dashboard'); if (mod.id === 'prelievi') { setPrelievoView('list'); fetchPrelievi(); } }}
-                  className={`w-full flex items-center gap-3 px-4 py-3 rounded-xl text-sm font-bold transition cursor-pointer text-left ${activeModule === mod.id ? 'bg-blue-600 text-white' : 'text-gray-700 hover:bg-gray-100'}`}
-                >
-                  <span className="text-lg">{mod.icon}</span>
-                  {mod.label}
-                </button>
-              ))}
+                { group: 'Magazzino', modules: [
+                  { id: 'arrivi', label: 'Piano Arrivi', icon: '📦' },
+                  { id: 'prelievi', label: 'Prelievi', icon: '📤' },
+                  { id: 'sposta-bancale', label: 'Sposta Bancale', icon: '🏭' },
+                  { id: 'stock', label: 'Inventario Spare Parts', icon: '🗄️' },
+                  { id: 'riepilogo', label: 'Riepilogo Stock', icon: '📊' },
+                ]},
+                { group: 'Repair', modules: [
+                  { id: 'spare-parts', label: 'DB Spare Parts', icon: '🔧' },
+                  { id: 'matrice', label: 'Matrice PNIT × TYPE', icon: '🧮' },
+                  { id: 'anagrafica', label: 'Anagrafica', icon: '📇' },
+                ]},
+                { group: 'Impostazioni', adminOnly: true, modules: [
+                  { id: 'utenti', label: 'Utenti / Ruoli', icon: '👥' },
+                  { id: 'moduli', label: 'Moduli sperimentali', icon: '🧪' },
+                ]},
+              ].filter(g => !g.adminOnly || authUser.ruolo === 'admin').map(({ group, modules }) => {
+                const visible = modules.filter(mod => (SHOW_WIP_MODULES || !isSper(mod.id)) && canRead(mod.id));
+                if (visible.length === 0) return null;
+                return (
+                  <div key={group} className="space-y-1">
+                    <span className="block px-3 text-[10px] font-black text-gray-400 uppercase tracking-widest">{group}</span>
+                    {visible.map(mod => (
+                      <button
+                        key={mod.id}
+                        onClick={() => { setActiveModule(mod.id); setMenuOpen(false); setCurrentView('dashboard'); if (mod.id === 'prelievi') { setPrelievoView('list'); fetchPrelievi(); } if (mod.id === 'utenti') fetchUtenti(); if (mod.id === 'moduli') fetchModuliConfig(); }}
+                        className={`w-full flex items-center gap-3 px-4 py-3 rounded-xl text-sm font-bold transition cursor-pointer text-left ${activeModule === mod.id ? 'bg-blue-600 text-white' : 'text-gray-700 hover:bg-gray-100'}`}
+                      >
+                        <span className="text-lg">{mod.icon}</span>
+                        <span className="flex-grow">{mod.label}</span>
+                        {isSper(mod.id) && (
+                          <span className={`text-[9px] font-black px-1.5 py-0.5 rounded ${activeModule === mod.id ? 'bg-white/25 text-white' : 'bg-amber-100 text-amber-700'}`}>SP</span>
+                        )}
+                      </button>
+                    ))}
+                  </div>
+                );
+              })}
             </nav>
+            <div className="p-4 border-t border-gray-100 space-y-2">
+              <div className="flex items-center gap-2 px-2">
+                <span className="w-8 h-8 rounded-full bg-blue-100 text-blue-700 flex items-center justify-center text-sm font-black">{(authUser.username || '?').charAt(0).toUpperCase()}</span>
+                <div className="leading-tight">
+                  <p className="text-sm font-bold text-gray-800">{authUser.username}</p>
+                  <p className="text-[10px] font-black text-gray-400 uppercase tracking-wider">{authUser.ruolo}</p>
+                </div>
+              </div>
+              <button onClick={() => { handleLogout(); setMenuOpen(false); }}
+                className="w-full text-sm font-bold text-red-600 hover:bg-red-50 border border-red-100 px-4 py-2.5 rounded-xl cursor-pointer transition text-left">
+                ⎋ Esci
+              </button>
+            </div>
           </div>
         </div>
       )}
@@ -1976,14 +2272,22 @@ export default function App() {
               </div>
             </button>
             <img src="/logo.png" alt="Logo" className="h-12 sm:h-16 w-auto object-contain" />
-            <h1 className="text-xl sm:text-2xl font-black tracking-tight text-gray-800 uppercase tracking-widest">
-              {activeModule === 'arrivi' && 'Piano Arrivi'}
-              {activeModule === 'spare-parts' && 'DB Spare Parts'}
-              {activeModule === 'stock' && 'Inventario Spare Parts'}
-              {activeModule === 'riepilogo' && 'Riepilogo Stock'}
-              {activeModule === 'matrice' && 'Matrice PNIT × TYPE'}
-              {activeModule === 'prelievi' && 'Prelievi'}
-              {activeModule === 'anagrafica' && 'Anagrafica'}
+            <h1 className="text-xl sm:text-2xl font-black tracking-tight text-gray-800 uppercase tracking-widest flex items-center gap-2">
+              <span>
+                {activeModule === 'arrivi' && 'Piano Arrivi'}
+                {activeModule === 'spare-parts' && 'DB Spare Parts'}
+                {activeModule === 'stock' && 'Inventario Spare Parts'}
+                {activeModule === 'sposta-bancale' && 'Sposta Bancale'}
+                {activeModule === 'riepilogo' && 'Riepilogo Stock'}
+                {activeModule === 'matrice' && 'Matrice PNIT × TYPE'}
+                {activeModule === 'prelievi' && 'Prelievi'}
+                {activeModule === 'anagrafica' && 'Anagrafica'}
+                {activeModule === 'utenti' && 'Utenti / Ruoli'}
+                {activeModule === 'moduli' && 'Moduli sperimentali'}
+              </span>
+              {isSper(activeModule) && (
+                <span className="text-[10px] font-black bg-amber-100 text-amber-700 px-2 py-0.5 rounded-md tracking-normal" title="Modulo sperimentale">SP</span>
+              )}
             </h1>
           </div>
           {activeModule === 'arrivi' && currentView === 'scan' && (
@@ -1999,6 +2303,12 @@ export default function App() {
         {loading && (
           <div className="text-center py-4 text-xs font-bold text-amber-600 animate-pulse bg-amber-50 border border-amber-100 rounded-xl mb-4">
             Sincronizzazione in corso con il Database Supabase...
+          </div>
+        )}
+
+        {(activeModule === 'no-access' || !canRead(activeModule)) && (
+          <div className="text-center py-20 text-gray-400 text-sm">
+            Il tuo ruolo (<strong>{myRole || '—'}</strong>) non ha accesso a nessun modulo. Contatta un amministratore.
           </div>
         )}
 
@@ -2056,12 +2366,14 @@ export default function App() {
 
               {/* Upload + contatore */}
               <div className="bg-white p-4 rounded-2xl border border-gray-200 shadow-xs flex flex-col sm:flex-row sm:items-center gap-4">
+                {canUpload('spare-parts') && (
                 <div className="relative flex-shrink-0">
                   <button className="bg-blue-600 hover:bg-blue-700 text-white text-sm font-bold px-4 py-2.5 rounded-xl cursor-pointer shadow-xs transition">
                     📥 Importa DB Excel
                   </button>
                   <input type="file" accept=".xls,.xlsx" className="absolute inset-0 w-full h-full opacity-0 cursor-pointer" onChange={handleSparePartsUpload} />
                 </div>
+                )}
                 <div className="flex-grow">
                   <p className="text-xs text-gray-400">Importa il file Excel del DB Spare Parts (Foglio 1). L&apos;import aggiorna i record esistenti per PN + Terminal PN.</p>
                   {importMeta.spare_parts && <p className="text-[11px] text-gray-400">Ultimo aggiornamento: {new Date(importMeta.spare_parts).toLocaleString('it-IT')}</p>}
@@ -2151,10 +2463,12 @@ export default function App() {
                         📥 Esporta XLS ({filtered.length})
                       </button>
                     )}
+                    {canEdit('spare-parts') && (
                     <button onClick={() => { setSpEditMode(v => !v); if (spEditMode) setSpNewRows([]); }}
                       className={`text-[10px] font-bold px-2.5 py-1 rounded-lg border transition cursor-pointer ${spEditMode ? 'bg-amber-500 text-white border-amber-600' : 'bg-gray-50 text-gray-500 hover:bg-gray-100 border-gray-200'}`}>
                       {spEditMode ? '✏️ Modifica ON' : '✏️ Modifica'}
                     </button>
+                    )}
                     {spEditMode && (
                       <button onClick={() => setSpNewRows(prev => [{ tempId: Date.now() + Math.random(), pn: '', terminal_pn: '', pnit: '', english_name: '', descrizione: '', type: '', eol: '', ref: '', rplus: '', to_order: 'SI', price: '' }, ...prev])}
                         className="text-[10px] font-bold text-white bg-green-600 hover:bg-green-700 px-2.5 py-1 rounded-lg transition cursor-pointer">
@@ -2389,12 +2703,14 @@ export default function App() {
 
               {/* Upload + contatore */}
               <div className="bg-white p-4 rounded-2xl border border-gray-200 shadow-xs flex flex-col sm:flex-row sm:items-center gap-4">
+                {canUpload('stock') && (
                 <div className="relative flex-shrink-0">
                   <button className="bg-blue-600 hover:bg-blue-700 text-white text-sm font-bold px-4 py-2.5 rounded-xl cursor-pointer shadow-xs transition">
                     📥 Importa Stock Excel
                   </button>
                   <input type="file" accept=".xls,.xlsx" className="absolute inset-0 w-full h-full opacity-0 cursor-pointer" onChange={handleStockUpload} />
                 </div>
+                )}
                 <div className="flex-grow">
                   <p className="text-xs text-gray-400">Importa il file Excel dello Stock (Foglio 2). Chiave: Codice + Magazzino + Bancale.</p>
                   {importMeta.stock && <p className="text-[11px] text-gray-400">Ultimo aggiornamento: {new Date(importMeta.stock).toLocaleString('it-IT')}</p>}
@@ -2405,53 +2721,6 @@ export default function App() {
                   </span>
                 )}
               </div>
-
-              {/* Sposta bancale */}
-              {stockItems.length > 0 && (
-                <div className="bg-white p-4 rounded-2xl border border-gray-200 shadow-xs">
-                  {!moveBancaleOpen ? (
-                    <button onClick={() => setMoveBancaleOpen(true)}
-                      className="text-sm font-bold text-blue-600 hover:text-blue-800 cursor-pointer flex items-center gap-2">
-                      🏭 Sposta bancale tra magazzini
-                    </button>
-                  ) : (
-                    <div className="flex flex-wrap items-end gap-3">
-                      <div className="space-y-1">
-                        <label className="block text-[10px] font-bold text-gray-500 uppercase">Bancale</label>
-                        <select value={moveBancaleSrc} onChange={e => setMoveBancaleSrc(e.target.value)}
-                          className="bg-gray-50 border border-gray-300 rounded-xl p-2 text-xs focus:outline-hidden">
-                          <option value="">Seleziona bancale...</option>
-                          {[...new Set(stockItems.map(s => s.numero_bancale).filter(Boolean))].sort().map(b => (
-                            <option key={b} value={b}>{b} ({stockItems.filter(s => s.numero_bancale === b)[0]?.magazzino})</option>
-                          ))}
-                        </select>
-                      </div>
-                      <div className="space-y-1">
-                        <label className="block text-[10px] font-bold text-gray-500 uppercase">Magazzino dest.</label>
-                        <select value={moveBancaleDest} onChange={e => setMoveBancaleDest(e.target.value)}
-                          className="bg-gray-50 border border-gray-300 rounded-xl p-2 text-xs focus:outline-hidden">
-                          <option value="GESSATE">GESSATE</option>
-                          <option value="ESPRINET">ESPRINET</option>
-                        </select>
-                      </div>
-                      <div className="space-y-1">
-                        <label className="block text-[10px] font-bold text-gray-500 uppercase">Locazione dest. <span className="text-gray-400 normal-case font-normal">(opz.)</span></label>
-                        <input value={moveBancaleLocazione} onChange={e => setMoveBancaleLocazione(e.target.value)}
-                          placeholder="Es. SCAFFALE-A3"
-                          className="bg-gray-50 border border-gray-300 rounded-xl p-2 text-xs focus:outline-hidden w-full" />
-                      </div>
-                      <button onClick={moveBancale}
-                        className="bg-blue-600 hover:bg-blue-700 text-white text-xs font-bold px-4 py-2 rounded-xl cursor-pointer transition shadow-xs">
-                        ↗ Sposta
-                      </button>
-                      <button onClick={() => { setMoveBancaleOpen(false); setMoveBancaleSrc(''); }}
-                        className="text-xs text-gray-400 hover:text-gray-600 cursor-pointer px-2 py-2">
-                        Annulla
-                      </button>
-                    </div>
-                  )}
-                </div>
-              )}
 
               {/* Filtri */}
               {stockItems.length > 0 && (
@@ -2532,10 +2801,12 @@ export default function App() {
                         📥 Esporta XLS ({filtered.length})
                       </button>
                     )}
+                    {canEdit('stock') && (
                     <button onClick={() => { setStockEditMode(v => !v); if (stockEditMode) setStockNewRows([]); }}
                       className={`text-[10px] font-bold px-2.5 py-1 rounded-lg border transition cursor-pointer ${stockEditMode ? 'bg-amber-500 text-white border-amber-600' : 'bg-gray-50 text-gray-500 hover:bg-gray-100 border-gray-200'}`}>
                       {stockEditMode ? '✏️ Modifica ON' : '✏️ Modifica'}
                     </button>
+                    )}
                     {stockEditMode && (
                       <button onClick={() => setStockNewRows(prev => [{ tempId: Date.now() + Math.random(), locazione: '', numero_bancale: '', magazzino: 'GESSATE', codice: '', stock: '' }, ...prev])}
                         className="text-[10px] font-bold text-white bg-green-600 hover:bg-green-700 px-2.5 py-1 rounded-lg transition cursor-pointer">
@@ -2653,6 +2924,333 @@ export default function App() {
           );
         })()}
 
+        {/* ==================== MODULO SPOSTA BANCALE ==================== */}
+        {activeModule === 'sposta-bancale' && (() => {
+          const bancali = [...new Set(stockItems.map(s => s.numero_bancale).filter(Boolean))].sort();
+          const righeBancale = moveBancaleSrc ? stockItems.filter(s => s.numero_bancale === moveBancaleSrc) : [];
+          const magSrc = righeBancale[0]?.magazzino || '';
+          const pezziBancale = righeBancale.reduce((s, r) => s + (r.stock || 0), 0);
+          return (
+            <div className="space-y-5 max-w-2xl mx-auto">
+              <div>
+                <h2 className="text-lg font-black text-gray-800">🏭 Sposta Bancale</h2>
+                <p className="text-xs text-gray-500">Sposta tutte le righe di un bancale da un magazzino all&apos;altro (opzionale: nuova locazione).</p>
+              </div>
+
+              {stockItems.length === 0 ? (
+                <div className="text-center py-16 text-gray-400 text-sm">Nessuno stock caricato. Importa l&apos;inventario per movimentare i bancali.</div>
+              ) : (
+                <div className="bg-white p-5 rounded-2xl border border-gray-200 shadow-xs space-y-4">
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                    <div className="space-y-1">
+                      <label className="block text-[10px] font-bold text-gray-500 uppercase">Bancale da spostare</label>
+                      <select value={moveBancaleSrc} onChange={e => setMoveBancaleSrc(e.target.value)}
+                        className="w-full bg-gray-50 border border-gray-300 rounded-xl p-2.5 text-xs focus:outline-hidden">
+                        <option value="">Seleziona bancale...</option>
+                        {bancali.map(b => (
+                          <option key={b} value={b}>{b} ({stockItems.filter(s => s.numero_bancale === b)[0]?.magazzino})</option>
+                        ))}
+                      </select>
+                    </div>
+                    <div className="space-y-1">
+                      <label className="block text-[10px] font-bold text-gray-500 uppercase">Magazzino destinazione</label>
+                      <select value={moveBancaleDest} onChange={e => setMoveBancaleDest(e.target.value)}
+                        className="w-full bg-gray-50 border border-gray-300 rounded-xl p-2.5 text-xs focus:outline-hidden">
+                        <option value="GESSATE">GESSATE</option>
+                        <option value="ESPRINET">ESPRINET</option>
+                      </select>
+                    </div>
+                    <div className="space-y-1 sm:col-span-2">
+                      <label className="block text-[10px] font-bold text-gray-500 uppercase">Locazione destinazione <span className="text-gray-400 normal-case font-normal">(opzionale)</span></label>
+                      <input value={moveBancaleLocazione} onChange={e => setMoveBancaleLocazione(e.target.value)}
+                        placeholder="Es. SCAFFALE-A3"
+                        className="w-full bg-gray-50 border border-gray-300 rounded-xl p-2.5 text-xs focus:outline-hidden" />
+                    </div>
+                  </div>
+
+                  {moveBancaleSrc && (
+                    <div className="text-[11px] text-gray-500 bg-gray-50 rounded-xl px-3 py-2 border border-gray-100">
+                      Bancale <strong>{moveBancaleSrc}</strong> · magazzino attuale <strong>{magSrc}</strong> · {righeBancale.length} righe · {pezziBancale} pezzi → destinazione <strong>{moveBancaleDest}</strong>
+                    </div>
+                  )}
+
+                  <div className="flex items-center gap-2">
+                    <button onClick={moveBancale} disabled={!moveBancaleSrc}
+                      className="bg-blue-600 hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed text-white text-sm font-bold px-5 py-2.5 rounded-xl cursor-pointer transition shadow-xs">
+                      ↗ Sposta bancale
+                    </button>
+                    {moveBancaleSrc && (
+                      <button onClick={() => { setMoveBancaleSrc(''); setMoveBancaleLocazione(''); }}
+                        className="text-xs text-gray-400 hover:text-gray-600 cursor-pointer px-2 py-2">Annulla</button>
+                    )}
+                  </div>
+                </div>
+              )}
+            </div>
+          );
+        })()}
+
+        {/* ==================== MODULO UTENTI / RUOLI (admin) ==================== */}
+        {activeModule === 'utenti' && authUser.ruolo === 'admin' && (
+          <div className="space-y-5 max-w-3xl mx-auto">
+            <div className="flex items-center justify-between flex-wrap gap-3">
+              <div>
+                <h2 className="text-lg font-black text-gray-800">👥 Utenti / Ruoli</h2>
+                <p className="text-xs text-gray-500">Crea utenti, reimposta password, attiva/disattiva accessi. Le password sono cifrate lato database.</p>
+              </div>
+              <button onClick={fetchUtenti} className="bg-gray-100 hover:bg-gray-200 text-gray-600 text-sm font-bold px-3 py-2.5 rounded-xl cursor-pointer transition" title="Aggiorna">↻</button>
+            </div>
+
+            {/* Sotto-schede */}
+            <div className="flex gap-1 bg-gray-100 p-1 rounded-xl w-fit">
+              {[{ id: 'utenti', label: 'Utenti', n: utentiList.length }, { id: 'ruoli', label: 'Ruoli', n: ruoliList.length }].map(t => (
+                <button key={t.id} onClick={() => setUtentiTab(t.id)}
+                  className={`text-xs font-bold px-4 py-2 rounded-lg cursor-pointer transition ${utentiTab === t.id ? 'bg-white text-gray-800 shadow-xs' : 'text-gray-500 hover:text-gray-700'}`}>
+                  {t.label} <span className="ml-1 text-[10px] opacity-70">({t.n})</span>
+                </button>
+              ))}
+            </div>
+
+            {utentiTab === 'utenti' && (<>
+            {/* Form crea / aggiorna utente */}
+            <div className="bg-white p-4 rounded-2xl border border-gray-200 shadow-xs space-y-3">
+              <span className="text-[10px] font-black text-gray-400 uppercase tracking-wider block">Crea / aggiorna utente</span>
+              <div className="grid grid-cols-1 sm:grid-cols-4 gap-3 items-end">
+                <div className="space-y-1">
+                  <label className="block text-[10px] font-bold text-gray-500 uppercase">Username</label>
+                  <input value={nuovoUtente.username} onChange={e => setNuovoUtente(v => ({ ...v, username: e.target.value }))}
+                    autoComplete="off" className="w-full bg-gray-50 border border-gray-300 rounded-xl p-2.5 text-xs focus:outline-hidden" />
+                </div>
+                <div className="space-y-1">
+                  <label className="block text-[10px] font-bold text-gray-500 uppercase">Password</label>
+                  <input type="password" value={nuovoUtente.password} onChange={e => setNuovoUtente(v => ({ ...v, password: e.target.value }))}
+                    autoComplete="new-password" className="w-full bg-gray-50 border border-gray-300 rounded-xl p-2.5 text-xs focus:outline-hidden" />
+                </div>
+                <div className="space-y-1">
+                  <label className="block text-[10px] font-bold text-gray-500 uppercase">Ruolo</label>
+                  <select value={nuovoUtente.ruolo} onChange={e => setNuovoUtente(v => ({ ...v, ruolo: e.target.value }))}
+                    className="w-full bg-gray-50 border border-gray-300 rounded-xl p-2.5 text-xs focus:outline-hidden">
+                    {(ruoliList.length ? ruoliList.map(r => r.nome) : ['admin']).map(n => <option key={n} value={n}>{n}</option>)}
+                  </select>
+                </div>
+                <button onClick={salvaUtente} disabled={utentiLoading}
+                  className="bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white text-sm font-bold px-4 py-2.5 rounded-xl cursor-pointer transition shadow-xs">
+                  Salva utente
+                </button>
+              </div>
+              <p className="text-[11px] text-gray-400">Se lo username esiste già, viene aggiornata la password (e il ruolo). I ruoli aggiuntivi e i permessi granulari li configureremo in un secondo momento.</p>
+            </div>
+
+            {/* Elenco utenti */}
+            {utentiLoading && <div className="text-center py-4 text-xs font-bold text-amber-600 animate-pulse">Caricamento...</div>}
+            {!utentiLoading && (
+              <div className="bg-white rounded-2xl border border-gray-200 shadow-xs overflow-x-auto">
+                <table className="w-full min-w-[520px] text-left border-collapse text-xs">
+                  <thead className="bg-gray-50 border-b border-gray-200 text-[10px] font-black text-gray-500 uppercase tracking-wider">
+                    <tr>
+                      <th className="px-3 py-3">Username</th>
+                      <th className="px-3 py-3">Ruolo</th>
+                      <th className="px-3 py-3">Stato</th>
+                      <th className="px-3 py-3">Creato</th>
+                      <th className="px-3 py-3 text-right">Azioni</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-gray-100">
+                    {utentiList.map(u => (
+                      <tr key={u.username} className="hover:bg-gray-50/80">
+                        <td className="px-3 py-2.5 font-bold text-gray-800">{u.username}{u.username === authUser.username && <span className="ml-2 text-[9px] font-black text-blue-600">(tu)</span>}</td>
+                        <td className="px-3 py-2.5 text-gray-600 uppercase">{u.ruolo}</td>
+                        <td className="px-3 py-2.5 space-x-1 whitespace-nowrap">
+                          {u.attivo
+                            ? <span className="text-[9px] font-black text-emerald-700 bg-emerald-50 border border-emerald-100 px-2 py-0.5 rounded">ATTIVO</span>
+                            : <span className="text-[9px] font-black text-gray-500 bg-gray-100 border border-gray-200 px-2 py-0.5 rounded">DISATTIVO</span>}
+                          {u.must_change_pw && <span className="text-[9px] font-black text-amber-700 bg-amber-50 border border-amber-100 px-2 py-0.5 rounded">CAMBIO PW</span>}
+                        </td>
+                        <td className="px-3 py-2.5 text-gray-500">{u.created_at ? new Date(u.created_at).toLocaleDateString('it-IT') : '—'}</td>
+                        <td className="px-3 py-2.5 text-right space-x-2 whitespace-nowrap">
+                          <button onClick={() => toggleMustChange(u)}
+                            className="text-[10px] font-bold text-amber-700 hover:text-amber-900 bg-amber-50 hover:bg-amber-100 border border-amber-100 px-2 py-1 rounded-lg cursor-pointer transition">
+                            {u.must_change_pw ? 'Annulla cambio pw' : 'Richiedi cambio pw'}
+                          </button>
+                          <button onClick={() => toggleUtenteAttivo(u)} disabled={u.username === authUser.username}
+                            className="text-[10px] font-bold text-gray-600 hover:text-gray-900 disabled:opacity-30 disabled:cursor-not-allowed bg-gray-50 hover:bg-gray-100 border border-gray-200 px-2 py-1 rounded-lg cursor-pointer transition">
+                            {u.attivo ? 'Disattiva' : 'Attiva'}
+                          </button>
+                          <button onClick={() => eliminaUtente(u)} disabled={u.username === authUser.username}
+                            className="text-[10px] font-bold text-red-600 hover:text-red-800 disabled:opacity-30 disabled:cursor-not-allowed bg-red-50 hover:bg-red-100 border border-red-100 px-2 py-1 rounded-lg cursor-pointer transition">
+                            Elimina
+                          </button>
+                        </td>
+                      </tr>
+                    ))}
+                    {utentiList.length === 0 && (
+                      <tr><td colSpan={5} className="px-3 py-8 text-center text-gray-400">Nessun utente.</td></tr>
+                    )}
+                  </tbody>
+                </table>
+              </div>
+            )}
+            </>)}
+
+            {utentiTab === 'ruoli' && (<>
+              {/* Form crea ruolo */}
+              <div className="bg-white p-4 rounded-2xl border border-gray-200 shadow-xs space-y-3">
+                <span className="text-[10px] font-black text-gray-400 uppercase tracking-wider block">Crea / aggiorna ruolo</span>
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 items-end">
+                  <div className="space-y-1">
+                    <label className="block text-[10px] font-bold text-gray-500 uppercase">Nome ruolo</label>
+                    <input value={nuovoRuolo.nome} onChange={e => setNuovoRuolo(v => ({ ...v, nome: e.target.value }))}
+                      placeholder="es. operatore" autoComplete="off" className="w-full bg-gray-50 border border-gray-300 rounded-xl p-2.5 text-xs focus:outline-hidden" />
+                  </div>
+                  <div className="space-y-1">
+                    <label className="block text-[10px] font-bold text-gray-500 uppercase">Descrizione <span className="text-gray-400 normal-case font-normal">(opz.)</span></label>
+                    <input value={nuovoRuolo.descrizione} onChange={e => setNuovoRuolo(v => ({ ...v, descrizione: e.target.value }))}
+                      className="w-full bg-gray-50 border border-gray-300 rounded-xl p-2.5 text-xs focus:outline-hidden" />
+                  </div>
+                  <button onClick={salvaRuolo} disabled={utentiLoading}
+                    className="bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white text-sm font-bold px-4 py-2.5 rounded-xl cursor-pointer transition shadow-xs">
+                    Salva ruolo
+                  </button>
+                </div>
+                <p className="text-[11px] text-gray-400">I permessi granulari (visibilità moduli/gruppi, lettura/scrittura) per ogni ruolo li aggiungeremo qui in un secondo momento.</p>
+              </div>
+
+              {/* Elenco ruoli */}
+              <div className="bg-white rounded-2xl border border-gray-200 shadow-xs overflow-x-auto">
+                <table className="w-full min-w-[420px] text-left border-collapse text-xs">
+                  <thead className="bg-gray-50 border-b border-gray-200 text-[10px] font-black text-gray-500 uppercase tracking-wider">
+                    <tr>
+                      <th className="px-3 py-3">Ruolo</th>
+                      <th className="px-3 py-3">Descrizione</th>
+                      <th className="px-3 py-3 text-right">Utenti</th>
+                      <th className="px-3 py-3 text-right">Azioni</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-gray-100">
+                    {ruoliList.map(r => {
+                      const inUso = utentiList.filter(u => (u.ruolo || '').toLowerCase() === r.nome.toLowerCase()).length;
+                      return (
+                        <tr key={r.nome} className="hover:bg-gray-50/80">
+                          <td className="px-3 py-2.5 font-bold text-gray-800 uppercase">{r.nome}</td>
+                          <td className="px-3 py-2.5 text-gray-600">{r.descrizione || '—'}</td>
+                          <td className="px-3 py-2.5 text-right font-mono text-gray-500">{inUso}</td>
+                          <td className="px-3 py-2.5 text-right">
+                            <button onClick={() => eliminaRuolo(r.nome)} disabled={r.nome.toLowerCase() === 'admin'}
+                              className="text-[10px] font-bold text-red-600 hover:text-red-800 disabled:opacity-30 disabled:cursor-not-allowed bg-red-50 hover:bg-red-100 border border-red-100 px-2 py-1 rounded-lg cursor-pointer transition">
+                              Elimina
+                            </button>
+                          </td>
+                        </tr>
+                      );
+                    })}
+                    {ruoliList.length === 0 && (
+                      <tr><td colSpan={4} className="px-3 py-8 text-center text-gray-400">Nessun ruolo.</td></tr>
+                    )}
+                  </tbody>
+                </table>
+              </div>
+
+              {/* Configurazione permessi per ruolo */}
+              <div className="bg-white p-4 rounded-2xl border border-gray-200 shadow-xs space-y-3">
+                <span className="text-[10px] font-black text-gray-400 uppercase tracking-wider block">Permessi per ruolo</span>
+                <div className="flex items-center gap-2 flex-wrap">
+                  <label className="text-xs font-bold text-gray-600">Ruolo:</label>
+                  <select value={permRuoloSel} onChange={e => setPermRuoloSel(e.target.value)}
+                    className="bg-gray-50 border border-gray-300 rounded-xl p-2 text-xs focus:outline-hidden">
+                    <option value="">Seleziona ruolo...</option>
+                    {ruoliList.filter(r => r.nome.toLowerCase() !== 'admin').map(r => <option key={r.nome} value={r.nome}>{r.nome}</option>)}
+                  </select>
+                  <span className="text-[11px] text-gray-400">Il ruolo <strong>admin</strong> ha sempre accesso completo.</span>
+                </div>
+
+                {permRuoloSel && (() => {
+                  const rp = permessi[permRuoloSel.toLowerCase()] || {};
+                  const has = (k) => (rp[k] || 'none') !== 'none';
+                  const toggle = (k, checked) => setPermesso(permRuoloSel.toLowerCase(), k, checked ? 'visible' : 'none');
+                  return (
+                  <div className="space-y-3">
+                    <div className="border border-gray-100 rounded-xl overflow-hidden">
+                      <table className="w-full text-xs border-collapse">
+                        <thead className="bg-gray-50 text-[10px] font-black text-gray-500 uppercase tracking-wider">
+                          <tr>
+                            <th className="px-3 py-2 text-left">Gruppo</th>
+                            <th className="px-3 py-2 text-left">Modulo</th>
+                            <th className="px-3 py-2 text-center">Visibile</th>
+                            <th className="px-3 py-2 text-center">Carica Excel/CSV</th>
+                            <th className="px-3 py-2 text-center">Modifica</th>
+                          </tr>
+                        </thead>
+                        <tbody className="divide-y divide-gray-100">
+                          {APP_MODULES.map(m => {
+                            const vis = has(m.id);
+                            return (
+                              <tr key={m.id} className="hover:bg-gray-50/60">
+                                <td className="px-3 py-2 text-gray-400">{m.group}</td>
+                                <td className="px-3 py-2 font-bold text-gray-700">{m.label}{isSper(m.id) && <span className="ml-1 text-[9px] font-black text-amber-600">SP</span>}</td>
+                                <td className="px-3 py-2 text-center">
+                                  <input type="checkbox" checked={vis} onChange={e => toggle(m.id, e.target.checked)} className="w-4 h-4 accent-blue-600 cursor-pointer" />
+                                </td>
+                                <td className="px-3 py-2 text-center">
+                                  {m.upload
+                                    ? <input type="checkbox" checked={has(`${m.id}:upload`)} disabled={!vis} onChange={e => toggle(`${m.id}:upload`, e.target.checked)} className="w-4 h-4 accent-blue-600 cursor-pointer disabled:opacity-30" />
+                                    : <span className="text-gray-300">—</span>}
+                                </td>
+                                <td className="px-3 py-2 text-center">
+                                  {m.edit
+                                    ? <input type="checkbox" checked={has(`${m.id}:edit`)} disabled={!vis} onChange={e => toggle(`${m.id}:edit`, e.target.checked)} className="w-4 h-4 accent-blue-600 cursor-pointer disabled:opacity-30" />
+                                    : <span className="text-gray-300">—</span>}
+                                </td>
+                              </tr>
+                            );
+                          })}
+                        </tbody>
+                      </table>
+                    </div>
+                    <p className="text-[11px] text-gray-400">Se un modulo è <strong>Visibile</strong>, il ruolo può usarne tutte le funzioni. <strong>Carica</strong> e <strong>Modifica</strong> sono eccezioni per modulo: se disattivate, quei controlli vengono nascosti (i moduli senza queste funzioni mostrano «—»).</p>
+                  </div>
+                  );
+                })()}
+              </div>
+            </>)}
+          </div>
+        )}
+
+        {/* ==================== MODULO MODULI SPERIMENTALI (admin) ==================== */}
+        {activeModule === 'moduli' && isAdmin && (
+          <div className="space-y-5 max-w-2xl mx-auto">
+            <div className="flex items-center justify-between flex-wrap gap-3">
+              <div>
+                <h2 className="text-lg font-black text-gray-800">🧪 Moduli sperimentali</h2>
+                <p className="text-xs text-gray-500">Marca i moduli come sperimentali (SP). I moduli SP sono nascosti in produzione e visibili solo in sviluppo locale.</p>
+              </div>
+              <button onClick={fetchModuliConfig} className="bg-gray-100 hover:bg-gray-200 text-gray-600 text-sm font-bold px-3 py-2.5 rounded-xl cursor-pointer transition" title="Aggiorna">↻</button>
+            </div>
+            <div className="bg-white rounded-2xl border border-gray-200 shadow-xs overflow-x-auto">
+              <table className="w-full min-w-[420px] text-left border-collapse text-xs">
+                <thead className="bg-gray-50 border-b border-gray-200 text-[10px] font-black text-gray-500 uppercase tracking-wider">
+                  <tr>
+                    <th className="px-3 py-3">Gruppo</th>
+                    <th className="px-3 py-3">Modulo</th>
+                    <th className="px-3 py-3 text-center">Sperimentale (SP)</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-gray-100">
+                  {APP_MODULES.map(m => (
+                    <tr key={m.id} className="hover:bg-gray-50/60">
+                      <td className="px-3 py-2.5 text-gray-400">{m.group}</td>
+                      <td className="px-3 py-2.5 font-bold text-gray-700">{m.label}{isSper(m.id) && <span className="ml-1 text-[9px] font-black text-amber-600">SP</span>}</td>
+                      <td className="px-3 py-2.5 text-center">
+                        <input type="checkbox" checked={isSper(m.id)} onChange={e => setModuloSper(m.id, e.target.checked)} className="w-4 h-4 accent-amber-500 cursor-pointer" />
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+            <p className="text-[11px] text-gray-400">Nota: in ambiente di sviluppo locale i moduli SP restano comunque visibili (per poterli testare); in produzione vengono nascosti.</p>
+          </div>
+        )}
+
         {/* ==================== MODULO RIEPILOGO STOCK ==================== */}
         {activeModule === 'riepilogo' && (() => {
           // Stock totale per codice
@@ -2664,6 +3262,7 @@ export default function App() {
           poLines.forEach(l => {
             const cod = String(l.item_code || '').trim();
             if (!cod || cod === 'N/D') return;
+            if (cod.toUpperCase().startsWith('BULK')) return; // codice BULK non considerato
             arrivoByCodice[cod] = (arrivoByCodice[cod] || 0) + (l.qty_expected || 0);
           });
 
@@ -2907,6 +3506,7 @@ export default function App() {
           poLines.forEach(l => {
             const cod = String(l.item_code || '').trim();
             if (!cod || cod === 'N/D') return;
+            if (cod.toUpperCase().startsWith('BULK')) return; // codice BULK non considerato
             arrivoByCodice[cod] = (arrivoByCodice[cod] || 0) + (l.qty_expected || 0);
           });
 
@@ -3003,6 +3603,7 @@ export default function App() {
 
               {/* Upload file quantità in ordine */}
               <div className="bg-white p-3 rounded-2xl border border-gray-200 shadow-xs flex items-center justify-between flex-wrap gap-2">
+                {canUpload('matrice') && (<>
                 <label className="bg-emerald-50 hover:bg-emerald-100 text-emerald-700 border border-emerald-200 text-xs font-bold px-3 py-2 rounded-xl cursor-pointer transition relative">
                   📥 Aggiorna quantità in ordine (CSV)
                   <input type="file" accept=".csv,.xls,.xlsx" className="absolute inset-0 w-full h-full opacity-0 cursor-pointer" onChange={handleOrdiniUpload} />
@@ -3011,6 +3612,7 @@ export default function App() {
                   📥 Aggiorna consumi / NoMaterial
                   <input type="file" accept=".csv,.xls,.xlsx" className="absolute inset-0 w-full h-full opacity-0 cursor-pointer" onChange={handleConsumiUpload} />
                 </label>
+                </>)}
                 <span className="text-[11px] text-gray-400">In arrivo dal Piano Arrivi</span>
                 {(ordiniLoading || consumiLoading) && <span className="text-[11px] font-bold text-amber-600 animate-pulse">Caricamento...</span>}
                 {importMeta.ordini && <span className="text-[11px] text-gray-400">In ordine: {new Date(importMeta.ordini).toLocaleString('it-IT')}</span>}
@@ -3097,10 +3699,12 @@ export default function App() {
               </div>
               <div className="flex gap-2 flex-wrap">
                 <button onClick={fetchAnagrafica} className="bg-gray-100 hover:bg-gray-200 text-gray-600 text-sm font-bold px-3 py-2.5 rounded-xl cursor-pointer transition" title="Aggiorna">↻</button>
+                {canUpload('anagrafica') && (
                 <label className="bg-blue-600 hover:bg-blue-700 text-white text-sm font-bold px-4 py-2.5 rounded-xl cursor-pointer transition shadow-xs relative">
                   📥 Importa file
                   <input type="file" accept=".csv,.xls,.xlsx" className="absolute inset-0 w-full h-full opacity-0 cursor-pointer" onChange={handleAnagraficaUpload} />
                 </label>
+                )}
               </div>
             </div>
 
@@ -3474,6 +4078,7 @@ export default function App() {
           <div className="space-y-6">
 
             {/* Box Caricamento File */}
+            {canUpload('arrivi') && (
             <div className={`bg-white p-4 sm:p-5 rounded-2xl border border-gray-200 shadow-xs ${poLines.length === 0 ? 'max-w-xl mx-auto my-8 text-center space-y-4' : ''}`}>
               {poLines.length === 0 && (
                 <div className="space-y-1">
@@ -3495,6 +4100,7 @@ export default function App() {
               </div>
               {importMeta.po_lines && <p className="text-[11px] text-gray-400 mt-2 text-center sm:text-left">Ultimo aggiornamento piano arrivi: {new Date(importMeta.po_lines).toLocaleString('it-IT')}</p>}
             </div>
+            )}
 
             {poLines.length > 0 && (
               <>
