@@ -4304,7 +4304,7 @@ export default function App() {
                             📄 Arrivo del: {group.lines[0]?.arrival_date || '—'} — {group.invoice}
                           </span>
                         </div>
-                        {!group.snRequired && (
+                        {!group.snRequired && !group.lines.every(l => l.is_user_confirmed) && (
                           <button
                             onClick={async () => {
                               setArrivoQtyInvoice(group.invoice);
@@ -4518,14 +4518,13 @@ export default function App() {
             <div className="bg-white p-4 rounded-2xl border border-gray-200 shadow-xs space-y-3">
               {/* Bancale in lavorazione */}
               {arrivoQtyBancale.trim() ? (
-                <div className="flex items-center justify-between bg-blue-50 border border-blue-200 rounded-xl px-4 py-3 gap-3">
+                <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between bg-blue-50 border border-blue-200 rounded-xl px-4 py-3 gap-3">
                   <div className="min-w-0">
-                    <span className="text-[9px] font-black text-blue-400 uppercase tracking-wider block">Bancale in lavorazione</span>
-                    <span className="text-lg sm:text-xl font-black text-blue-800 font-mono truncate block">📦 {arrivoQtyBancale}</span>
-                    <span className="text-[10px] font-bold text-blue-400 uppercase">{arrivoQtyMagazzino}</span>
+                    <span className="text-[9px] font-black text-blue-400 uppercase tracking-wider block">Bancale in lavorazione · <span className="text-blue-500">{arrivoQtyMagazzino}</span></span>
+                    <span className="text-lg sm:text-xl font-black text-blue-800 font-mono break-all block">📦 {arrivoQtyBancale}</span>
                   </div>
                   <button onClick={() => setArrivoBancaleForm({ open: true, nome: '', magazzino: arrivoQtyMagazzino })}
-                    className="shrink-0 bg-blue-600 hover:bg-blue-700 text-white text-xs font-bold px-3 py-2 rounded-xl cursor-pointer transition shadow-xs whitespace-nowrap">+ Nuovo bancale</button>
+                    className="w-full sm:w-auto shrink-0 bg-blue-600 hover:bg-blue-700 text-white text-xs font-bold px-3 py-2 rounded-xl cursor-pointer transition shadow-xs whitespace-nowrap">+ Nuovo bancale</button>
                 </div>
               ) : (
                 <button onClick={() => setArrivoBancaleForm({ open: true, nome: '', magazzino: arrivoQtyMagazzino || 'GESSATE' })}
