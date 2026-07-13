@@ -344,7 +344,10 @@ export default function App() {
   const [matriceSort, setMatriceSort] = useState({ col: 'pnit', dir: 'asc' });
   const [consumi, setConsumi] = useState({}); // id (pnit+type) -> { media, nomaterial }
   const [consumiLoading, setConsumiLoading] = useState(false);
-  const [mesiCopertura, setMesiCopertura] = useState(3);
+  const [mesiCopertura, setMesiCopertura] = useState(8);
+  const [refurb, setRefurb] = useState({}); // pnit -> quantita da refurbishare
+  const [refurbLoading, setRefurbLoading] = useState(false);
+  const [refurbPerc, setRefurbPerc] = useState(50); // % di refurbishing
   const [matriceSoloStima, setMatriceSoloStima] = useState(false);
   const [matriceSoloDaOrdinare, setMatriceSoloDaOrdinare] = useState(false);
 
@@ -358,6 +361,7 @@ export default function App() {
     fetchAnagrafica();
     fetchOrdini();
     fetchConsumi();
+    fetchRefurb();
     fetchImportMeta();
     // eslint-disable-next-line react-hooks/set-state-in-effect
     fetchPermessi();
@@ -395,6 +399,41 @@ export default function App() {
     return all;
   }
 
+  // Distribuisce un totale ricevuto sulle righe ordinate: riempie ciascuna fino alla sua
+  // quantità attesa, l'eccedenza scala sulla successiva; l'ultima assorbe l'over-receipt.
+  function distribuisciCarico(orderedLines, total) {
+    let remaining = total;
+    return orderedLines.map((l, idx) => {
+      if (idx === orderedLines.length - 1) { const a = remaining; remaining = 0; return a; }
+      const cap = Math.max(0, l.qty_expected || 0);
+      const a = Math.min(remaining, cap);
+      remaining -= a;
+      return a;
+    });
+  }
+  const orderByLineId = (a, b) => (parseInt(a.line_id) || 0) - (parseInt(b.line_id) || 0);
+
+  // Ricalcola qty_loaded per le righe NON serializzate, distribuendo per (invoice, codice)
+  // il totale ricevuto su tutte le righe che condividono lo stesso codice.
+  function applyQtyLoaded(lines, receivedByInvCode) {
+    const groups = {};
+    lines.forEach(l => {
+      if (l.sn_required) return;
+      const ic = (l.item_code || '').trim();
+      const pnr = (l.part_number || '').trim();
+      let key = null;
+      if (ic && receivedByInvCode[`${l.china_invoice}__${ic}`] !== undefined) key = `${l.china_invoice}__${ic}`;
+      else if (pnr && receivedByInvCode[`${l.china_invoice}__${pnr}`] !== undefined) key = `${l.china_invoice}__${pnr}`;
+      if (key) (groups[key] = groups[key] || []).push(l);
+    });
+    const byKey = {};
+    Object.entries(groups).forEach(([key, grp]) => {
+      const ordered = [...grp].sort(orderByLineId);
+      distribuisciCarico(ordered, receivedByInvCode[key] || 0).forEach((a, i) => { byKey[ordered[i].unique_key] = a; });
+    });
+    return lines.map(l => l.sn_required ? l : { ...l, qty_loaded: byKey[l.unique_key] || 0 });
+  }
+
   async function fetchPOLines() {
     setLoading(true);
     const [{ data, error }, scannedKeys, cartonData] = await Promise.all([
@@ -410,24 +449,16 @@ export default function App() {
       (scannedKeys || []).forEach(r => {
         countMap[r.po_line_key] = (countMap[r.po_line_key] || 0) + 1;
       });
-      // Mappa quantità caricate: usa po_line_key se presente, altrimenti fallback su invoice+codice
-      const cartonMap = {};
-      const cartonByCode = {};
+      // Totale ricevuto per (invoice, codice): la ripartizione sulle singole righe è derivata
+      const receivedByInvCode = {};
       (cartonData || []).forEach(r => {
-        if (r.po_line_key) {
-          cartonMap[r.po_line_key] = (cartonMap[r.po_line_key] || 0) + (r.quantita || 0);
-        } else if (r.invoice && r.codice) {
+        if (r.invoice && r.codice) {
           const k = `${r.invoice}__${r.codice}`;
-          cartonByCode[k] = (cartonByCode[k] || 0) + (r.quantita || 0);
+          receivedByInvCode[k] = (receivedByInvCode[k] || 0) + (r.quantita || 0);
         }
       });
-      setPoLines((data || []).map(l => ({
-        ...l,
-        scanned_count: countMap[l.unique_key] || 0,
-        qty_loaded: (cartonMap[l.unique_key] || 0) +
-          (cartonByCode[`${l.china_invoice}__${l.item_code}`] || 0) +
-          (cartonByCode[`${l.china_invoice}__${l.part_number}`] || 0)
-      })));
+      const withCounts = (data || []).map(l => ({ ...l, scanned_count: countMap[l.unique_key] || 0 }));
+      setPoLines(applyQtyLoaded(withCounts, receivedByInvCode));
     }
     setLoading(false);
   }
@@ -941,6 +972,80 @@ export default function App() {
     reader.readAsArrayBuffer(file);
   }
 
+  // ===== Quantità da refurbishare per terminale (refurb_qty), chiave PNIT =====
+  async function fetchRefurb() {
+    const pageSize = 1000;
+    let all = [];
+    let from = 0;
+    while (true) {
+      const { data, error } = await supabase.from('refurb_qty').select('*').order('pnit', { ascending: true }).range(from, from + pageSize - 1);
+      if (error) break;
+      all = [...all, ...(data || [])];
+      if (!data || data.length < pageSize) break;
+      from += pageSize;
+    }
+    const map = {};
+    all.forEach(r => { map[r.pnit] = r.quantita || 0; });
+    setRefurb(map);
+  }
+
+  async function handleRefurbUpload(event) {
+    const file = event.target.files[0];
+    if (!file) return;
+    event.target.value = '';
+    setRefurbLoading(true);
+
+    const reader = new FileReader();
+    reader.onload = async function(e) {
+      let rows;
+      try {
+        const wb = XLSX.read(e.target.result, { type: 'array' });
+        const ws = wb.Sheets[wb.SheetNames[0]];
+        rows = XLSX.utils.sheet_to_json(ws, { defval: '', blankrows: false, raw: false });
+      } catch {
+        alert("Errore: impossibile leggere il file.");
+        setRefurbLoading(false);
+        return;
+      }
+      if (rows.length === 0) { alert("File vuoto."); setRefurbLoading(false); return; }
+
+      const norm = s => String(s).toLowerCase().replace(/[^a-z0-9]/g, '');
+      const cols = Object.keys(rows[0]);
+      const colFor = (...cands) => cols.find(k => cands.includes(norm(k)));
+      const cPn = colFor('partnumber', 'pnit', 'pn');
+      const cQty = colFor('conteggiodiserialnumber', 'quantita', 'quantity', 'conteggio', 'qty');
+      if (!cPn || !cQty) {
+        alert("Colonne mancanti: servono 'Part Number' e 'Conteggio di Serial Number'.");
+        setRefurbLoading(false);
+        return;
+      }
+      const toNum = v => parseFloat(String(v || '').replace(/[^0-9.-]/g, '')) || 0;
+
+      const agg = new Map();
+      rows.forEach(r => {
+        const pnit = String(r[cPn] || '').trim();
+        if (!pnit) return;
+        agg.set(pnit, (agg.get(pnit) || 0) + toNum(r[cQty]));
+      });
+      const nowIso = new Date().toISOString();
+      const toInsert = [...agg.entries()].map(([pnit, q]) => ({ pnit, quantita: Math.round(q), updated_at: nowIso }));
+      if (toInsert.length === 0) { alert("Nessuna riga valida."); setRefurbLoading(false); return; }
+
+      // Snapshot completo
+      const { error: delErr } = await supabase.from('refurb_qty').delete().gte('pnit', '');
+      if (delErr) { alert("Errore svuotamento: " + delErr.message); setRefurbLoading(false); return; }
+      let insErr = null;
+      for (let i = 0; i < toInsert.length; i += 500) {
+        const { error } = await supabase.from('refurb_qty').insert(toInsert.slice(i, i + 500));
+        if (error) { insErr = error; break; }
+      }
+      if (insErr) { alert("Errore salvataggio: " + insErr.message); }
+      else { await fetchRefurb(); await recordImportMeta('refurb'); alert(`${toInsert.length} terminali da refurbishare caricati.`); }
+      setRefurbLoading(false);
+    };
+    reader.readAsArrayBuffer(file);
+  }
+
 
   function setStockFieldChange(id, field, value) {
     setStockPendingChanges(prev => ({
@@ -1018,9 +1123,16 @@ export default function App() {
       if (i >= 0) { const copy = [...prev]; copy[i] = { ...copy[i], quantita: copy[i].quantita + qty, rilievi: (copy[i].rilievi || 1) + 1 }; return copy; }
       return [{ codice, quantita: qty, bancale, magazzino: mag, rilievi: 1 }, ...prev];
     });
-    if (matchedLine) {
-      setPoLines(prev => prev.map(l => l.unique_key === matchedLine.unique_key ? { ...l, qty_loaded: (l.qty_loaded || 0) + qty } : l));
-    }
+    // Ridistribuisce il nuovo totale del codice sulle righe che lo condividono (split per riga)
+    setPoLines(prev => {
+      const grp = prev.filter(l => !l.sn_required && l.china_invoice === arrivoQtyInvoice && ((l.item_code || '') === codice || (l.part_number || '') === codice));
+      if (grp.length === 0) return prev;
+      const ordered = [...grp].sort(orderByLineId);
+      const newTotal = ordered.reduce((s, l) => s + (l.qty_loaded || 0), 0) + qty;
+      const byKey = {};
+      distribuisciCarico(ordered, newTotal).forEach((a, i) => { byKey[ordered[i].unique_key] = a; });
+      return prev.map(l => byKey[l.unique_key] !== undefined ? { ...l, qty_loaded: byKey[l.unique_key] } : l);
+    });
     return true;
   }
 
@@ -3531,13 +3643,16 @@ export default function App() {
             const pn = (p.pn || '').trim();
             if (!pn) return;
             const key = `${pnit}||${type}`;
-            if (!comboMap[key]) comboMap[key] = { pnit, type, codici: new Set(), orderable: new Set() };
+            if (!comboMap[key]) comboMap[key] = { pnit, type, codici: new Set(), orderable: new Set(), rplus: false };
             comboMap[key].codici.add(pn);
             // ordinabile = non locked (esclude EOL/CLI, TO ORDER=NO, TYPE=NO)
             if ((p.locked || '').trim().toUpperCase() !== 'Y') comboMap[key].orderable.add(pn);
+            // R+ : referenza da acquistare per il refurbishing
+            if ((p.rplus || '').trim().toUpperCase() === 'X') comboMap[key].rplus = true;
           });
 
           const mesi = parseFloat(mesiCopertura) || 0;
+          const perc = (parseFloat(refurbPerc) || 0) / 100;
           let combos = Object.values(comboMap).map(c => {
             const codici = [...c.codici];
             // Codice da ordinare: il più idoneo (ordinabile); se più d'uno equivalente, il primo per codice
@@ -3550,7 +3665,9 @@ export default function App() {
             const cons = consumi[`${c.pnit}${c.type}`] || { media: 0, nomaterial: 0 };
             const media = cons.media || 0;
             const nomaterial = cons.nomaterial || 0;
-            const stima = Math.round(media * mesi + nomaterial);
+            // Refurb: se la referenza è R+, servono (terminali da refurbishare del PNIT) × % refurbishing
+            const refurbQty = c.rplus ? Math.round((refurb[c.pnit] || 0) * perc) : 0;
+            const stima = Math.round(media * mesi + nomaterial + refurbQty);
             // Se il codice da ordinare è locked, la quantità da ordinare è 0
             const locked = !!lockedByPn[codiceOrdine];
             const fabbisogno = stima - stock - inOrdine;
@@ -3558,7 +3675,7 @@ export default function App() {
             const daOrdinare = (locked || fabbisogno <= 0) ? 0 : Math.ceil(fabbisogno / 100) * 100;
             const prezzo = priceByPn[codiceOrdine] || 0;
             const ptot = daOrdinare > 0 ? prezzo * daOrdinare : 0;
-            return { pnit: c.pnit, type: c.type, nCodici: codici.length, codiceOrdine, nOrderable, locked, media, nomaterial, stock, inArrivo, inOrdine, stima, daOrdinare, prezzo, ptot };
+            return { pnit: c.pnit, type: c.type, nCodici: codici.length, codiceOrdine, nOrderable, locked, media, nomaterial, refurbQty, stock, inArrivo, inOrdine, stima, daOrdinare, prezzo, ptot };
           });
 
           const q = matriceSearch.trim().toLowerCase();
@@ -3587,6 +3704,22 @@ export default function App() {
                   <p className="text-xs text-gray-500">Tutte le combinazioni PNIT + TYPE del DB spare parts, con stock, in arrivo (Piano Arrivi) e in ordine.</p>
                 </div>
                 <div className="flex items-center gap-3 flex-wrap">
+                  <button onClick={() => {
+                    const rows = combos.map(c => ({
+                      'PNIT': c.pnit, 'TYPE': c.type, 'Codice da ordinare': c.codiceOrdine,
+                      'N. Codici': c.nCodici, 'Cons. medio/mese': c.media, 'NoMaterial': c.nomaterial,
+                      'Refurb': c.refurbQty, 'Stima necessaria': c.stima, 'Stock': c.stock,
+                      'In arrivo': c.inArrivo, 'In ordine': c.inOrdine, 'Da ordinare': c.daOrdinare,
+                      'Locked': c.locked ? 'SI' : '', 'Prezzo unit.': c.prezzo, 'P.tot': c.ptot,
+                    }));
+                    const ws = XLSX.utils.json_to_sheet(rows);
+                    const wb = XLSX.utils.book_new();
+                    XLSX.utils.book_append_sheet(wb, ws, 'Matrice');
+                    XLSX.writeFile(wb, `matrice_${new Date().toISOString().slice(0, 10)}.xlsx`);
+                  }}
+                    className="bg-green-50 hover:bg-green-100 text-green-700 border border-green-200 text-xs font-bold px-3 py-2.5 rounded-xl cursor-pointer transition">
+                    📊 Esporta Excel
+                  </button>
                   <input value={matriceSearch} onChange={e => setMatriceSearch(e.target.value)}
                     placeholder="Cerca per PNIT o TYPE..."
                     className="min-w-[220px] bg-gray-50 border border-gray-300 rounded-xl p-2.5 text-xs focus:outline-hidden" />
@@ -3612,20 +3745,29 @@ export default function App() {
                   📥 Aggiorna consumi / NoMaterial
                   <input type="file" accept=".csv,.xls,.xlsx" className="absolute inset-0 w-full h-full opacity-0 cursor-pointer" onChange={handleConsumiUpload} />
                 </label>
+                <label className="bg-orange-50 hover:bg-orange-100 text-orange-700 border border-orange-200 text-xs font-bold px-3 py-2 rounded-xl cursor-pointer transition relative">
+                  📥 Aggiorna refurbishing (CSV)
+                  <input type="file" accept=".csv,.xls,.xlsx" className="absolute inset-0 w-full h-full opacity-0 cursor-pointer" onChange={handleRefurbUpload} />
+                </label>
                 </>)}
                 <span className="text-[11px] text-gray-400">In arrivo dal Piano Arrivi</span>
-                {(ordiniLoading || consumiLoading) && <span className="text-[11px] font-bold text-amber-600 animate-pulse">Caricamento...</span>}
+                {(ordiniLoading || consumiLoading || refurbLoading) && <span className="text-[11px] font-bold text-amber-600 animate-pulse">Caricamento...</span>}
                 {importMeta.ordini && <span className="text-[11px] text-gray-400">In ordine: {new Date(importMeta.ordini).toLocaleString('it-IT')}</span>}
                 {importMeta.consumi && <span className="text-[11px] text-gray-400">Consumi: {new Date(importMeta.consumi).toLocaleString('it-IT')}</span>}
+                {importMeta.refurb && <span className="text-[11px] text-gray-400">Refurb: {new Date(importMeta.refurb).toLocaleString('it-IT')}</span>}
               </div>
 
               <div className="flex items-center justify-between text-[11px] text-gray-500 flex-wrap gap-2">
-                <div className="flex items-center gap-2">
+                <div className="flex items-center gap-2 flex-wrap">
                   <span className="font-semibold text-gray-600">Mesi copertura:</span>
                   <input type="number" min="0" step="1" value={mesiCopertura}
                     onChange={e => setMesiCopertura(e.target.value)}
-                    className="w-20 bg-gray-50 border border-gray-300 rounded-lg p-1.5 text-xs text-right focus:outline-hidden" />
-                  <span className="text-gray-400">· Stima = consumo medio × mesi + NoMaterial</span>
+                    className="w-16 bg-gray-50 border border-gray-300 rounded-lg p-1.5 text-xs text-right focus:outline-hidden" />
+                  <span className="font-semibold text-gray-600">% refurbishing:</span>
+                  <input type="number" min="0" step="1" value={refurbPerc}
+                    onChange={e => setRefurbPerc(e.target.value)}
+                    className="w-16 bg-gray-50 border border-gray-300 rounded-lg p-1.5 text-xs text-right focus:outline-hidden" />
+                  <span className="text-gray-400">· Stima = consumo × mesi + NoMaterial + Refurb</span>
                   <span>· {combos.length} combinazioni</span>
                 </div>
                 <span className="font-black text-blue-600">Stock: {tot.stock} · <span className="text-emerald-600">In arrivo: {tot.inArrivo}</span> · <span className="text-amber-600">In ordine: {tot.inOrdine}</span> · <span className="text-gray-800">Valore d&apos;acquisto: {fmtEuro(tot.ptot)} $</span></span>
@@ -3633,7 +3775,7 @@ export default function App() {
 
               {combos.length > 0 ? (
                 <div className="bg-white rounded-2xl border border-gray-200 shadow-xs overflow-x-auto">
-                  <table className="w-full min-w-[1300px] text-left border-collapse text-xs">
+                  <table className="w-full min-w-[1400px] text-left border-collapse text-xs">
                     <thead className="bg-gray-50 border-b border-gray-200 text-[10px] font-black text-gray-500 uppercase tracking-wider">
                       <tr>
                         <th className="px-3 py-3 cursor-pointer select-none whitespace-nowrap hover:bg-gray-100 transition" onClick={() => toggleSort('pnit')}>PNIT{arrow('pnit')}</th>
@@ -3642,6 +3784,7 @@ export default function App() {
                         <th className="px-3 py-3 text-right cursor-pointer select-none whitespace-nowrap hover:bg-gray-100 transition" onClick={() => toggleSort('nCodici')}>N. Codici{arrow('nCodici')}</th>
                         <th className="px-3 py-3 text-right text-purple-600 cursor-pointer select-none whitespace-nowrap hover:bg-gray-100 transition" onClick={() => toggleSort('media')}>Cons. medio/mese{arrow('media')}</th>
                         <th className="px-3 py-3 text-right text-rose-600 cursor-pointer select-none whitespace-nowrap hover:bg-gray-100 transition" onClick={() => toggleSort('nomaterial')}>NoMaterial{arrow('nomaterial')}</th>
+                        <th className="px-3 py-3 text-right text-orange-600 cursor-pointer select-none whitespace-nowrap hover:bg-gray-100 transition" onClick={() => toggleSort('refurbQty')}>Refurb{arrow('refurbQty')}</th>
                         <th className="px-3 py-3 text-right text-blue-700 cursor-pointer select-none whitespace-nowrap hover:bg-gray-100 transition" onClick={() => toggleSort('stima')}>Stima necessaria{arrow('stima')}</th>
                         <th className="px-3 py-3 text-right cursor-pointer select-none whitespace-nowrap hover:bg-gray-100 transition" onClick={() => toggleSort('stock')}>Stock{arrow('stock')}</th>
                         <th className="px-3 py-3 text-right text-emerald-600 cursor-pointer select-none whitespace-nowrap hover:bg-gray-100 transition" onClick={() => toggleSort('inArrivo')}>In arrivo{arrow('inArrivo')}</th>
@@ -3661,6 +3804,7 @@ export default function App() {
                           <td className="px-3 py-2.5 text-right font-mono text-gray-500">{c.nCodici}</td>
                           <td className="px-3 py-2.5 text-right font-mono text-purple-600">{c.media ? c.media.toFixed(1) : ''}</td>
                           <td className="px-3 py-2.5 text-right font-mono text-rose-600">{c.nomaterial || ''}</td>
+                          <td className="px-3 py-2.5 text-right font-mono text-orange-600">{c.refurbQty || ''}</td>
                           <td className="px-3 py-2.5 text-right font-mono font-black text-blue-800">{c.stima || ''}</td>
                           <td className="px-3 py-2.5 text-right font-mono font-black text-blue-700">{c.stock}</td>
                           <td className="px-3 py-2.5 text-right font-mono font-black text-emerald-600">{c.inArrivo || ''}</td>
@@ -4180,11 +4324,25 @@ export default function App() {
                                   else agg.set(key, { codice: c.codice, quantita: c.quantita || 0, bancale: c.bancale, magazzino: c.magazzino, rilievi: c.rilievi || 1 });
                                 });
                                 setArrivoQtyCartoni([...agg.values()]);
-                                const qtyMap = {};
-                                existing.forEach(c => {
-                                  if (c.po_line_key) qtyMap[c.po_line_key] = (qtyMap[c.po_line_key] || 0) + (c.quantita || 0);
+                                // Totale ricevuto per codice in questo invoice → split derivato sulle righe
+                                const recvByCode = {};
+                                existing.forEach(c => { if (c.codice) recvByCode[c.codice] = (recvByCode[c.codice] || 0) + (c.quantita || 0); });
+                                setPoLines(prev => {
+                                  const grpByCode = {};
+                                  prev.forEach(l => {
+                                    if (l.sn_required || l.china_invoice !== group.invoice) return;
+                                    const ic = (l.item_code || '').trim(), pnr = (l.part_number || '').trim();
+                                    let cod = null;
+                                    if (ic && recvByCode[ic] !== undefined) cod = ic; else if (pnr && recvByCode[pnr] !== undefined) cod = pnr;
+                                    if (cod) (grpByCode[cod] = grpByCode[cod] || []).push(l);
+                                  });
+                                  const byKey = {};
+                                  Object.entries(grpByCode).forEach(([cod, grp]) => {
+                                    const ordered = [...grp].sort(orderByLineId);
+                                    distribuisciCarico(ordered, recvByCode[cod] || 0).forEach((a, i) => { byKey[ordered[i].unique_key] = a; });
+                                  });
+                                  return prev.map(l => (l.china_invoice === group.invoice && !l.sn_required) ? { ...l, qty_loaded: byKey[l.unique_key] || 0 } : l);
                                 });
-                                setPoLines(prev => prev.map(l => ({ ...l, qty_loaded: qtyMap[l.unique_key] || l.qty_loaded || 0 })));
                               } else {
                                 setArrivoQtyCartoni([]);
                                 setArrivoQtyBancale('');
@@ -4443,20 +4601,25 @@ export default function App() {
 
             {/* Lista cartoni */}
             {arrivoQtyCartoni.length > 0 && (() => {
-              // Riepilogo per codice
+              // Riepilogo per codice: la quantità attesa è la SOMMA delle righe con lo stesso codice
+              const invoiceLines = poLines.filter(l => l.china_invoice === arrivoQtyInvoice && l.sn_required === false);
+              const attesaByCodice = {};
+              invoiceLines.forEach(l => {
+                const q = l.qty_expected || 0;
+                const ic = (l.item_code || '').trim();
+                const pnr = (l.part_number || '').trim();
+                if (ic) attesaByCodice[ic] = (attesaByCodice[ic] || 0) + q;
+                if (pnr && pnr !== ic) attesaByCodice[pnr] = (attesaByCodice[pnr] || 0) + q;
+              });
               const summary = {};
               arrivoQtyCartoni.forEach(c => {
-                if (!summary[c.codice]) {
-                  const line = checkCodiceInPianoArrivi(c.codice);
-                  summary[c.codice] = { caricata: 0, attesa: line?.qty_expected || 0 };
-                }
+                if (!summary[c.codice]) summary[c.codice] = { caricata: 0, attesa: attesaByCodice[c.codice] || 0 };
                 summary[c.codice].caricata += c.quantita || 0;
               });
               // Righe dell'invoice non ancora toccate
-              const invoiceLines = poLines.filter(l => l.china_invoice === arrivoQtyInvoice && l.sn_required === false);
               invoiceLines.forEach(l => {
                 const codice = l.item_code || l.part_number;
-                if (!summary[codice]) summary[codice] = { caricata: 0, attesa: l.qty_expected || 0 };
+                if (!summary[codice]) summary[codice] = { caricata: 0, attesa: attesaByCodice[codice] || 0 };
               });
               const invoiceComplete = Object.values(summary).every(({ caricata, attesa }) => attesa > 0 && caricata >= attesa);
               return (
