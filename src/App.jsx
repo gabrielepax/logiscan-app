@@ -342,7 +342,8 @@ export default function App() {
   const [importMeta, setImportMeta] = useState({}); // chiave -> updated_at ISO
   const [matriceSearch, setMatriceSearch] = useState('');
   const [matriceSort, setMatriceSort] = useState({ col: 'pnit', dir: 'asc' });
-  const [consumi, setConsumi] = useState({}); // id (pnit+type) -> { media, nomaterial }
+  const [mediaData, setMediaData] = useState({}); // id (pnit+type) -> consumo medio mensile
+  const [nomatData, setNomatData] = useState({}); // id (pnit+type) -> NoMaterial
   const [consumiLoading, setConsumiLoading] = useState(false);
   const [mesiCopertura, setMesiCopertura] = useState(8);
   const [refurb, setRefurb] = useState({}); // pnit -> quantita da refurbishare
@@ -360,7 +361,8 @@ export default function App() {
     fetchPrelievi();
     fetchAnagrafica();
     fetchOrdini();
-    fetchConsumi();
+    fetchMedia();
+    fetchNomat();
     fetchRefurb();
     fetchImportMeta();
     // eslint-disable-next-line react-hooks/set-state-in-effect
@@ -897,80 +899,76 @@ export default function App() {
     reader.readAsArrayBuffer(file);
   }
 
-  // ===== Consumi medi mensili + NoMaterial (matrice_consumi), chiave ID = PNIT+TYPE =====
-  async function fetchConsumi() {
+  // ===== Consumi medi / NoMaterial: file separati, chiave ID = PNIT+TYPE, colonne IDSPAREPARTS + Pezzi =====
+  async function fetchKV(table, setter) {
     const pageSize = 1000;
     let all = [];
     let from = 0;
     while (true) {
-      const { data, error } = await supabase.from('matrice_consumi').select('*').order('id', { ascending: true }).range(from, from + pageSize - 1);
+      const { data, error } = await supabase.from(table).select('*').order('id', { ascending: true }).range(from, from + pageSize - 1);
       if (error) break;
       all = [...all, ...(data || [])];
       if (!data || data.length < pageSize) break;
       from += pageSize;
     }
     const map = {};
-    all.forEach(r => { map[r.id] = { media: r.media || 0, nomaterial: r.nomaterial || 0 }; });
-    setConsumi(map);
+    all.forEach(r => { map[r.id] = r.pezzi || 0; });
+    setter(map);
   }
+  const fetchMedia = () => fetchKV('matrice_media', setMediaData);
+  const fetchNomat = () => fetchKV('matrice_nomaterial', setNomatData);
 
-  async function handleConsumiUpload(event) {
-    const file = event.target.files[0];
-    if (!file) return;
-    event.target.value = '';
-    setConsumiLoading(true);
+  // Import generico per tabelle chiave/valore (id = IDSPAREPARTS, pezzi = Pezzi)
+  function makeKVUpload(table, metaKey, fetchFn, label) {
+    return function (event) {
+      const file = event.target.files[0];
+      if (!file) return;
+      event.target.value = '';
+      setConsumiLoading(true);
+      const reader = new FileReader();
+      reader.onload = async function (e) {
+        let rows;
+        try {
+          const wb = XLSX.read(e.target.result, { type: 'array' });
+          const ws = wb.Sheets[wb.SheetNames[0]];
+          rows = XLSX.utils.sheet_to_json(ws, { defval: '', blankrows: false, raw: false });
+        } catch { alert("Errore: impossibile leggere il file."); setConsumiLoading(false); return; }
+        if (rows.length === 0) { alert("File vuoto."); setConsumiLoading(false); return; }
 
-    const reader = new FileReader();
-    reader.onload = async function(e) {
-      let rows;
-      try {
-        const wb = XLSX.read(e.target.result, { type: 'array' });
-        const ws = wb.Sheets[wb.SheetNames[0]];
-        rows = XLSX.utils.sheet_to_json(ws, { defval: '', blankrows: false, raw: false });
-      } catch {
-        alert("Errore: impossibile leggere il file.");
+        const norm = s => String(s).toLowerCase().replace(/[^a-z0-9]/g, '');
+        const cols = Object.keys(rows[0]);
+        const colFor = (...cands) => cols.find(k => cands.includes(norm(k)));
+        const cId = colFor('idspareparts', 'id') || cols[0];
+        const cVal = colFor('pezzi', 'quantita', 'valore', 'media', 'nomaterial') || cols[1];
+        if (!cId || !cVal) { alert("Colonne mancanti: servono 'IDSPAREPARTS' e 'Pezzi'."); setConsumiLoading(false); return; }
+        const toNum = v => parseFloat(String(v || '').replace(',', '.').replace(/[^0-9.-]/g, '')) || 0;
+
+        const seen = new Set();
+        const toInsert = [];
+        rows.forEach(r => {
+          const id = String(r[cId] || '').trim();
+          if (!id || seen.has(id)) return;
+          seen.add(id);
+          toInsert.push({ id, pezzi: toNum(r[cVal]), updated_at: new Date().toISOString() });
+        });
+        if (toInsert.length === 0) { alert("Nessuna riga valida."); setConsumiLoading(false); return; }
+
+        const { error: delErr } = await supabase.from(table).delete().gte('id', '');
+        if (delErr) { alert("Errore svuotamento: " + delErr.message); setConsumiLoading(false); return; }
+        let insErr = null;
+        for (let i = 0; i < toInsert.length; i += 500) {
+          const { error } = await supabase.from(table).insert(toInsert.slice(i, i + 500));
+          if (error) { insErr = error; break; }
+        }
+        if (insErr) { alert("Errore salvataggio: " + insErr.message); }
+        else { await fetchFn(); await recordImportMeta(metaKey); alert(`${toInsert.length} righe ${label} caricate.`); }
         setConsumiLoading(false);
-        return;
-      }
-      if (rows.length === 0) { alert("File vuoto."); setConsumiLoading(false); return; }
-
-      const norm = s => String(s).toLowerCase().replace(/[^a-z0-9]/g, '');
-      const cols = Object.keys(rows[0]);
-      const colFor = (...cands) => cols.find(k => cands.includes(norm(k)));
-      const cId = colFor('id');
-      const cMedia = colFor('media');
-      const cNoMat = colFor('nomaterial');
-      if (!cId || !cMedia) {
-        alert("Colonne mancanti: servono 'ID' (PNIT+TYPE) e 'MEDIA'.");
-        setConsumiLoading(false);
-        return;
-      }
-      const toNum = v => parseFloat(String(v || '').replace(',', '.').replace(/[^0-9.-]/g, '')) || 0;
-
-      const seen = new Set();
-      const toInsert = [];
-      rows.forEach(r => {
-        const id = String(r[cId] || '').trim();
-        if (!id || seen.has(id)) return;
-        seen.add(id);
-        toInsert.push({ id, media: toNum(r[cMedia]), nomaterial: cNoMat ? toNum(r[cNoMat]) : 0, updated_at: new Date().toISOString() });
-      });
-      if (toInsert.length === 0) { alert("Nessuna riga valida."); setConsumiLoading(false); return; }
-
-      // Snapshot completo
-      const { error: delErr } = await supabase.from('matrice_consumi').delete().gte('id', '');
-      if (delErr) { alert("Errore svuotamento: " + delErr.message); setConsumiLoading(false); return; }
-      let insErr = null;
-      for (let i = 0; i < toInsert.length; i += 500) {
-        const { error } = await supabase.from('matrice_consumi').insert(toInsert.slice(i, i + 500));
-        if (error) { insErr = error; break; }
-      }
-      if (insErr) { alert("Errore salvataggio: " + insErr.message); }
-      else { await fetchConsumi(); await recordImportMeta('consumi'); alert(`${toInsert.length} righe consumi/NoMaterial caricate.`); }
-      setConsumiLoading(false);
+      };
+      reader.readAsArrayBuffer(file);
     };
-    reader.readAsArrayBuffer(file);
   }
+  const handleMediaUpload = makeKVUpload('matrice_media', 'media', fetchMedia, 'consumi medi');
+  const handleNomatUpload = makeKVUpload('matrice_nomaterial', 'nomaterial', fetchNomat, 'NoMaterial');
 
   // ===== Quantità da refurbishare per terminale (refurb_qty), chiave PNIT =====
   async function fetchRefurb() {
@@ -1012,8 +1010,9 @@ export default function App() {
       const norm = s => String(s).toLowerCase().replace(/[^a-z0-9]/g, '');
       const cols = Object.keys(rows[0]);
       const colFor = (...cands) => cols.find(k => cands.includes(norm(k)));
-      const cPn = colFor('partnumber', 'pnit', 'pn');
-      const cQty = colFor('conteggiodiserialnumber', 'quantita', 'quantity', 'conteggio', 'qty');
+      const cPn = colFor('partnumber', 'pnit', 'pn') || cols[0];
+      const cQty = colFor('conteggiodiidrma', 'conteggiodiserialnumber', 'quantita', 'quantity', 'qty', 'pezzi')
+        || cols.find(k => norm(k).startsWith('conteggio')) || cols[1];
       if (!cPn || !cQty) {
         alert("Colonne mancanti: servono 'Part Number' e 'Conteggio di Serial Number'.");
         setRefurbLoading(false);
@@ -3662,9 +3661,9 @@ export default function App() {
             const stock = codici.reduce((s, k) => s + (stockByCodice[k] || 0), 0);
             const inArrivo = codici.reduce((s, k) => s + (arrivoByCodice[k] || 0), 0);
             const inOrdine = codici.reduce((s, k) => s + (ordini[k]?.in_ordine || 0), 0);
-            const cons = consumi[`${c.pnit}${c.type}`] || { media: 0, nomaterial: 0 };
-            const media = cons.media || 0;
-            const nomaterial = cons.nomaterial || 0;
+            const idConsumi = `${c.pnit}${c.type}`;
+            const media = mediaData[idConsumi] || 0;
+            const nomaterial = nomatData[idConsumi] || 0;
             // Refurb: se la referenza è R+, servono (terminali da refurbishare del PNIT) × % refurbishing
             const refurbQty = c.rplus ? Math.round((refurb[c.pnit] || 0) * perc) : 0;
             const stima = Math.round(media * mesi + nomaterial + refurbQty);
@@ -3734,28 +3733,31 @@ export default function App() {
                 </div>
               </div>
 
-              {/* Upload file quantità in ordine */}
-              <div className="bg-white p-3 rounded-2xl border border-gray-200 shadow-xs flex items-center justify-between flex-wrap gap-2">
-                {canUpload('matrice') && (<>
-                <label className="bg-emerald-50 hover:bg-emerald-100 text-emerald-700 border border-emerald-200 text-xs font-bold px-3 py-2 rounded-xl cursor-pointer transition relative">
-                  📥 Aggiorna quantità in ordine (CSV)
-                  <input type="file" accept=".csv,.xls,.xlsx" className="absolute inset-0 w-full h-full opacity-0 cursor-pointer" onChange={handleOrdiniUpload} />
-                </label>
-                <label className="bg-purple-50 hover:bg-purple-100 text-purple-700 border border-purple-200 text-xs font-bold px-3 py-2 rounded-xl cursor-pointer transition relative">
-                  📥 Aggiorna consumi / NoMaterial
-                  <input type="file" accept=".csv,.xls,.xlsx" className="absolute inset-0 w-full h-full opacity-0 cursor-pointer" onChange={handleConsumiUpload} />
-                </label>
-                <label className="bg-orange-50 hover:bg-orange-100 text-orange-700 border border-orange-200 text-xs font-bold px-3 py-2 rounded-xl cursor-pointer transition relative">
-                  📥 Aggiorna refurbishing (CSV)
-                  <input type="file" accept=".csv,.xls,.xlsx" className="absolute inset-0 w-full h-full opacity-0 cursor-pointer" onChange={handleRefurbUpload} />
-                </label>
-                </>)}
-                <span className="text-[11px] text-gray-400">In arrivo dal Piano Arrivi</span>
-                {(ordiniLoading || consumiLoading || refurbLoading) && <span className="text-[11px] font-bold text-amber-600 animate-pulse">Caricamento...</span>}
-                {importMeta.ordini && <span className="text-[11px] text-gray-400">In ordine: {new Date(importMeta.ordini).toLocaleString('it-IT')}</span>}
-                {importMeta.consumi && <span className="text-[11px] text-gray-400">Consumi: {new Date(importMeta.consumi).toLocaleString('it-IT')}</span>}
-                {importMeta.refurb && <span className="text-[11px] text-gray-400">Refurb: {new Date(importMeta.refurb).toLocaleString('it-IT')}</span>}
-              </div>
+              {/* Upload dei 4 file, con data di ultimo aggiornamento dentro il pulsante */}
+              {canUpload('matrice') && (() => {
+                const fmtAgg = (iso) => iso
+                  ? new Date(iso).toLocaleString('it-IT', { day: '2-digit', month: '2-digit', year: '2-digit', hour: '2-digit', minute: '2-digit' })
+                  : 'mai caricato';
+                const btns = [
+                  { key: 'media', label: '📥 Consumi medi', onChange: handleMediaUpload, cls: 'bg-purple-50 hover:bg-purple-100 text-purple-700 border-purple-200' },
+                  { key: 'nomaterial', label: '📥 NoMaterial', onChange: handleNomatUpload, cls: 'bg-rose-50 hover:bg-rose-100 text-rose-700 border-rose-200' },
+                  { key: 'ordini', label: '📥 Pending quantity', onChange: handleOrdiniUpload, cls: 'bg-amber-50 hover:bg-amber-100 text-amber-700 border-amber-200' },
+                  { key: 'refurb', label: '📥 Refurbishing', onChange: handleRefurbUpload, cls: 'bg-orange-50 hover:bg-orange-100 text-orange-700 border-orange-200' },
+                ];
+                return (
+                  <div className="bg-white p-3 rounded-2xl border border-gray-200 shadow-xs flex items-center flex-wrap gap-2">
+                    {btns.map(b => (
+                      <label key={b.key} className={`relative border text-xs font-bold px-3 py-2 rounded-xl cursor-pointer transition flex flex-col leading-tight ${b.cls}`}>
+                        <span>{b.label}</span>
+                        <span className="text-[9px] font-semibold opacity-70">agg. {fmtAgg(importMeta[b.key])}</span>
+                        <input type="file" accept=".csv,.xls,.xlsx" className="absolute inset-0 w-full h-full opacity-0 cursor-pointer" onChange={b.onChange} />
+                      </label>
+                    ))}
+                    <span className="text-[11px] text-gray-400 ml-1">In arrivo dal Piano Arrivi</span>
+                    {(ordiniLoading || consumiLoading || refurbLoading) && <span className="text-[11px] font-bold text-amber-600 animate-pulse">Caricamento...</span>}
+                  </div>
+                );
+              })()}
 
               <div className="flex items-center justify-between text-[11px] text-gray-500 flex-wrap gap-2">
                 <div className="flex items-center gap-2 flex-wrap">
