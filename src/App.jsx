@@ -240,6 +240,7 @@ export default function App() {
   const [currentView, setCurrentView] = useState('dashboard');
   const [poLines, setPoLines] = useState([]);
   const [activeLineKey, setActiveLineKey] = useState(null);
+  const [activeGroupKeys, setActiveGroupKeys] = useState([]); // righe dello stesso invoice+codice lavorate insieme
   const [loading, setLoading] = useState(false);
 
   const [activeLine, setActiveLine] = useState(null);
@@ -1729,7 +1730,9 @@ export default function App() {
     reader.readAsText(file);
   }
 
-  async function handleSNUpload(event, line) {
+  // Upload UNICO per invoice: il file contiene tutte le matricole dell'arrivo, divise per VPN (colonna PN).
+  // L'app raggruppa per VPN e ripartisce i seriali sulle righe del piano rispettando le quantità attese.
+  async function handleSNUpload(event, invoice) {
     const file = event.target.files[0];
     if (!file) return;
     event.target.value = '';
@@ -1747,130 +1750,156 @@ export default function App() {
         setLoading(false);
         return;
       }
+      if (snRecords.length === 0) { alert("Errore: il file è vuoto o non leggibile."); setLoading(false); return; }
 
-      if (snRecords.length === 0) {
-        alert("Errore: il file è vuoto o non leggibile.");
+      const cols = Object.keys(snRecords[0]);
+      if (!cols.includes('SN') || !cols.includes('PN')) {
+        alert(`CARICAMENTO BLOCCATO — colonne obbligatorie mancanti:\n\n${!cols.includes('SN') ? '• Colonna "SN" mancante\n' : ''}${!cols.includes('PN') ? '• Colonna "PN" mancante' : ''}`);
         setLoading(false);
         return;
       }
 
-      const cols = Object.keys(snRecords[0]);
-      const hasSN = cols.includes('SN');
-      const hasPN = cols.includes('PN');
-
-      const errors = [];
-
-      // 1. Presenza colonne obbligatorie
-      if (!hasSN) errors.push(`• Colonna "SN" mancante nel file.`);
-      if (!hasPN) errors.push(`• Colonna "PN" mancante nel file.`);
-
-      const validRows = hasSN ? snRecords.filter(row => String(row['SN']).trim() !== '') : [];
-      const qtyProvided = validRows.length;
-      const qtyExpected = line.qty_expected;
-
-      // 2. Corrispondenza quantità
-      if (hasSN && qtyProvided !== qtyExpected) {
-        errors.push(`• QUANTITÀ non corrispondente:\n   Attese: ${qtyExpected} pz — Fornite: ${qtyProvided} pz`);
-      }
-
-      // 3. Corrispondenza VPN / PN (case/spazi-insensitive)
       const normPN = s => String(s || '').trim().toLowerCase().replace(/\s+/g, '');
-      const expectedPN = (line.part_number || '').trim();
-      if (!expectedPN || expectedPN === 'N/D') {
-        errors.push(`• VPN non presente sulla riga del piano arrivi: impossibile verificare la corrispondenza Part Number.`);
-      } else if (hasPN) {
-        const expN = normPN(expectedPN);
-        const mismatchedPNs = [...new Set(
-          validRows.map(row => String(row['PN'] || '').trim()).filter(pn => pn !== '' && normPN(pn) !== expN)
-        )];
-        if (mismatchedPNs.length > 0) {
-          errors.push(`• PART NUMBER non corrispondente:\n   VPN atteso: ${expectedPN}\n   PN nel file: ${mismatchedPNs.slice(0, 5).join(', ')}${mismatchedPNs.length > 5 ? '...' : ''}`);
-        }
-      }
+      const validRows = snRecords.filter(row => String(row['SN']).trim() !== '');
 
-      // Controlli BLOCCANTI: se anche solo uno fallisce, il caricamento è impedito
+      // Righe serializzate del piano per questo invoice, raggruppate per VPN
+      const invoiceLines = poLines.filter(l => l.china_invoice === invoice && l.sn_required === true);
+      if (invoiceLines.length === 0) { alert("Nessuna riga serializzata per questo arrivo."); setLoading(false); return; }
+      const linesByVpn = {};
+      const noVpn = [];
+      invoiceLines.forEach(l => {
+        const vpn = (l.part_number || '').trim();
+        if (!vpn || vpn === 'N/D') { noVpn.push(l); return; }
+        (linesByVpn[normPN(vpn)] = linesByVpn[normPN(vpn)] || []).push(l);
+      });
+
+      // Seriali del file raggruppati per VPN, deduplicati per SN
+      const serialsByVpn = {};
+      const seen = new Set();
+      const duplicati = [];
+      validRows.forEach(row => {
+        const sn = String(row['SN']).trim();
+        if (seen.has(sn)) { duplicati.push(sn); return; }
+        seen.add(sn);
+        const vpn = normPN(row['PN']);
+        (serialsByVpn[vpn] = serialsByVpn[vpn] || []).push({
+          serial: sn, model: String(row['Model'] || 'N/D').trim(), pn: String(row['PN'] || 'N/D').trim()
+        });
+      });
+
+      // ===== Validazioni bloccanti =====
+      const errors = [];
+      if (noVpn.length > 0) errors.push(`• ${noVpn.length} riga/e del piano senza VPN: impossibile abbinare le matricole (${noVpn.map(l => l.item_code).join(', ')}).`);
+      const vpnFileNotInPlan = Object.keys(serialsByVpn).filter(v => !linesByVpn[v]);
+      if (vpnFileNotInPlan.length > 0) errors.push(`• PN presenti nel file ma non nel piano di questo arrivo: ${vpnFileNotInPlan.slice(0, 5).join(', ')}${vpnFileNotInPlan.length > 5 ? '...' : ''}`);
+
+      // Gruppi VPN già in lavorazione (con matricole rilevate): NON verranno toccati
+      const skipped = [];
+      const toProcess = [];
+      Object.entries(linesByVpn).forEach(([vpn, grp]) => {
+        const hasScans = grp.some(l => (l.scanned_count || 0) > 0);
+        if (hasScans) { skipped.push({ vpn, grp }); return; }
+        toProcess.push({ vpn, grp });
+      });
+
+      // Per i gruppi da processare: il totale dei seriali deve combaciare con la somma delle quantità attese
+      toProcess.forEach(({ vpn, grp }) => {
+        const attesi = grp.reduce((s, l) => s + (l.qty_expected || 0), 0);
+        const forniti = (serialsByVpn[vpn] || []).length;
+        if (forniti !== attesi) {
+          const vpnLabel = (grp[0].part_number || '').trim();
+          errors.push(`• QUANTITÀ non corrispondente per VPN ${vpnLabel} (${grp.length} riga/e):\n   Attese: ${attesi} pz — Fornite: ${forniti} pz`);
+        }
+      });
+
       if (errors.length > 0) {
         alert(`CARICAMENTO BLOCCATO — il file non rispetta i requisiti:\n\n${errors.join('\n\n')}\n\nCorreggi il file e riprova.`);
         setLoading(false);
         return;
       }
-
-      // Avviso (non bloccante) sui serial duplicati: vengono caricati solo gli univoci
-      const seenSerials = new Set();
-      const duplicateSerials = [];
-      validRows.forEach(row => {
-        const sn = String(row['SN']).trim();
-        if (seenSerials.has(sn)) duplicateSerials.push(sn);
-        else seenSerials.add(sn);
-      });
-      if (duplicateSerials.length > 0) {
+      if (toProcess.length === 0) {
+        alert(`Nessuna riga da aggiornare: tutte le righe di questo arrivo hanno già matricole rilevate.\n\nPer ricaricarle, azzera prima le rilevazioni.`);
+        setLoading(false);
+        return;
+      }
+      if (duplicati.length > 0) {
         const proceed = window.confirm(
-          `Attenzione: il file contiene ${duplicateSerials.length} matricole DUPLICATE:\n\n` +
-          `${[...new Set(duplicateSerials)].slice(0, 10).join(', ')}${duplicateSerials.length > 10 ? '...' : ''}\n\n` +
-          `Verranno caricate solo le matricole univoche (${seenSerials.size}). Procedere?`
+          `Attenzione: il file contiene ${duplicati.length} matricole DUPLICATE:\n\n` +
+          `${[...new Set(duplicati)].slice(0, 10).join(', ')}${duplicati.length > 10 ? '...' : ''}\n\n` +
+          `Verranno caricate solo le matricole univoche. Procedere?`
         );
         if (!proceed) { setLoading(false); return; }
       }
 
-      const fullyMatched = true;
-
-      await supabase.from('expected_serials').delete().eq('po_line_key', line.unique_key);
-      await supabase.from('scanned_serials').delete().eq('po_line_key', line.unique_key);
-      await supabase.from('po_lines').update({
-        cartons_scanned: 0,
-        is_user_confirmed: false,
-        sn_loaded: fullyMatched
-      }).eq('unique_key', line.unique_key);
-
-      // Deduplica per serial (la chiave del controllo è il serial univoco)
-      const dedup = new Map();
-      validRows.forEach(row => {
-        const sn = String(row['SN']).trim();
-        if (!dedup.has(sn)) dedup.set(sn, {
-          po_line_key: line.unique_key,
-          serial: sn,
-          model: String(row['Model'] || 'N/D').trim(),
-          pn: String(row['PN'] || 'N/D').trim()
-        });
-      });
-      const serialsToInsert = [...dedup.values()];
-
-      // Inserimento a blocchi di 500 per evitare limiti di payload
-      const CHUNK = 500;
+      // ===== Ripartizione e inserimento =====
       let insertErr = null;
-      for (let i = 0; i < serialsToInsert.length; i += CHUNK) {
-        const { error } = await supabase.from('expected_serials').insert(serialsToInsert.slice(i, i + CHUNK));
-        if (error) { insertErr = error; break; }
+      let totalIns = 0;
+      for (const { vpn, grp } of toProcess) {
+        const ordered = [...grp].sort(orderByLineId);
+        const pool = serialsByVpn[vpn] || [];
+        const keys = ordered.map(l => l.unique_key);
+        await supabase.from('expected_serials').delete().in('po_line_key', keys);
+        await supabase.from('scanned_serials').delete().in('po_line_key', keys);
+        await supabase.from('po_lines').update({ cartons_scanned: 0, is_user_confirmed: false, sn_loaded: true }).in('unique_key', keys);
+
+        // Split: i primi N seriali alla prima riga, i successivi alla seconda, ecc.
+        let cursor = 0;
+        const toInsert = [];
+        ordered.forEach((l, idx) => {
+          const take = idx === ordered.length - 1 ? pool.length - cursor : Math.min(l.qty_expected || 0, pool.length - cursor);
+          pool.slice(cursor, cursor + take).forEach(s => toInsert.push({ po_line_key: l.unique_key, serial: s.serial, model: s.model, pn: s.pn }));
+          cursor += take;
+        });
+        const CHUNK = 500;
+        for (let i = 0; i < toInsert.length; i += CHUNK) {
+          const { error } = await supabase.from('expected_serials').insert(toInsert.slice(i, i + CHUNK));
+          if (error) { insertErr = error; break; }
+        }
+        if (insertErr) break;
+        totalIns += toInsert.length;
       }
 
       if (insertErr) {
         alert("Errore nel caricamento delle matricole: " + insertErr.message);
       } else {
-        // Conteggio reale dal DB
-        const { count } = await supabase.from('expected_serials')
-          .select('*', { count: 'exact', head: true }).eq('po_line_key', line.unique_key);
         await fetchPOLines();
-        alert(`Matricole caricate: ${count} SN salvate (file: ${qtyProvided} righe, univoche: ${serialsToInsert.length}).`);
+        const skipMsg = skipped.length > 0
+          ? `\n\nNON aggiornati (già in lavorazione con matricole rilevate): ${skipped.map(s => (s.grp[0].part_number || '').trim()).join(', ')}`
+          : '';
+        alert(`Matricole caricate: ${totalIns} SN su ${toProcess.length} VPN (${toProcess.reduce((s, t) => s + t.grp.length, 0)} righe del piano).${skipMsg}`);
       }
+      setLoading(false);
     };
     reader.readAsArrayBuffer(file);
   }
 
 
+  // Righe lavorate insieme: stesso invoice + stesso codice, serializzate
+  function serialGroupOf(line) {
+    const grp = poLines.filter(l => l.sn_required === true
+      && l.china_invoice === line.china_invoice
+      && (l.item_code || '') === (line.item_code || ''));
+    return grp.length > 0 ? grp.sort(orderByLineId) : [line];
+  }
+
   async function startScanningSession(line) {
     setLoading(true);
+    const group = serialGroupOf(line);
+    const keys = group.map(l => l.unique_key);
+    setActiveGroupKeys(keys);
     setActiveLineKey(line.unique_key);
-    setActiveLine(line);
+    // La riga attiva rappresenta il GRUPPO: quantità attesa = somma delle righe
+    setActiveLine({ ...line, qty_expected: group.reduce((s, l) => s + (l.qty_expected || 0), 0), _nLines: group.length });
     setCartonsScanned(line.cartons_scanned || 0);
 
     // Fetch paginato per superare il limite di 1000 righe di Supabase
-    const fetchAllByLine = async (table, cols) => {
+    const fetchAllByKeys = async (table, cols) => {
       const pageSize = 1000;
       let all = [];
       let from = 0;
       while (true) {
         // Ordinamento per 'id' (chiave univoca) per una paginazione stabile: evita duplicati/salti sui confini di pagina
-        const { data, error } = await supabase.from(table).select(cols).eq('po_line_key', line.unique_key)
+        const { data, error } = await supabase.from(table).select(cols).in('po_line_key', keys)
           .order('id', { ascending: true }).range(from, from + pageSize - 1);
         if (error) { alert(`Errore caricamento ${table}: ${error.message}`); break; }
         all = [...all, ...(data || [])];
@@ -1880,12 +1909,13 @@ export default function App() {
       return all;
     };
 
-    const expectedData = await fetchAllByLine('expected_serials', 'serial, model, pn');
-    const scannedData = await fetchAllByLine('scanned_serials', 'serial, model, pn, scanned_at');
+    const expectedData = await fetchAllByKeys('expected_serials', 'serial, model, pn, po_line_key');
+    const scannedData = await fetchAllByKeys('scanned_serials', 'serial, model, pn, scanned_at');
 
+    // Ogni seriale atteso porta con sé la riga che lo attende: la scansione verrà imputata lì
     const expectedMap = {};
     if (expectedData) {
-      expectedData.forEach(d => { expectedMap[d.serial] = { model: d.model, pn: d.pn }; });
+      expectedData.forEach(d => { expectedMap[d.serial] = { model: d.model, pn: d.pn, key: d.po_line_key }; });
     }
     const formattedScanned = (scannedData || []).map(s => ({
       serial: s.serial,
@@ -1908,8 +1938,9 @@ export default function App() {
   }
 
   async function reopenScanningSession(line) {
-    if (!window.confirm(`Riaprire la riga "${line.item_code}" per modificare le rilevazioni?\n\nL'arrivo verrà riportato in stato "In Corso".`)) return;
-    await supabase.from('po_lines').update({ is_user_confirmed: false }).eq('unique_key', line.unique_key);
+    if (!window.confirm(`Riaprire "${line.item_code}" per modificare le rilevazioni?\n\nL'arrivo verrà riportato in stato "In Corso".`)) return;
+    const keys = serialGroupOf(line).map(l => l.unique_key);
+    await supabase.from('po_lines').update({ is_user_confirmed: false }).in('unique_key', keys);
     await fetchPOLines();
     await startScanningSession({ ...line, is_user_confirmed: false });
   }
@@ -1917,59 +1948,67 @@ export default function App() {
   async function downloadArrivoCSV(line) {
     setLoading(true);
     setDownloadedKeys(prev => new Set(prev).add(line.unique_key));
-    // Fetch paginato per superare il limite di 1000 righe di Supabase
-    const pageSize = 1000;
-    let scannedData = [];
-    let from = 0;
-    let fetchErr = null;
-    while (true) {
-      const { data, error } = await supabase
-        .from('scanned_serials')
-        .select('serial, model, pn, scanned_at')
-        .eq('po_line_key', line.unique_key)
-        .order('id', { ascending: true })
-        .range(from, from + pageSize - 1);
-      if (error) { fetchErr = error; break; }
-      scannedData = [...scannedData, ...(data || [])];
-      if (!data || data.length < pageSize) break;
-      from += pageSize;
-    }
+    const scannedData = await fetchScannedByLine(line.unique_key);
     setLoading(false);
-    if (fetchErr) { alert("Errore nel recupero dati: " + fetchErr.message); return; }
-
     buildAndDownloadCSV(line, scannedData);
   }
 
-  function buildAndDownloadCSV(line, serials) {
-    // Nessun dedup: il file riporta TUTTE le matricole registrate (anche i doppioni) per piena tracciabilità
-    serials = serials || [];
-    const header = "Internal ID,Date,Document Number,Subsidiary,Item,CODICE CINESE,Fornitore,Memo,[PAX] China Invoice,Quantity Riga,Quantity Serial,Seriale,Line ID,Surrogate ID,Vendor DDT,Vendor DDT Date";
-    const rows = serials.map(s => [
-      line.po_internal_id,
-      line.arrival_date,
-      line.po_name,
-      "",
-      line.item_code,
-      s.model,
-      "",
-      line.description,
-      line.china_invoice,
-      line.qty_expected,
-      1,
-      s.serial,
-      line.line_id,
-      line.line_id,
-      "",
-      ""
+  const CSV_ARRIVO_HEADER = "Internal ID,Date,Document Number,Subsidiary,Item,CODICE CINESE,Fornitore,Memo,[PAX] China Invoice,Quantity Riga,Quantity Serial,Seriale,Line ID,Surrogate ID,Vendor DDT,Vendor DDT Date";
+
+  // Costruisce le righe CSV di una singola riga di piano: ogni record porta il proprio Line ID
+  function csvRowsForLine(line, serials) {
+    return (serials || []).map(s => [
+      line.po_internal_id, line.arrival_date, line.po_name, "", line.item_code, s.model, "",
+      line.description, line.china_invoice, line.qty_expected, 1, s.serial, line.line_id, line.line_id, "", ""
     ]);
-    const csv = [header, ...rows.map(r => r.map(v => `"${String(v).replace(/"/g, '""')}"`).join(','))].join('\r\n');
+  }
+
+  function downloadCSVRows(rows, filename) {
+    const csv = [CSV_ARRIVO_HEADER, ...rows.map(r => r.map(v => `"${String(v).replace(/"/g, '""')}"`).join(','))].join('\r\n');
     const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = `${line.china_invoice}-${line.item_code}.csv`;
+    a.download = filename;
     a.click();
     URL.revokeObjectURL(url);
+  }
+
+  function buildAndDownloadCSV(line, serials) {
+    // Nessun dedup: il file riporta TUTTE le matricole registrate (anche i doppioni) per piena tracciabilità
+    // Il Line ID è nel nome file: righe diverse dello stesso codice non si sovrascrivono
+    downloadCSVRows(csvRowsForLine(line, serials), `${line.china_invoice}-${line.item_code}-L${line.line_id}.csv`);
+  }
+
+  // Scarica in UN unico file tutte le righe dello stesso codice/arrivo, ognuna col proprio Line ID
+  async function downloadGruppoCSV(line) {
+    setLoading(true);
+    const grp = serialGroupOf(line);
+    const rows = [];
+    for (const l of grp) {
+      const serials = await fetchScannedByLine(l.unique_key);
+      rows.push(...csvRowsForLine(l, serials));
+      setDownloadedKeys(prev => new Set(prev).add(l.unique_key));
+    }
+    setLoading(false);
+    if (rows.length === 0) { alert('Nessuna matricola rilevata per questo codice.'); return; }
+    downloadCSVRows(rows, `${line.china_invoice}-${line.item_code}.csv`);
+  }
+
+  async function fetchScannedByLine(key) {
+    const pageSize = 1000;
+    let all = [];
+    let from = 0;
+    while (true) {
+      const { data, error } = await supabase.from('scanned_serials')
+        .select('serial, model, pn, scanned_at').eq('po_line_key', key)
+        .order('id', { ascending: true }).range(from, from + pageSize - 1);
+      if (error) break;
+      all = [...all, ...(data || [])];
+      if (!data || data.length < pageSize) break;
+      from += pageSize;
+    }
+    return all;
   }
 
   async function deleteScannedSerial(serial) {
@@ -1977,7 +2016,7 @@ export default function App() {
     const { error } = await supabase
       .from('scanned_serials')
       .delete()
-      .eq('po_line_key', activeLineKey)
+      .in('po_line_key', activeGroupKeys.length ? activeGroupKeys : [activeLineKey])
       .eq('serial', serial);
     if (error) { alert("Errore: " + error.message); return; }
     scannedSetRef.current.delete(serial);
@@ -1986,13 +2025,14 @@ export default function App() {
   }
 
   async function deleteAllScannedSerials() {
-    if (!window.confirm(`Eliminare TUTTE le ${scannedSerials.length} matricole rilevate per questa riga?\n\nL'operazione non è reversibile.`)) return;
+    if (!window.confirm(`Eliminare TUTTE le ${scannedSerials.length} matricole rilevate per questo arrivo?\n\nL'operazione non è reversibile.`)) return;
+    const keys = activeGroupKeys.length ? activeGroupKeys : [activeLineKey];
     const { error } = await supabase
       .from('scanned_serials')
       .delete()
-      .eq('po_line_key', activeLineKey);
+      .in('po_line_key', keys);
     if (error) { alert("Errore: " + error.message); return; }
-    await supabase.from('po_lines').update({ cartons_scanned: 0 }).eq('unique_key', activeLineKey);
+    await supabase.from('po_lines').update({ cartons_scanned: 0 }).in('unique_key', keys);
     scannedSetRef.current = new Set();
     setScannedSerials([]);
     setCartonsScanned(0);
@@ -2009,7 +2049,7 @@ export default function App() {
     let from = 0;
     while (true) {
       const { data, error } = await supabase.from('scanned_serials')
-        .select('id, serial').eq('po_line_key', activeLineKey)
+        .select('id, serial').in('po_line_key', activeGroupKeys.length ? activeGroupKeys : [activeLineKey])
         .order('id', { ascending: true }).range(from, from + pageSize - 1);
       if (error) { alert("Errore: " + error.message); setLoading(false); return; }
       allRows = [...allRows, ...(data || [])];
@@ -2087,7 +2127,8 @@ export default function App() {
         if (scannedSetRef.current.has(serial)) { duplicati++; return; }
         if (!Object.hasOwn(expectedSerials, serial)) { errati++; return; }
         scannedSetRef.current.add(serial); // guardia sincrona: previene doppi da scansioni rapide o QR con seriali ripetuti
-        aggiunti.push({ po_line_key: activeLineKey, serial, model: expectedSerials[serial].model, pn: expectedSerials[serial].pn });
+        // Il seriale viene imputato alla riga che lo attende (split automatico tra righe stesso codice)
+        aggiunti.push({ po_line_key: expectedSerials[serial].key || activeLineKey, serial, model: expectedSerials[serial].model, pn: expectedSerials[serial].pn });
       });
 
       if (aggiunti.length > 0) {
@@ -2121,12 +2162,12 @@ export default function App() {
       }
       if (!Object.hasOwn(expectedSerials, serial)) {
         triggerVibration([300]); sounds.error();
-        setFeedback({ text: `Errore! La matricola ${serial} non appartiene a questa riga.`, type: 'error' });
+        setFeedback({ text: `Errore! La matricola ${serial} non appartiene a questo arrivo.`, type: 'error' });
         return;
       }
       scannedSetRef.current.add(serial); // guardia sincrona anti-duplicati
       const meta = expectedSerials[serial];
-      await supabase.from('scanned_serials').insert({ po_line_key: activeLineKey, serial, model: meta.model, pn: meta.pn });
+      await supabase.from('scanned_serials').insert({ po_line_key: meta.key || activeLineKey, serial, model: meta.model, pn: meta.pn });
 
       const updatedScanned = [
         { serial, model: meta.model, pn: meta.pn, time: new Date().toLocaleTimeString('it-IT') },
@@ -2153,7 +2194,7 @@ export default function App() {
       let from = 0;
       while (true) {
         const { data, error } = await supabase.from('scanned_serials')
-          .select('serial, model, pn, scanned_at').eq('po_line_key', activeLineKey)
+          .select('serial, model, pn, scanned_at').in('po_line_key', activeGroupKeys.length ? activeGroupKeys : [activeLineKey])
           .order('id', { ascending: true }).range(from, from + pageSize - 1);
         if (error) break;
         all = [...all, ...(data || [])];
@@ -2169,16 +2210,18 @@ export default function App() {
 
   async function confirmAndFinalizeVerification() {
     setLoading(true);
+    // Conferma tutte le righe del gruppo (stesso invoice + codice)
     const { error } = await supabase
       .from('po_lines')
       .update({ is_user_confirmed: true })
-      .eq('unique_key', activeLineKey);
+      .in('unique_key', activeGroupKeys.length ? activeGroupKeys : [activeLineKey]);
     if (error) {
       alert("Errore nel salvataggio finale: " + error.message);
     } else {
       triggerVibration([100, 50, 100, 50, 200]);
       await fetchPOLines();
       setActiveLineKey(null);
+      setActiveGroupKeys([]);
       setActiveLine(null);
       setCurrentView('dashboard');
     }
@@ -2187,6 +2230,7 @@ export default function App() {
 
   async function resetToDashboard() {
     setActiveLineKey(null);
+    setActiveGroupKeys([]);
     setActiveLine(null);
     setCurrentView('dashboard');
     await fetchPOLines();
@@ -4355,6 +4399,14 @@ export default function App() {
                             {group.lines.every(l => l.is_user_confirmed) ? '✎ Modifica Arrivo' : group.lines.some(l => (l.qty_loaded || 0) > 0) ? '▶ Riprendi Arrivo' : '📦 Processa Arrivo'}
                           </button>
                         )}
+                        {group.snRequired && canUpload('arrivi') && !group.lines.every(l => l.is_user_confirmed) && (
+                          <div className="relative shrink-0">
+                            <button className={`text-xs font-bold px-3.5 py-2 rounded-xl transition cursor-pointer shadow-xs whitespace-nowrap ${group.lines.some(l => l.sn_loaded) ? 'bg-gray-200 hover:bg-gray-300 text-gray-600 border border-gray-300' : 'bg-amber-600 hover:bg-amber-700 text-white'}`}>
+                              {group.lines.some(l => l.sn_loaded) ? '↻ Ricarica SN arrivo' : '📥 Carica SN arrivo'}
+                            </button>
+                            <input type="file" accept=".xls,.xlsx" className="absolute inset-0 w-full h-full opacity-0 cursor-pointer" onChange={(e) => handleSNUpload(e, group.invoice)} />
+                          </div>
+                        )}
                       </div>
                       <div className="flex flex-col space-y-3">
                         {group.lines.map(item => {
@@ -4420,27 +4472,20 @@ export default function App() {
 
                               {/* Pulsanti — destra, affiancati */}
                               <div className="flex flex-row flex-wrap gap-2 justify-end shrink-0">
-                                {snRequired && !isConfirmed && (
-                                  <div className="relative">
-                                    {item.sn_loaded ? (
-                                      <>
-                                        <button className="bg-gray-200 hover:bg-gray-300 text-gray-500 text-xs font-medium px-3 py-2 rounded-xl transition cursor-pointer border border-gray-300 whitespace-nowrap">Sovrascrivi SN</button>
-                                        <input type="file" accept=".xls,.xlsx" className="absolute inset-0 w-full h-full opacity-0 cursor-pointer" onChange={(e) => handleSNUpload(e, item)} />
-                                      </>
-                                    ) : (
-                                      <>
-                                        <button className="bg-amber-600 hover:bg-amber-700 text-white text-xs font-bold px-3 py-2 rounded-xl transition cursor-pointer shadow-xs whitespace-nowrap">Carica SN</button>
-                                        <input type="file" accept=".xls,.xlsx" className="absolute inset-0 w-full h-full opacity-0 cursor-pointer" onChange={(e) => handleSNUpload(e, item)} />
-                                      </>
-                                    )}
-                                  </div>
-                                )}
-                                {snRequired && isConfirmed && (
+                                {snRequired && isConfirmed && (() => {
+                                  const grp = serialGroupOf(item);
+                                  return (
                                   <>
-                                    <button onClick={() => downloadArrivoCSV(item)} className={`text-xs font-bold px-3 py-2 rounded-xl transition cursor-pointer whitespace-nowrap ${downloadedKeys.has(item.unique_key) ? 'bg-gray-100 hover:bg-gray-200 text-gray-400 border border-gray-200' : 'bg-blue-600 hover:bg-blue-700 text-white shadow-xs'}`}>📥 Scarica</button>
+                                    <button onClick={() => downloadArrivoCSV(item)} className={`text-xs font-bold px-3 py-2 rounded-xl transition cursor-pointer whitespace-nowrap ${downloadedKeys.has(item.unique_key) ? 'bg-gray-100 hover:bg-gray-200 text-gray-400 border border-gray-200' : 'bg-blue-600 hover:bg-blue-700 text-white shadow-xs'}`}
+                                      title="Scarica solo questa riga">📥 Riga</button>
+                                    {grp.length > 1 && (
+                                      <button onClick={() => downloadGruppoCSV(item)} className="bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-bold px-3 py-2 rounded-xl transition cursor-pointer shadow-xs whitespace-nowrap"
+                                        title={`Scarica tutte le ${grp.length} righe di questo codice in un unico file`}>📥 Gruppo ({grp.length})</button>
+                                    )}
                                     <button onClick={() => reopenScanningSession(item)} className="bg-gray-200 hover:bg-gray-300 text-gray-500 text-xs font-medium px-3 py-2 rounded-xl transition cursor-pointer border border-gray-300 whitespace-nowrap">Modifica</button>
                                   </>
-                                )}
+                                  );
+                                })()}
                                 {snRequired && !isConfirmed && (
                                   <button onClick={() => startScanningSession(item)} className="bg-blue-600 hover:bg-blue-700 text-white text-xs font-bold px-3 py-2 rounded-xl transition cursor-pointer shadow-xs whitespace-nowrap">
                                     {item.scanned_count > 0 ? 'Modifica' : 'Avvia'}
