@@ -1874,11 +1874,13 @@ export default function App() {
   }
 
 
-  // Righe lavorate insieme: stesso invoice + stesso codice, serializzate
+  // Righe lavorate insieme: stesso invoice + stesso codice + stesso VPN, serializzate.
+  // Il VPN è vincolante perché i seriali attesi vengono abbinati proprio sul VPN.
   function serialGroupOf(line) {
     const grp = poLines.filter(l => l.sn_required === true
       && l.china_invoice === line.china_invoice
-      && (l.item_code || '') === (line.item_code || ''));
+      && (l.item_code || '') === (line.item_code || '')
+      && (l.part_number || '') === (line.part_number || ''));
     return grp.length > 0 ? grp.sort(orderByLineId) : [line];
   }
 
@@ -1980,19 +1982,18 @@ export default function App() {
     downloadCSVRows(csvRowsForLine(line, serials), `${line.china_invoice}-${line.item_code}-L${line.line_id}.csv`);
   }
 
-  // Scarica in UN unico file tutte le righe dello stesso codice/arrivo, ognuna col proprio Line ID
-  async function downloadGruppoCSV(line) {
+  // Scarica in UN unico file tutte le righe serializzate dell'arrivo, ognuna col proprio Line ID
+  async function downloadInvoiceSerialCSV(invoice, lines) {
     setLoading(true);
-    const grp = serialGroupOf(line);
     const rows = [];
-    for (const l of grp) {
+    for (const l of lines) {
       const serials = await fetchScannedByLine(l.unique_key);
       rows.push(...csvRowsForLine(l, serials));
       setDownloadedKeys(prev => new Set(prev).add(l.unique_key));
     }
     setLoading(false);
-    if (rows.length === 0) { alert('Nessuna matricola rilevata per questo codice.'); return; }
-    downloadCSVRows(rows, `${line.china_invoice}-${line.item_code}.csv`);
+    if (rows.length === 0) { alert('Nessuna matricola rilevata per questo arrivo.'); return; }
+    downloadCSVRows(rows, `${invoice}.csv`);
   }
 
   async function fetchScannedByLine(key) {
@@ -4407,19 +4408,36 @@ export default function App() {
                             <input type="file" accept=".xls,.xlsx" className="absolute inset-0 w-full h-full opacity-0 cursor-pointer" onChange={(e) => handleSNUpload(e, group.invoice)} />
                           </div>
                         )}
+                        {group.snRequired && group.lines.some(l => l.is_user_confirmed) && (
+                          <button onClick={() => downloadInvoiceSerialCSV(group.invoice, group.lines)}
+                            className="shrink-0 bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-bold px-3.5 py-2 rounded-xl transition cursor-pointer shadow-xs whitespace-nowrap"
+                            title="Scarica in un unico file tutte le righe serializzate di questo arrivo, ognuna col proprio Line ID">
+                            📥 Scarica Excel arrivo
+                          </button>
+                        )}
                       </div>
                       <div className="flex flex-col space-y-3">
-                        {group.lines.map(item => {
+                        {/* I serializzati con stesso codice E stesso VPN si lavorano insieme: una sola scheda, con dettaglio per riga */}
+                        {(group.snRequired
+                          ? Object.values(group.lines.reduce((acc, l) => { const k = `${l.item_code || ''}__${l.part_number || ''}`; (acc[k] = acc[k] || []).push(l); return acc; }, {})).map(ls => [...ls].sort(orderByLineId))
+                          : group.lines.map(l => [l])
+                        ).map(cardLines => {
+                          const item = cardLines[0];
                           const snRequired = item.sn_required == null ? true : item.sn_required;
-                          const isConfirmed = item.is_user_confirmed === true;
+                          const multi = cardLines.length > 1;
+                          const qtyTot = cardLines.reduce((s, l) => s + (l.qty_expected || 0), 0);
+                          const scanTot = cardLines.reduce((s, l) => s + (l.scanned_count || 0), 0);
+                          const isConfirmed = cardLines.every(l => l.is_user_confirmed === true);
+                          const snLoaded = cardLines.some(l => l.sn_loaded);
                           return (
-                            <div key={item.unique_key} className="bg-white px-3 py-2.5 rounded-xl border border-gray-200 hover:border-gray-300 transition shadow-xs flex flex-col md:flex-row md:items-center justify-between gap-2">
+                            <div key={item.unique_key} className="bg-white px-3 py-2.5 rounded-xl border border-gray-200 hover:border-gray-300 transition shadow-xs space-y-2">
+                             <div className="flex flex-col md:flex-row md:items-center justify-between gap-2">
 
                               {/* Stato */}
                               <div className="flex flex-row md:flex-col items-center md:items-start justify-between md:justify-center gap-1.5 shrink-0 border-b md:border-b-0 pb-1.5 md:pb-0 border-gray-100">
                                 {isConfirmed ? (
                                   <span className="text-[10px] bg-green-600 text-white px-2 py-0.5 rounded-md font-black border border-green-700">✓ Concluso</span>
-                                ) : (item.scanned_count > 0 || item.qty_loaded > 0) ? (
+                                ) : (scanTot > 0 || item.qty_loaded > 0) ? (
                                   <span className="text-[10px] bg-amber-500 text-white px-2 py-0.5 rounded-md font-black border border-amber-600">⏳ In Corso</span>
                                 ) : (
                                   <span className="text-[10px] bg-gray-200 text-gray-600 px-2 py-0.5 rounded-md font-black border border-gray-300">◌ In Attesa</span>
@@ -4430,7 +4448,9 @@ export default function App() {
                               <div className="flex-grow min-w-0 space-y-0.5">
                                 <div className="flex flex-wrap items-center gap-1.5">
                                   <h4 className="text-base font-black text-blue-700 font-mono tracking-tight break-all">{item.item_code}</h4>
-                                  <span className="text-[10px] text-gray-400 font-mono hidden md:inline">(L: {item.line_id})</span>
+                                  {multi
+                                    ? <span className="text-[9px] bg-indigo-50 text-indigo-700 border border-indigo-200 font-black px-1.5 py-px rounded" title="Righe dello stesso codice, lavorate insieme">{cardLines.length} RIGHE</span>
+                                    : <span className="text-[10px] text-gray-400 font-mono hidden md:inline">(L: {item.line_id})</span>}
                                   {!snRequired && !spareParts.some(p => p.pn === item.item_code) && (
                                     <span className="text-[9px] bg-red-50 text-red-600 border border-red-200 font-bold px-1.5 py-px rounded" title="Codice non presente nel DB Spare Parts">⚠ NON IN DB</span>
                                   )}
@@ -4447,15 +4467,15 @@ export default function App() {
                               {/* Quantità — inline, subito dopo la descrizione */}
                               <div className="flex flex-col justify-center shrink-0 text-right min-w-[80px]">
                                 {/* Solo attesi: nessuna rilevazione avviata */}
-                                {snRequired && !item.sn_loaded && (
-                                  <span className="text-2xl font-black font-mono text-gray-900">{item.qty_expected}<span className="text-xs font-bold text-gray-400 ml-1">pz</span></span>
+                                {snRequired && !snLoaded && (
+                                  <span className="text-2xl font-black font-mono text-gray-900">{qtyTot}<span className="text-xs font-bold text-gray-400 ml-1">pz</span></span>
                                 )}
                                 {/* Serializzati con rilevazione */}
-                                {snRequired && item.sn_loaded && (
+                                {snRequired && snLoaded && (
                                   <span className="text-2xl font-black font-mono text-gray-900">
-                                    {item.scanned_count > 0
-                                      ? <><span className={item.scanned_count >= item.qty_expected ? 'text-green-600' : 'text-blue-600'}>{item.scanned_count}</span><span className="text-sm font-bold text-gray-400">/{item.qty_expected}</span></>
-                                      : <>{item.qty_expected}<span className="text-xs font-bold text-gray-400 ml-1">pz</span></>
+                                    {scanTot > 0
+                                      ? <><span className={scanTot >= qtyTot ? 'text-green-600' : 'text-blue-600'}>{scanTot}</span><span className="text-sm font-bold text-gray-400">/{qtyTot}</span></>
+                                      : <>{qtyTot}<span className="text-xs font-bold text-gray-400 ml-1">pz</span></>
                                     }
                                   </span>
                                 )}
@@ -4470,29 +4490,46 @@ export default function App() {
                                 )}
                               </div>
 
-                              {/* Pulsanti — destra, affiancati */}
+                              {/* Pulsanti — destra: uno solo per l'intero codice */}
                               <div className="flex flex-row flex-wrap gap-2 justify-end shrink-0">
-                                {snRequired && isConfirmed && (() => {
-                                  const grp = serialGroupOf(item);
-                                  return (
-                                  <>
-                                    <button onClick={() => downloadArrivoCSV(item)} className={`text-xs font-bold px-3 py-2 rounded-xl transition cursor-pointer whitespace-nowrap ${downloadedKeys.has(item.unique_key) ? 'bg-gray-100 hover:bg-gray-200 text-gray-400 border border-gray-200' : 'bg-blue-600 hover:bg-blue-700 text-white shadow-xs'}`}
-                                      title="Scarica solo questa riga">📥 Riga</button>
-                                    {grp.length > 1 && (
-                                      <button onClick={() => downloadGruppoCSV(item)} className="bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-bold px-3 py-2 rounded-xl transition cursor-pointer shadow-xs whitespace-nowrap"
-                                        title={`Scarica tutte le ${grp.length} righe di questo codice in un unico file`}>📥 Gruppo ({grp.length})</button>
-                                    )}
-                                    <button onClick={() => reopenScanningSession(item)} className="bg-gray-200 hover:bg-gray-300 text-gray-500 text-xs font-medium px-3 py-2 rounded-xl transition cursor-pointer border border-gray-300 whitespace-nowrap">Modifica</button>
-                                  </>
-                                  );
-                                })()}
+                                {snRequired && isConfirmed && (
+                                  <button onClick={() => reopenScanningSession(item)} className="bg-gray-200 hover:bg-gray-300 text-gray-500 text-xs font-medium px-3 py-2 rounded-xl transition cursor-pointer border border-gray-300 whitespace-nowrap">Modifica</button>
+                                )}
                                 {snRequired && !isConfirmed && (
                                   <button onClick={() => startScanningSession(item)} className="bg-blue-600 hover:bg-blue-700 text-white text-xs font-bold px-3 py-2 rounded-xl transition cursor-pointer shadow-xs whitespace-nowrap">
-                                    {item.scanned_count > 0 ? 'Modifica' : 'Avvia'}
+                                    {scanTot > 0 ? 'Modifica' : 'Avvia'}
                                   </button>
                                 )}
                               </div>
+                             </div>
 
+                             {/* Dettaglio per riga: resta la distinzione (Line ID, attesi, rilevati) */}
+                             {snRequired && multi && (
+                               <div className="border-t border-gray-100 pt-2 space-y-1">
+                                 {cardLines.map(l => (
+                                   <div key={l.unique_key} className="flex items-center justify-between gap-2 text-[11px]">
+                                     <span className="text-gray-500 font-mono">L: <strong className="text-gray-700">{l.line_id}</strong></span>
+                                     <span className="font-mono text-gray-500">
+                                       <span className={(l.scanned_count || 0) >= l.qty_expected ? 'text-green-600 font-black' : 'text-blue-600 font-black'}>{l.scanned_count || 0}</span>/{l.qty_expected} pz
+                                     </span>
+                                     {l.is_user_confirmed && (
+                                       <button onClick={() => downloadArrivoCSV(l)}
+                                         className={`text-[10px] font-bold px-2 py-1 rounded-lg cursor-pointer transition whitespace-nowrap ${downloadedKeys.has(l.unique_key) ? 'bg-gray-100 hover:bg-gray-200 text-gray-400 border border-gray-200' : 'bg-blue-50 hover:bg-blue-100 text-blue-700 border border-blue-200'}`}
+                                         title="Scarica solo questa riga">📥 Riga</button>
+                                     )}
+                                   </div>
+                                 ))}
+                               </div>
+                             )}
+
+                             {/* Riga singola confermata: download della riga */}
+                             {snRequired && !multi && isConfirmed && (
+                               <div className="border-t border-gray-100 pt-2 flex justify-end">
+                                 <button onClick={() => downloadArrivoCSV(item)}
+                                   className={`text-[10px] font-bold px-2 py-1 rounded-lg cursor-pointer transition whitespace-nowrap ${downloadedKeys.has(item.unique_key) ? 'bg-gray-100 hover:bg-gray-200 text-gray-400 border border-gray-200' : 'bg-blue-50 hover:bg-blue-100 text-blue-700 border border-blue-200'}`}
+                                   title="Scarica solo questa riga">📥 Riga</button>
+                               </div>
+                             )}
                             </div>
                           );
                         })}
