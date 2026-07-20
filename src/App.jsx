@@ -17,7 +17,7 @@ const APP_MODULES = [
   { id: 'riepilogo', label: 'Riepilogo Stock', group: 'Magazzino' },
   { id: 'spare-parts', label: 'DB Spare Parts', group: 'Repair', upload: true, edit: true },
   { id: 'matrice', label: 'Matrice PNIT × TYPE', group: 'Repair', upload: true },
-  { id: 'anagrafica', label: 'Anagrafica', group: 'Repair', upload: true },
+  { id: 'anagrafica', label: 'Anagrafica', group: 'Repair', upload: true, edit: true },
 ];
 
 const SP_DEFAULT_WIDTHS = {
@@ -329,6 +329,7 @@ export default function App() {
   const [anagrafica, setAnagrafica] = useState([]);
   const [anagLoading, setAnagLoading] = useState(false);
   const [anagSearch, setAnagSearch] = useState('');
+  const [anagCluster, setAnagCluster] = useState('');
 
   // Riepilogo Stock
   const [riepSearch, setRiepSearch] = useState('');
@@ -486,13 +487,14 @@ export default function App() {
     setSpLoading(false);
   }
 
+  // ===== Anagrafica Articoli (chiave Internal ID) — import completo, con "gruppo" editabile per gli Hardware =====
   async function fetchAnagrafica() {
     setAnagLoading(true);
     const pageSize = 1000;
     let all = [];
     let from = 0;
     while (true) {
-      const { data, error } = await supabase.from('anagrafica_terminali').select('*').order('codice', { ascending: true }).range(from, from + pageSize - 1);
+      const { data, error } = await supabase.from('anagrafica_articoli').select('*').order('codice', { ascending: true }).range(from, from + pageSize - 1);
       if (error) break;
       all = [...all, ...(data || [])];
       if (!data || data.length < pageSize) break;
@@ -500,6 +502,13 @@ export default function App() {
     }
     setAnagrafica(all);
     setAnagLoading(false);
+  }
+
+  // Salva il "gruppo" specificato manualmente su un item (Hardware)
+  async function setAnagraficaGruppo(internal_id, gruppo) {
+    setAnagrafica(prev => prev.map(a => a.internal_id === internal_id ? { ...a, gruppo } : a));
+    const { error } = await supabase.from('anagrafica_articoli').update({ gruppo }).eq('internal_id', internal_id);
+    if (error) { alert('Errore salvataggio gruppo: ' + error.message); fetchAnagrafica(); }
   }
 
   async function handleAnagraficaUpload(event) {
@@ -513,60 +522,71 @@ export default function App() {
       let rows;
       try {
         const wb = XLSX.read(e.target.result, { type: 'array' });
-        // Preferisci il foglio "famiglie"; altrimenti il primo
-        const shName = wb.SheetNames.find(n => n.toLowerCase() === 'famiglie') || wb.SheetNames[0];
-        const ws = wb.Sheets[shName];
+        const ws = wb.Sheets[wb.SheetNames[0]];
         rows = XLSX.utils.sheet_to_json(ws, { defval: '', blankrows: false, raw: false });
-      } catch {
-        alert("Errore: impossibile leggere il file.");
-        setAnagLoading(false);
-        return;
-      }
+      } catch { alert("Errore: impossibile leggere il file."); setAnagLoading(false); return; }
       if (rows.length === 0) { alert("File vuoto."); setAnagLoading(false); return; }
 
-      // Ricerca flessibile delle colonne
       const norm = s => String(s).toLowerCase().replace(/[^a-z0-9]/g, '');
       const cols = Object.keys(rows[0]);
       const colFor = (...cands) => cols.find(k => cands.includes(norm(k)));
-      const cCodice = colFor('codice');
-      if (!cCodice) {
-        alert("Colonna obbligatoria mancante: serve 'CODICE' (foglio 'famiglie').");
+      const cId = colFor('internalid');
+      const cName = colFor('name');
+      const cDisplay = colFor('displayname');
+      const cCluster = colFor('paxclusteritem', 'clusteritem', 'cluster');
+      const cInactive = colFor('inactive');
+      const cVpn = colFor('paxvendorpartnumber', 'vendorpartnumber', 'vpn');
+      const cCli = colFor('gmcontolavoro', 'contolavoro');
+      const cNote = colFor('paxnotes', 'notes', 'note');
+      const cPrice = colFor('vendorprice', 'price', 'prezzo');
+      const cCur = colFor('vendorpricecurrency', 'currency', 'valuta');
+      if (!cId || !cName) {
+        alert("Colonne obbligatorie mancanti: servono 'Internal ID' e 'Name'.");
         setAnagLoading(false);
         return;
       }
-      const c = {
-        tipo: colFor('tipo'), modello: colFor('modello'), blocco: colFor('blocco'),
-        famiglia: colFor('famiglia'), famigliakey: colFor('famigliakey'),
-        descrizione: colFor('descrizione'), gruppo: colFor('gruppo'), gruppo2a: colFor('gruppo2a'),
-        family: colFor('family'), microfamily: colFor('microfamily'),
-        note: colFor('note'), versione_pci: colFor('versionepci'),
-      };
       const g = (r, col) => col ? String(r[col] || '').trim() : '';
+      const toNum = v => parseFloat(String(v || '').replace(',', '.').replace(/[^0-9.-]/g, '')) || 0;
+
+      // Preserva i "gruppo" già inseriti manualmente (chiave internal_id)
+      const gruppoPrev = {};
+      anagrafica.forEach(a => { if (a.gruppo) gruppoPrev[a.internal_id] = a.gruppo; });
 
       const seen = new Set();
       const toUpsert = rows.filter(r => {
-        const cod = String(r[cCodice] || '').trim();
-        if (!cod || seen.has(cod)) return false;
-        seen.add(cod);
+        const id = String(r[cId] || '').trim();
+        if (!id || seen.has(id)) return false;
+        seen.add(id);
         return true;
-      }).map(r => ({
-        codice: String(r[cCodice] || '').trim(),
-        tipo: g(r, c.tipo), modello: g(r, c.modello), blocco: g(r, c.blocco),
-        famiglia: g(r, c.famiglia), famigliakey: g(r, c.famigliakey),
-        descrizione: g(r, c.descrizione), gruppo: g(r, c.gruppo), gruppo2a: g(r, c.gruppo2a),
-        family: g(r, c.family), microfamily: g(r, c.microfamily),
-        note: g(r, c.note), versione_pci: g(r, c.versione_pci),
-      }));
+      }).map(r => {
+        const id = String(r[cId] || '').trim();
+        return {
+          internal_id: id,
+          codice: g(r, cName),
+          descrizione: g(r, cDisplay),
+          cluster: g(r, cCluster),
+          inactive: g(r, cInactive),
+          vpn: g(r, cVpn),
+          conto_lavoro: g(r, cCli),
+          note: g(r, cNote),
+          prezzo: cPrice ? toNum(r[cPrice]) : 0,
+          valuta: g(r, cCur),
+          gruppo: gruppoPrev[id] || '',
+          updated_at: new Date().toISOString(),
+        };
+      });
 
-      // Upsert a blocchi
+      // Snapshot completo (preserva il gruppo tramite gruppoPrev)
+      const { error: delErr } = await supabase.from('anagrafica_articoli').delete().gte('internal_id', '');
+      if (delErr) { alert("Errore svuotamento: " + delErr.message); setAnagLoading(false); return; }
       const CHUNK = 500;
       let err = null;
       for (let i = 0; i < toUpsert.length; i += CHUNK) {
-        const { error } = await supabase.from('anagrafica_terminali').upsert(toUpsert.slice(i, i + CHUNK), { onConflict: 'codice' });
+        const { error } = await supabase.from('anagrafica_articoli').insert(toUpsert.slice(i, i + CHUNK));
         if (error) { err = error; break; }
       }
       if (err) alert("Errore salvataggio: " + err.message);
-      else { await fetchAnagrafica(); await recordImportMeta('anagrafica'); alert(`${toUpsert.length} terminali caricati in anagrafica.`); }
+      else { await fetchAnagrafica(); await recordImportMeta('anagrafica'); alert(`${toUpsert.length} articoli caricati in anagrafica.`); }
       setAnagLoading(false);
     };
     reader.readAsArrayBuffer(file);
@@ -2249,6 +2269,11 @@ export default function App() {
   });
 
   // Raggruppa per invoice + sn_required
+  const anagCodiciSet = new Set(anagrafica.map(a => String(a.codice || '').trim()).filter(Boolean));
+  // Descrizione per codice: prima dal DB spare parts, poi fallback su anagrafica articoli
+  const descByCodice = {};
+  anagrafica.forEach(a => { const c = String(a.codice || '').trim(); if (c && a.descrizione) descByCodice[c] = a.descrizione; });
+  spareParts.forEach(p => { const c = String(p.pn || '').trim(); if (c) descByCodice[c] = p.descrizione || p.english_name || descByCodice[c] || ''; });
   const invoiceGroups = {};
   filteredLines.forEach(line => {
     const snRequired = line.sn_required == null ? true : line.sn_required;
@@ -3422,10 +3447,10 @@ export default function App() {
             arrivoByCodice[cod] = (arrivoByCodice[cod] || 0) + (l.qty_expected || 0);
           });
 
-          // Anagrafica terminali per codice (= PNIT): gruppo = MODELLO - VERSIONE PCI - NOTE
+          // Anagrafica articoli (Hardware) per codice (= PNIT): gruppo specificato manualmente
           const anagByCodice = {};
           anagrafica.forEach(a => { anagByCodice[String(a.codice || '').trim()] = a; });
-          const gruppoDesc = (a) => a ? [a.modello, a.versione_pci, a.note].map(x => String(x || '').trim()).filter(Boolean).join(' - ') : '';
+          const gruppoDesc = (a) => a ? String(a.gruppo || '').trim() : '';
 
           // Info per pn dal DB spare parts
           const pnInfo = {};
@@ -3872,20 +3897,22 @@ export default function App() {
           );
         })()}
 
-        {/* ==================== MODULO ANAGRAFICA TERMINALI ==================== */}
+        {/* ==================== MODULO ANAGRAFICA ARTICOLI ==================== */}
         {activeModule === 'anagrafica' && (() => {
-          const gruppoDesc = (a) => [a.modello, a.versione_pci, a.note].map(x => String(x || '').trim()).filter(Boolean).join(' - ');
+          const clusters = [...new Set(anagrafica.map(a => (a.cluster || '').trim()).filter(Boolean))].sort();
           const q = anagSearch.trim().toLowerCase();
           const list = anagrafica.filter(a => {
+            if (anagCluster && (a.cluster || '').trim() !== anagCluster) return false;
             if (!q) return true;
-            return `${a.codice} ${a.tipo} ${a.modello} ${a.famiglia} ${a.descrizione} ${gruppoDesc(a)}`.toLowerCase().includes(q);
+            return `${a.codice} ${a.descrizione} ${a.vpn} ${a.note} ${a.gruppo}`.toLowerCase().includes(q);
           });
+          const isHardware = (a) => (a.cluster || '').trim().toLowerCase() === 'hardware';
           return (
           <div className="space-y-5">
             <div className="flex items-center justify-between flex-wrap gap-3">
               <div>
-                <h2 className="text-lg font-black text-gray-800">📇 Anagrafica Terminali</h2>
-                <p className="text-xs text-gray-500">Chiave <strong>CODICE = PNIT</strong> del DB spare parts. Import da <em>tipoterminale.xlsx</em> (foglio &quot;famiglie&quot;).</p>
+                <h2 className="text-lg font-black text-gray-800">📇 Anagrafica Articoli</h2>
+                <p className="text-xs text-gray-500">Anagrafica completa (chiave <strong>Internal ID</strong>). Name = codice, Display Name = descrizione. Per gli item <strong>Hardware</strong> puoi specificare il <strong>Gruppo</strong>.</p>
                 {importMeta.anagrafica && <p className="text-[11px] text-gray-400">Ultimo aggiornamento: {new Date(importMeta.anagrafica).toLocaleString('it-IT')}</p>}
               </div>
               <div className="flex gap-2 flex-wrap">
@@ -3900,38 +3927,53 @@ export default function App() {
             </div>
 
             <div className="flex items-center gap-3 flex-wrap">
+              <select value={anagCluster} onChange={e => setAnagCluster(e.target.value)}
+                className="bg-gray-50 border border-gray-300 rounded-xl p-2.5 text-xs focus:outline-hidden">
+                <option value="">Tutti i cluster ({clusters.length})</option>
+                {clusters.map(c => <option key={c} value={c}>{c}</option>)}
+              </select>
               <input value={anagSearch} onChange={e => setAnagSearch(e.target.value)}
-                placeholder="Cerca per codice, modello, famiglia, descrizione..."
+                placeholder="Cerca per codice, descrizione, VPN, gruppo..."
                 className="flex-grow min-w-[200px] bg-gray-50 border border-gray-300 rounded-xl p-2.5 text-xs focus:outline-hidden" />
-              <span className="text-[11px] text-gray-500">{list.length} / {anagrafica.length} terminali</span>
+              <span className="text-[11px] text-gray-500">{list.length} / {anagrafica.length} articoli</span>
             </div>
 
             {anagLoading && <div className="text-center py-4 text-xs font-bold text-amber-600 animate-pulse">Caricamento...</div>}
 
             {!anagLoading && anagrafica.length === 0 && (
-              <div className="text-center py-16 text-gray-400 text-sm">Nessun terminale in anagrafica. Importa il file tipoterminale.xlsx.</div>
+              <div className="text-center py-16 text-gray-400 text-sm">Nessun articolo in anagrafica. Importa il file anagrafica.</div>
             )}
 
             {!anagLoading && list.length > 0 && (
               <div className="bg-white rounded-2xl border border-gray-200 shadow-xs overflow-x-auto">
-                <table className="w-full min-w-[720px] text-left border-collapse text-xs">
+                <table className="w-full min-w-[860px] text-left border-collapse text-xs">
                   <thead className="bg-gray-50 border-b border-gray-200 text-[10px] font-black text-gray-500 uppercase tracking-wider">
                     <tr>
-                      <th className="px-3 py-3">Codice (PNIT)</th>
-                      <th className="px-3 py-3">Gruppo</th>
-                      <th className="px-3 py-3">Tipo</th>
-                      <th className="px-3 py-3">Famiglia</th>
+                      <th className="px-3 py-3">Codice</th>
                       <th className="px-3 py-3">Descrizione</th>
+                      <th className="px-3 py-3">Cluster</th>
+                      <th className="px-3 py-3">VPN</th>
+                      <th className="px-3 py-3 text-center">ST.</th>
+                      <th className="px-3 py-3">Gruppo (Hardware)</th>
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-gray-100">
                     {list.map(a => (
-                      <tr key={a.codice} className="hover:bg-blue-50/50 transition">
+                      <tr key={a.internal_id} className="hover:bg-blue-50/50 transition">
                         <td className="px-3 py-2.5 font-mono font-bold text-blue-700">{a.codice}</td>
-                        <td className="px-3 py-2.5 font-black text-indigo-800">{gruppoDesc(a) || '—'}</td>
-                        <td className="px-3 py-2.5 text-gray-600">{a.tipo || '—'}</td>
-                        <td className="px-3 py-2.5 text-gray-600">{a.famiglia || '—'}</td>
-                        <td className="px-3 py-2.5 text-gray-600">{a.descrizione || '—'}</td>
+                        <td className="px-3 py-2.5 text-gray-700">{a.descrizione || '—'}</td>
+                        <td className="px-3 py-2.5 text-gray-600">{a.cluster || '—'}</td>
+                        <td className="px-3 py-2.5 font-mono text-gray-500 text-[10px]">{a.vpn || '—'}</td>
+                        <td className="px-3 py-2.5 text-center">
+                          {String(a.conto_lavoro || '').trim().toLowerCase() === 'yes' && <span className="px-1 py-px rounded font-black text-[9px] border bg-amber-50 text-amber-700 border-amber-100" title="Conto Lavoro">CLI</span>}
+                        </td>
+                        <td className="px-3 py-2.5">
+                          {isHardware(a)
+                            ? <input defaultValue={a.gruppo || ''} onBlur={e => { const v = e.target.value.trim(); if (v !== (a.gruppo || '')) setAnagraficaGruppo(a.internal_id, v); }}
+                                placeholder="—" disabled={!canEdit('anagrafica')}
+                                className="w-full bg-indigo-50/40 border border-indigo-100 rounded-lg px-2 py-1 text-xs font-bold text-indigo-800 focus:outline-hidden disabled:bg-gray-50 disabled:text-gray-500" />
+                            : <span className="text-gray-300">—</span>}
+                        </td>
                       </tr>
                     ))}
                   </tbody>
@@ -4061,10 +4103,11 @@ export default function App() {
                 <span className="text-sm font-black text-blue-600">Tot. pezzi: {prelievoDetail.righe.reduce((s, r) => s + (r.quantita || 0), 0)}</span>
               </div>
               <div className="overflow-x-auto">
-              <table className="w-full min-w-[560px] text-left border-collapse text-xs">
+              <table className="w-full min-w-[680px] text-left border-collapse text-xs">
                 <thead className="bg-gray-50 border-b border-gray-200 text-[10px] font-black text-gray-500 uppercase tracking-wider">
                   <tr>
                     <th className="px-3 py-3">Codice</th>
+                    <th className="px-3 py-3">Descrizione</th>
                     <th className="px-3 py-3">ID Cartone</th>
                     <th className="px-3 py-3">Magazzino</th>
                     <th className="px-3 py-3">Bancale</th>
@@ -4075,6 +4118,7 @@ export default function App() {
                   {prelievoDetail.righe.map(r => (
                     <tr key={r.id} className="hover:bg-gray-50/80">
                       <td className="px-3 py-2.5 font-mono font-bold text-blue-700">{r.codice}</td>
+                      <td className="px-3 py-2.5 text-gray-600">{descByCodice[r.codice] || '—'}</td>
                       <td className="px-3 py-2.5 font-mono text-[10px] text-gray-500">{r.id_cartone || '—'}</td>
                       <td className="px-3 py-2.5 text-gray-600">{r.magazzino}</td>
                       <td className="px-3 py-2.5 text-gray-600">{r.numero_bancale || '—'}</td>
@@ -4451,8 +4495,8 @@ export default function App() {
                                   {multi
                                     ? <span className="text-[9px] bg-indigo-50 text-indigo-700 border border-indigo-200 font-black px-1.5 py-px rounded" title="Righe dello stesso codice, lavorate insieme">{cardLines.length} RIGHE</span>
                                     : <span className="text-[10px] text-gray-400 font-mono hidden md:inline">(L: {item.line_id})</span>}
-                                  {!snRequired && !spareParts.some(p => p.pn === item.item_code) && (
-                                    <span className="text-[9px] bg-red-50 text-red-600 border border-red-200 font-bold px-1.5 py-px rounded" title="Codice non presente nel DB Spare Parts">⚠ NON IN DB</span>
+                                  {!snRequired && !anagCodiciSet.has(item.item_code) && (
+                                    <span className="text-[9px] bg-red-50 text-red-600 border border-red-200 font-bold px-1.5 py-px rounded" title="Codice non presente in Anagrafica">⚠ NON IN ANAGRAFICA</span>
                                   )}
                                 </div>
                                 <p className="text-xs text-gray-500 font-medium line-clamp-1">{item.description}</p>
