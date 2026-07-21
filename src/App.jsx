@@ -13,8 +13,8 @@ const APP_MODULES = [
   { id: 'arrivi', label: 'Piano Arrivi', group: 'Magazzino', upload: true },
   { id: 'prelievi', label: 'Prelievi', group: 'Magazzino' },
   { id: 'sposta-bancale', label: 'Sposta Bancale', group: 'Magazzino' },
-  { id: 'stock', label: 'Inventario Spare Parts', group: 'Magazzino', upload: true, edit: true },
-  { id: 'riepilogo', label: 'Riepilogo Stock', group: 'Magazzino' },
+  { id: 'stock', label: 'Inventario', group: 'Magazzino', upload: true, edit: true },
+  { id: 'riepilogo', label: 'Stock Spare Parts', group: 'Magazzino' },
   { id: 'spare-parts', label: 'DB Spare Parts', group: 'Repair', upload: true, edit: true },
   { id: 'matrice', label: 'Matrice PNIT × TYPE', group: 'Repair', upload: true },
   { id: 'anagrafica', label: 'Anagrafica', group: 'Repair', upload: true, edit: true },
@@ -28,7 +28,7 @@ const SP_DEFAULT_WIDTHS = {
 
 const STOCK_DEFAULT_WIDTHS = {
   locazione: 110, numero_bancale: 110, magazzino: 110,
-  codice: 140, modello: 80, eol: 40, english_name: 155, descrizione: 190, stock: 68, edit: 60,
+  codice: 140, cluster: 100, modello: 80, eol: 40, descrizione: 300, stock: 68, edit: 60,
 };
 
 // Web Audio API — crea il contesto la prima volta che l'utente interagisce
@@ -241,6 +241,7 @@ export default function App() {
   const [poLines, setPoLines] = useState([]);
   const [activeLineKey, setActiveLineKey] = useState(null);
   const [activeGroupKeys, setActiveGroupKeys] = useState([]); // righe dello stesso invoice+codice lavorate insieme
+  const [arriviTab, setArriviTab] = useState('spedizioni'); // 'spedizioni' (CI No. presente) | 'po' (PO ancora aperti)
   const [loading, setLoading] = useState(false);
 
   const [activeLine, setActiveLine] = useState(null);
@@ -274,6 +275,7 @@ export default function App() {
   const [stockSearch, setStockSearch] = useState('');
   const [stockFilterMagazzino, setStockFilterMagazzino] = useState('');
   const [stockFilterLocazione, setStockFilterLocazione] = useState('');
+  const [stockFilterCluster, setStockFilterCluster] = useState('');
   const [stockPage, setStockPage] = useState(0);
   const [stockSortCol, setStockSortCol] = useState('codice');
   const [stockSortDir, setStockSortDir] = useState('asc');
@@ -314,9 +316,11 @@ export default function App() {
   const [prelieviList, setPrelieviList] = useState([]);
   const [prelievoDetail, setPrelievoDetail] = useState(null); // { testata, righe }
   const [prelievoTab, setPrelievoTab] = useState('attivi'); // 'attivi' | 'registrati'
+  const [prelievoTipo, setPrelievoTipo] = useState('chiamata'); // 'chiamata' | 'workorder'
   const [prelieviLoading, setPrelieviLoading] = useState(false);
   const [prelievoUtente, setPrelievoUtente] = useState('');
   const [prelievoDest, setPrelievoDest] = useState('');
+  const [prelievoWO, setPrelievoWO] = useState(''); // codice Work Order rilevato (WO + numero)
   const [prelievoRighe, setPrelievoRighe] = useState([]); // { stockId, idCartone, codice, numero_bancale, magazzino, quantita, qtaDisponibile }
   const [prelievoScanner, setPrelievoScanner] = useState('');
   const [prelievoFeedback, setPrelievoFeedback] = useState({ text: '', type: '' });
@@ -324,6 +328,14 @@ export default function App() {
   const [prelievoShowEsprinet, setPrelievoShowEsprinet] = useState(false);
   const prelievoScannerRef = useRef(null);
   const registraLockRef = useRef(false); // guard anti doppio-submit prelievo
+  // Tipologia prelievo: Work Order (trasferimento a produzione) vs "chiamata" (Secure Room / Repair)
+  // Work Order: in DB la destinazione è salvata come "Work Order #WO1403"
+  const WO_RE = /^WO\s*\d+$/i; // formato del codice rilevato (WO1454)
+  const isWorkOrder = (p) => {
+    const d = String(p?.destinazione || '').trim();
+    return /^work order/i.test(d) || WO_RE.test(d);
+  };
+  const matchTipo = (p) => prelievoTipo === 'workorder' ? isWorkOrder(p) : !isWorkOrder(p);
 
   // Anagrafica Terminali (tipoterminale.xlsx → foglio "famiglie", chiave CODICE = PNIT del DB spare parts)
   const [anagrafica, setAnagrafica] = useState([]);
@@ -533,6 +545,7 @@ export default function App() {
       const cId = colFor('internalid');
       const cName = colFor('name');
       const cDisplay = colFor('displayname');
+      const cDesc = colFor('description', 'descrizione');
       const cCluster = colFor('paxclusteritem', 'clusteritem', 'cluster');
       const cInactive = colFor('inactive');
       const cVpn = colFor('paxvendorpartnumber', 'vendorpartnumber', 'vpn');
@@ -563,7 +576,8 @@ export default function App() {
         return {
           internal_id: id,
           codice: g(r, cName),
-          descrizione: g(r, cDisplay),
+          display_name: g(r, cDisplay),
+          descrizione: g(r, cDesc),
           cluster: g(r, cCluster),
           inactive: g(r, cInactive),
           vpn: g(r, cVpn),
@@ -790,7 +804,7 @@ export default function App() {
         if (aggMap.has(key)) {
           aggMap.get(key).stock += stock;
         } else {
-          aggMap.set(key, { locazione, numero_bancale, magazzino, codice, stock });
+          aggMap.set(key, { locazione, numero_bancale, magazzino, codice, stock, fonte: 'spare_parts' });
         }
       });
 
@@ -810,8 +824,8 @@ export default function App() {
         return;
       }
 
-      // 1. Svuota la tabella
-      const { error: delErr } = await supabase.from('stock_inventory').delete().gte('id', 0);
+      // 1. Svuota solo le righe spare parts (gli accessori restano)
+      const { error: delErr } = await supabase.from('stock_inventory').delete().or('fonte.is.null,fonte.eq.spare_parts');
       if (delErr) { alert("Errore durante lo svuotamento: " + delErr.message); setStockLoading(false); return; }
 
       // 2. Inserimento a blocchi
@@ -823,6 +837,61 @@ export default function App() {
 
       if (insErr) { alert("Errore salvataggio stock: " + insErr.message); }
       else { await fetchStock(); await recordImportMeta('stock'); alert(`Inventario sostituito: ${toInsert.length} record caricati.`); }
+    };
+    reader.readAsArrayBuffer(file);
+  }
+
+  // ===== Giacenze Accessori: Item;Location;On Hand (già diviso per magazzino) → stock_inventory (fonte=accessori) =====
+  async function handleStockAccessoriUpload(event) {
+    const file = event.target.files[0];
+    if (!file) return;
+    event.target.value = '';
+    setStockLoading(true);
+    const reader = new FileReader();
+    reader.onload = async function(e) {
+      let rows;
+      try {
+        const wb = XLSX.read(e.target.result, { type: 'array' });
+        const ws = wb.Sheets[wb.SheetNames[0]];
+        rows = XLSX.utils.sheet_to_json(ws, { defval: '', blankrows: false, raw: false });
+      } catch { alert("Errore: impossibile leggere il file."); setStockLoading(false); return; }
+      if (rows.length === 0) { alert("File vuoto."); setStockLoading(false); return; }
+
+      const norm = s => String(s).toLowerCase().replace(/[^a-z0-9]/g, '');
+      const cols = Object.keys(rows[0]);
+      const colFor = (...cands) => cols.find(k => cands.includes(norm(k)));
+      const cItem = colFor('item', 'codice');
+      const cLoc = colFor('location', 'magazzino', 'locazione');
+      const cQty = colFor('onhand', 'available', 'stock', 'quantita');
+      if (!cItem || !cLoc || !cQty) {
+        alert("Colonne mancanti: servono 'Item', 'Location' e 'On Hand' (o 'Available').");
+        setStockLoading(false);
+        return;
+      }
+      const toNum = v => parseFloat(String(v || '').replace(/[^0-9.-]/g, '')) || 0;
+
+      const agg = new Map();
+      rows.forEach(r => {
+        const codice = String(r[cItem] || '').trim();
+        const mag = String(r[cLoc] || '').trim().toUpperCase();
+        if (!codice || !mag) return;
+        const key = `${codice}__${mag}`;
+        agg.set(key, { codice, magazzino: mag, numero_bancale: '', locazione: '', fonte: 'accessori', stock: (agg.get(key)?.stock || 0) + toNum(r[cQty]) });
+      });
+      const toInsert = [...agg.values()].filter(r => r.stock !== 0);
+      if (toInsert.length === 0) { alert("Nessuna riga valida."); setStockLoading(false); return; }
+
+      // Sostituisce solo le righe accessori (le spare parts restano)
+      const { error: delErr } = await supabase.from('stock_inventory').delete().eq('fonte', 'accessori');
+      if (delErr) { alert("Errore svuotamento: " + delErr.message); setStockLoading(false); return; }
+      let insErr = null;
+      for (let i = 0; i < toInsert.length; i += 500) {
+        const { error } = await supabase.from('stock_inventory').insert(toInsert.slice(i, i + 500));
+        if (error) { insErr = error; break; }
+      }
+      if (insErr) { alert("Errore salvataggio: " + insErr.message); }
+      else { await fetchStock(); await recordImportMeta('stock_accessori'); alert(`${toInsert.length} giacenze accessori caricate.`); }
+      setStockLoading(false);
     };
     reader.readAsArrayBuffer(file);
   }
@@ -1305,8 +1374,8 @@ export default function App() {
   }
 
   async function exportPrelieviRettifica() {
-    // Esporta solo i prelievi ATTIVI (non ancora registrati)
-    const attivi = prelieviList.filter(p => p.stato !== 'registrato');
+    // Esporta solo i prelievi ATTIVI di tipo "chiamata" (i Work Order hanno un export dedicato)
+    const attivi = prelieviList.filter(p => p.stato !== 'registrato' && !isWorkOrder(p));
     if (attivi.length === 0) { alert('Nessun prelievo attivo da esportare.'); return; }
     if (!window.confirm(`Esportare ${attivi.length} prelievi?\n\nDopo il download verranno marcati come REGISTRATI e non saranno più eliminabili né modificabili.`)) return;
 
@@ -1484,7 +1553,15 @@ export default function App() {
 
   async function registraPrelievo() {
     if (prelievoRighe.length === 0) { alert('Nessuna riga da prelevare.'); return; }
-    if (!prelievoDest) { alert('Seleziona la destinazione (Secure Room o Repair).'); return; }
+    if (!prelievoDest) { alert('Seleziona la destinazione (Secure Room, Repair o Work Order).'); return; }
+    // Per i Work Order la destinazione salvata è il codice WO rilevato (es. WO1454)
+    let destFinale = prelievoDest.trim();
+    if (prelievoDest === 'Work Order') {
+      const wo = prelievoWO.trim().toUpperCase().replace(/\s+/g, '');
+      if (!wo) { alert('Il Work Order è obbligatorio: rilevalo o digitalo (es. WO1454).'); return; }
+      if (!WO_RE.test(wo)) { alert('Work Order non valido: atteso WO seguito dal numero (es. WO1454).'); return; }
+      destFinale = `Work Order #${wo}`;
+    }
     // Valida quantità
     for (const r of prelievoRighe) {
       const q = parseFloat(r.quantita);
@@ -1521,7 +1598,7 @@ export default function App() {
 
       // 1. Crea testata prelievo
       const { data: testata, error: errT } = await supabase.from('prelievi')
-        .insert({ id_prelievo: idPrelievo, utente: user, destinazione: prelievoDest.trim() || null })
+        .insert({ id_prelievo: idPrelievo, utente: user, destinazione: destFinale || null })
         .select('id').single();
       if (errT) { alert('Errore creazione prelievo: ' + errT.message); return; }
 
@@ -1546,6 +1623,7 @@ export default function App() {
       else alert(`Prelievo ${idPrelievo} registrato (${prelievoRighe.length} righe).`);
       setPrelievoRighe([]);
       setPrelievoDest('');
+      setPrelievoWO('');
       setPrelievoFeedback({ text: '', type: '' });
       setPrelievoView('list');
       await fetchStock();
@@ -1606,19 +1684,42 @@ export default function App() {
     setStockLoading(false);
   }
 
+  // Parser CSV conforme a RFC 4180: gestisce virgolette, delimitatori e a capo DENTRO i campi
+  // (es. Remark = "Due to the shortage of the MCU, It might not be ready until November.")
   function parseCSV(text, delimiter) {
-    const lines = text.split(/\r?\n/).map(line => line.trim()).filter(line => line.length > 0);
-    if (lines.length === 0) return [];
-    const headers = lines[0].split(delimiter).map(h => h.replace(/^["']|["']$/g, '').trim());
-    const result = [];
-    for (let i = 1; i < lines.length; i++) {
-      const currentLine = lines[i].split(delimiter).map(v => v.replace(/^["']|["']$/g, '').trim());
-      if (currentLine.length < headers.length) continue;
-      const obj = {};
-      headers.forEach((header, index) => { obj[header] = currentLine[index] || ""; });
-      result.push(obj);
+    let s = String(text || '');
+    if (s.charCodeAt(0) === 0xFEFF) s = s.slice(1); // via il BOM
+    const rows = [];
+    let row = [];
+    let field = '';
+    let inQuotes = false;
+    for (let i = 0; i < s.length; i++) {
+      const c = s[i];
+      if (inQuotes) {
+        if (c === '"') {
+          if (s[i + 1] === '"') { field += '"'; i++; } // virgoletta escapata ("")
+          else inQuotes = false;
+        } else field += c;
+      } else if (c === '"') {
+        inQuotes = true;
+      } else if (c === delimiter) {
+        row.push(field); field = '';
+      } else if (c === '\n') {
+        row.push(field); rows.push(row); row = []; field = '';
+      } else if (c !== '\r') {
+        field += c;
+      }
     }
-    return result;
+    if (field !== '' || row.length > 0) { row.push(field); rows.push(row); }
+
+    const clean = rows.filter(r => r.some(v => String(v).trim() !== ''));
+    if (clean.length === 0) return [];
+    const headers = clean[0].map(h => h.trim());
+    return clean.slice(1).map(r => {
+      const obj = {};
+      headers.forEach((h, idx) => { obj[h] = String(r[idx] ?? '').trim(); });
+      return obj;
+    });
   }
 
   async function handlePOLinesUpload(event) {
@@ -1677,20 +1778,34 @@ export default function App() {
 
       const existingKeys = new Set(existing.map(l => l.unique_key));
 
-      // Trova in modo flessibile la colonna del vendor part number (ignora maiuscole/spazi/parentesi)
+      // Risoluzione flessibile delle colonne: supporta sia la nuova search (GMOpenPOGLOBAL) sia il vecchio file
       const norm = s => String(s).toLowerCase().replace(/[^a-z0-9]/g, '');
-      const findVendorPN = (row) => {
-        const key = Object.keys(row).find(k => {
-          const n = norm(k);
-          return n.includes('vendorpartnumber') || n.includes('vendorpn') || n === 'vpn';
-        });
-        return key ? String(row[key] || '').trim() : '';
+      const headers = Object.keys(records[0] || {});
+      const colFor = (...cands) => headers.find(h => cands.includes(norm(h)));
+      const C = {
+        poId: colFor('pointernalid', 'internalid'),
+        lineId: colFor('lineid'),
+        po: colFor('itemspo', 'po'),
+        item: colFor('itemsitem', 'pnit'),
+        desc: colFor('itemsdescription', 'description', 'descrizione'),
+        qty: colFor('itemsquantityexpected', 'pendingqty', 'quantita'),
+        eta: colFor('datadiarrivo', 'etagessate', 'eta'),
+        ci: colFor('paxchinainvoice', 'chinainvoice', 'cino'),
+        vpn: headers.find(h => { const n = norm(h); return n.includes('vendorpartnumber') || n.includes('vendorpn') || n === 'vpn' || n === 'pn'; }),
+        sn: colFor('sn'),
+        fornitore: colFor('mainlinename', 'fornitore', 'vendor', 'supplier'),
       };
+      if (!C.poId || !C.lineId || !C.item) {
+        alert(`CARICAMENTO BLOCCATO — colonne obbligatorie non riconosciute nel file:\n\n${!C.poId ? '• Internal ID / PO INTERNAL ID\n' : ''}${!C.lineId ? '• Line ID\n' : ''}${!C.item ? '• PNIT / Items - Item' : ''}`);
+        setLoading(false);
+        return;
+      }
+      const g = (row, col) => col ? String(row[col] ?? '').trim() : '';
 
       // Controllo righe duplicate nel file (stessa PO INTERNAL ID + Line ID): il file NON deve contenerle
       const keyCount = new Map();
       records.forEach(row => {
-        const key = `${row["PO INTERNAL ID"]}_${row["Line ID"]}`;
+        const key = `${g(row, C.poId)}_${g(row, C.lineId)}`;
         keyCount.set(key, (keyCount.get(key) || 0) + 1);
       });
       const dupKeys = [...keyCount.entries()].filter(([, n]) => n > 1);
@@ -1705,26 +1820,28 @@ export default function App() {
       }
 
       const rowsToUpsert = records.map(row => {
-        const poInternalId = row["PO INTERNAL ID"];
-        const lineId = row["Line ID"];
+        const poInternalId = g(row, C.poId);
+        const lineId = g(row, C.lineId);
         const key = `${poInternalId}_${lineId}`;
-        const chinaInvoice = row["[PAX] CHINA INVOICE"] ? row["[PAX] CHINA INVOICE"].trim() : "SENZA FATTURA (N/D)";
-        const itemCode = row["Items - Item"] ? row["Items - Item"].trim() : "N/D";
+        // CI No. presente = spedizione partita (raggruppata per invoice); assente = PO ancora aperto
+        const chinaInvoice = g(row, C.ci);
+        const itemCode = g(row, C.item) || "N/D";
 
         const base = {
           unique_key: key,
           po_internal_id: poInternalId,
           line_id: lineId,
-          po_name: row["Items - PO"] || "N/D",
-          description: row["Items - Description"] || "N/D",
-          qty_expected: parseInt(row["Items - Quantity Expected"]) || 0,
+          po_name: g(row, C.po) || "N/D",
+          description: g(row, C.desc) || "N/D",
+          qty_expected: parseInt(g(row, C.qty)) || 0,
           china_invoice: chinaInvoice,
           item_code: itemCode,
-          arrival_date: row["DATA DI ARRIVO"] || "N/D",
-          part_number: findVendorPN(row),
+          arrival_date: g(row, C.eta) || "N/D",
+          part_number: g(row, C.vpn),
+          fornitore: g(row, C.fornitore),
         };
-        // sn_required comes from the "SN" column in the CSV (Yes/Si = true, anything else = false)
-        const snValue = (row["SN"] || "").trim().toLowerCase();
+        // sn_required dalla colonna SN (Yes/Si = serializzato)
+        const snValue = g(row, C.sn).toLowerCase();
         base.sn_required = snValue === 'yes' || snValue === 'si' || snValue === 'sì';
 
         // Only set scan-state defaults for brand-new lines
@@ -2264,7 +2381,8 @@ export default function App() {
     const matchInvoice = !filterInvoice || line.china_invoice === filterInvoice;
     const matchItem = !filterItem || line.item_code === filterItem;
     const snRequired = line.sn_required == null ? true : line.sn_required;
-    const matchSN = (snRequired && filterSNYes) || (!snRequired && filterSNNo);
+    // Nessun flag selezionato = nessun filtro: mostra tutto
+    const matchSN = (!filterSNYes && !filterSNNo) || (snRequired && filterSNYes) || (!snRequired && filterSNNo);
     return matchInvoice && matchItem && matchSN;
   });
 
@@ -2274,11 +2392,20 @@ export default function App() {
   const descByCodice = {};
   anagrafica.forEach(a => { const c = String(a.codice || '').trim(); if (c && a.descrizione) descByCodice[c] = a.descrizione; });
   spareParts.forEach(p => { const c = String(p.pn || '').trim(); if (c) descByCodice[c] = p.descrizione || p.english_name || descByCodice[c] || ''; });
+  // CI No. presente = spedizione partita (si raggruppa per invoice); assente = PO ancora aperto (si raggruppa per PO)
+  const isSpedizione = (l) => {
+    const c = String(l.china_invoice || '').trim();
+    return c !== '' && c !== 'SENZA FATTURA (N/D)' && c !== 'N/D';
+  };
+  const nSpedizioni = new Set(poLines.filter(isSpedizione).map(l => l.china_invoice)).size;
+  const nPoAperti = new Set(poLines.filter(l => !isSpedizione(l)).map(l => l.po_name)).size;
+
   const invoiceGroups = {};
-  filteredLines.forEach(line => {
+  filteredLines.filter(l => arriviTab === 'po' ? !isSpedizione(l) : isSpedizione(l)).forEach(line => {
     const snRequired = line.sn_required == null ? true : line.sn_required;
-    const groupKey = `${line.china_invoice}__${snRequired ? 'yes' : 'no'}`;
-    if (!invoiceGroups[groupKey]) invoiceGroups[groupKey] = { invoice: line.china_invoice, snRequired, lines: [] };
+    const gKey = isSpedizione(line) ? line.china_invoice : (line.po_name || 'SENZA PO');
+    const groupKey = `${gKey}__${snRequired ? 'yes' : 'no'}`;
+    if (!invoiceGroups[groupKey]) invoiceGroups[groupKey] = { invoice: gKey, snRequired, spedizione: isSpedizione(line), lines: [] };
     invoiceGroups[groupKey].lines.push(line);
   });
 
@@ -2390,8 +2517,8 @@ export default function App() {
                   { id: 'arrivi', label: 'Piano Arrivi', icon: '📦' },
                   { id: 'prelievi', label: 'Prelievi', icon: '📤' },
                   { id: 'sposta-bancale', label: 'Sposta Bancale', icon: '🏭' },
-                  { id: 'stock', label: 'Inventario Spare Parts', icon: '🗄️' },
-                  { id: 'riepilogo', label: 'Riepilogo Stock', icon: '📊' },
+                  { id: 'stock', label: 'Inventario', icon: '🗄️' },
+                  { id: 'riepilogo', label: 'Stock Spare Parts', icon: '📊' },
                 ]},
                 { group: 'Repair', modules: [
                   { id: 'spare-parts', label: 'DB Spare Parts', icon: '🔧' },
@@ -2457,9 +2584,9 @@ export default function App() {
               <span>
                 {activeModule === 'arrivi' && 'Piano Arrivi'}
                 {activeModule === 'spare-parts' && 'DB Spare Parts'}
-                {activeModule === 'stock' && 'Inventario Spare Parts'}
+                {activeModule === 'stock' && 'Inventario'}
                 {activeModule === 'sposta-bancale' && 'Sposta Bancale'}
-                {activeModule === 'riepilogo' && 'Riepilogo Stock'}
+                {activeModule === 'riepilogo' && 'Stock Spare Parts'}
                 {activeModule === 'matrice' && 'Matrice PNIT × TYPE'}
                 {activeModule === 'prelievi' && 'Prelievi'}
                 {activeModule === 'anagrafica' && 'Anagrafica'}
@@ -2827,9 +2954,18 @@ export default function App() {
           });
           Object.values(spMap).forEach(v => { v.modello = [...v.modelli].join(', '); delete v.modelli; });
 
-          const noMatchCount = stockItems.filter(s => !spMap[s.codice]).length;
-          const uniqueMagazzini  = [...new Set(stockItems.map(s => s.magazzino).filter(Boolean))].sort();
-          const uniqueLocazioni  = [...new Set(stockItems.map(s => s.locazione).filter(Boolean))].sort();
+          // Cluster e Description per codice dall'anagrafica articoli
+          const clusterByCodice = {};
+          const anagDescByCodice = {};
+          anagrafica.forEach(a => { const c = String(a.codice || '').trim(); if (c) { clusterByCodice[c] = a.cluster || ''; if (a.descrizione) anagDescByCodice[c] = a.descrizione; } });
+
+          // Inventario unico: spare parts + accessori (marcati con fonte)
+          const stockSource = stockItems;
+
+          const noMatchCount = stockSource.filter(s => !spMap[s.codice]).length;
+          const uniqueMagazzini  = [...new Set(stockSource.map(s => s.magazzino).filter(Boolean))].sort();
+          const uniqueLocazioni  = [...new Set(stockSource.map(s => s.locazione).filter(Boolean))].sort();
+          const uniqueClusters   = [...new Set(stockSource.map(s => clusterByCodice[s.codice]).filter(Boolean))].sort();
 
           const toggleStockSort = (col) => {
             if (stockSortCol === col) setStockSortDir(d => d === 'asc' ? 'desc' : 'asc');
@@ -2838,8 +2974,10 @@ export default function App() {
           };
           const stockSortIcon = (col) => stockSortCol === col ? (stockSortDir === 'asc' ? ' ↑' : ' ↓') : '';
 
-          const filtered = stockItems
-            .map(s => ({ ...s, ...(spMap[s.codice] || { english_name: '', descrizione: '' }) }))
+          const filtered = stockSource
+            .map(s => ({ ...s, ...(spMap[s.codice] || { english_name: '', descrizione: '' }), cluster: clusterByCodice[s.codice] || '',
+              // Descrizione = Description dell'anagrafica (fallback su DB spare parts)
+              descrizione: anagDescByCodice[s.codice] || (spMap[s.codice]?.descrizione || spMap[s.codice]?.english_name || '') }))
             .filter(s => {
               const matchAny = (q) => !q ||
                 (s.codice || '').toLowerCase().includes(q) ||
@@ -2847,6 +2985,7 @@ export default function App() {
                 (s.descrizione || '').toLowerCase().includes(q) ||
                 (s.numero_bancale || '').toLowerCase().includes(q) ||
                 (s.modello || '').toLowerCase().includes(q) ||
+                (s.cluster || '').toLowerCase().includes(q) ||
                 (s.magazzino || '').toLowerCase().includes(q) ||
                 (s.locazione || '').toLowerCase().includes(q);
               const matchSearch = matchAny(stockSearch.toLowerCase());
@@ -2854,8 +2993,9 @@ export default function App() {
               const matchMag = !stockFilterMagazzino || s.magazzino === stockFilterMagazzino;
               const matchLoc = !stockFilterLocazione || s.locazione === stockFilterLocazione;
               const matchBancale = !stockFilterBancale || s.numero_bancale === stockFilterBancale;
+              const matchCluster = !stockFilterCluster || s.cluster === stockFilterCluster;
               const matchNoMatch = !stockFilterNoMatch || !spMap[s.codice];
-              return matchSearch && matchSearch2 && matchMag && matchLoc && matchBancale && matchNoMatch && s.stock && s.stock !== 0;
+              return matchSearch && matchSearch2 && matchMag && matchLoc && matchBancale && matchCluster && matchNoMatch && s.stock && s.stock !== 0;
             })
             .sort((a, b) => {
               const va = String(a[stockSortCol] ?? '').toLowerCase();
@@ -2871,9 +3011,9 @@ export default function App() {
             { key: 'numero_bancale', label: 'Bancale' },
             { key: 'magazzino',      label: 'Magazzino' },
             { key: 'codice',         label: 'Codice' },
+            { key: 'cluster',        label: 'Cluster' },
             { key: 'modello',        label: 'Modello' },
             { key: 'eol',            label: 'ST.' },
-            { key: 'english_name',   label: 'English Name' },
             { key: 'descrizione',    label: 'Descrizione' },
             { key: 'stock',          label: 'Stock', right: true },
             { key: 'edit',           label: '', noSort: true },
@@ -2892,11 +3032,20 @@ export default function App() {
                   <input type="file" accept=".xls,.xlsx" className="absolute inset-0 w-full h-full opacity-0 cursor-pointer" onChange={handleStockUpload} />
                 </div>
                 )}
-                <div className="flex-grow">
-                  <p className="text-xs text-gray-400">Importa il file Excel dello Stock (Foglio 2). Chiave: Codice + Magazzino + Bancale.</p>
-                  {importMeta.stock && <p className="text-[11px] text-gray-400">Ultimo aggiornamento: {new Date(importMeta.stock).toLocaleString('it-IT')}</p>}
+                {canUpload('stock') && (
+                <div className="relative flex-shrink-0">
+                  <button className="bg-teal-600 hover:bg-teal-700 text-white text-sm font-bold px-4 py-2.5 rounded-xl cursor-pointer shadow-xs transition">
+                    📥 Importa Accessori
+                  </button>
+                  <input type="file" accept=".csv,.xls,.xlsx" className="absolute inset-0 w-full h-full opacity-0 cursor-pointer" onChange={handleStockAccessoriUpload} />
                 </div>
-                {stockItems.length > 0 && (
+                )}
+                <div className="flex-grow">
+                  <p className="text-xs text-gray-400">Stock spare parts (Excel, Foglio 2: Codice+Magazzino+Bancale) e giacenze accessori (Item;Location;On Hand).</p>
+                  {importMeta.stock && <p className="text-[11px] text-gray-400">Stock: {new Date(importMeta.stock).toLocaleString('it-IT')}</p>}
+                  {importMeta.stock_accessori && <p className="text-[11px] text-gray-400">Accessori: {new Date(importMeta.stock_accessori).toLocaleString('it-IT')}</p>}
+                </div>
+                {stockSource.length > 0 && (
                   <span className="text-sm bg-blue-50 text-blue-600 font-black px-3 py-1 rounded-full border border-blue-100 shrink-0">
                     {filtered.length} record
                   </span>
@@ -2904,7 +3053,7 @@ export default function App() {
               </div>
 
               {/* Filtri */}
-              {stockItems.length > 0 && (
+              {stockSource.length > 0 && (
                 <div className="bg-white p-4 rounded-2xl border border-gray-200 shadow-xs space-y-3">
                   <span className="text-[10px] font-black text-gray-400 uppercase tracking-wider block">Filtri</span>
                   <div className="grid grid-cols-1 sm:grid-cols-4 gap-3">
@@ -2912,6 +3061,12 @@ export default function App() {
                       onChange={e => { setStockSearch(e.target.value); setStockPage(0); }}
                       placeholder="Cerca per codice, modello, nome, descrizione..."
                       className="bg-gray-50 border border-gray-300 rounded-xl p-2.5 text-xs focus:outline-hidden" />
+                    <select value={stockFilterCluster}
+                      onChange={e => { setStockFilterCluster(e.target.value); setStockPage(0); }}
+                      className="bg-gray-50 border border-gray-300 rounded-xl p-2.5 text-xs focus:outline-hidden">
+                      <option value="">Tutti i cluster ({uniqueClusters.length})</option>
+                      {uniqueClusters.map(c => <option key={c} value={c}>{c}</option>)}
+                    </select>
                     <input type="text" value={stockSearch2}
                       onChange={e => { setStockSearch2(e.target.value); setStockPage(0); }}
                       placeholder="Secondo filtro (AND)..."
@@ -2970,9 +3125,8 @@ export default function App() {
                       <button onClick={() => {
                         const rows = filtered.map(s => ({
                           'Locazione': s.locazione, 'Bancale': s.numero_bancale,
-                          'Magazzino': s.magazzino, 'Codice': s.codice,
-                          'English Name': s.english_name, 'Descrizione': s.descrizione,
-                          'Stock': s.stock
+                          'Magazzino': s.magazzino, 'Codice': s.codice, 'Cluster': s.cluster,
+                          'Descrizione': s.descrizione, 'Stock': s.stock
                         }));
                         const ws = XLSX.utils.json_to_sheet(rows);
                         const wb2 = XLSX.utils.book_new();
@@ -2994,7 +3148,7 @@ export default function App() {
                         + Aggiungi riga
                       </button>
                     )}
-                    <button onClick={() => { setStockSearch(''); setStockSearch2(''); setStockFilterMagazzino(''); setStockFilterLocazione(''); setStockFilterBancale(''); setStockFilterNoMatch(false); setStockPage(0); }}
+                    <button onClick={() => { setStockSearch(''); setStockSearch2(''); setStockFilterMagazzino(''); setStockFilterLocazione(''); setStockFilterBancale(''); setStockFilterCluster(''); setStockFilterNoMatch(false); setStockPage(0); }}
                       className="text-[10px] font-bold text-gray-400 hover:text-red-600 bg-gray-50 hover:bg-red-50 border border-gray-200 hover:border-red-200 px-2.5 py-1 rounded-lg transition cursor-pointer">
                       ✕ Reset filtri
                     </button>
@@ -3007,7 +3161,7 @@ export default function App() {
 
               {/* Tabella */}
               {stockLoading && <div className="text-center py-4 text-xs font-bold text-amber-600 animate-pulse">Caricamento...</div>}
-              {!stockLoading && stockItems.length > 0 && (
+              {!stockLoading && stockSource.length > 0 && (
                 <div className="bg-white rounded-2xl border border-gray-200 shadow-xs overflow-x-auto">
                   <table className="text-left border-collapse text-[11px]" style={{ tableLayout: 'fixed', width: Object.values(stWidths).reduce((a,b) => a+b, 0) + 'px' }}>
                     <thead className="bg-gray-50 border-b border-gray-200 text-[10px] font-black text-gray-500 uppercase tracking-wider">
@@ -3038,9 +3192,9 @@ export default function App() {
                               </select>
                             </td>
                             <td className="px-2 py-1"><input className={nCls + ' font-mono font-bold text-blue-700'} value={r.codice} onChange={e => upd('codice', e.target.value)} placeholder="Codice *" /></td>
+                            <td className="px-2 py-2"></td>
                             <td className="px-2 py-2 text-gray-300 text-[10px]">nuovo</td>
                             <td className="px-1 py-2"></td>
-                            <td className="px-2 py-2"></td>
                             <td className="px-2 py-2"></td>
                             <td className="px-2 py-1 text-right"><input className={nCls + ' text-right font-mono font-black'} value={r.stock} onChange={e => upd('stock', e.target.value)} placeholder="0" /></td>
                             <td className="px-2 py-2 text-center">
@@ -3053,19 +3207,20 @@ export default function App() {
                       {filtered.slice(stockPage * 100, stockPage * 100 + 100).map((s, rowIndex) => {
                           const pending = stockPendingChanges[s.id];
                           const d = pending ? { ...s, ...pending } : s;
+                          const editable = stockEditMode;
                           const iCls = `w-full rounded px-1 py-0.5 text-xs focus:outline-none border ${pending ? 'bg-amber-50 border-amber-300' : 'bg-transparent border-transparent hover:border-gray-300 focus:border-blue-400 focus:bg-white'}`;
                           const nav = (field) => ({ 'data-rowindex': rowIndex, 'data-field': field, onKeyDown: (e) => handleStockKeyNav(e, rowIndex, field) });
                           const eolBadge = (eol) => eol ? <span className={`px-1 py-px rounded font-black text-[9px] border ${eol === 'EOL' ? 'bg-red-50 text-red-600 border-red-100' : eol === 'ALT' ? 'bg-amber-50 text-amber-700 border-amber-100' : 'bg-blue-50 text-blue-700 border-blue-100'}`}>{eol}</span> : '';
                           return (
                             <tr key={s.id} className={`transition ${pending ? 'bg-amber-50/40' : 'hover:bg-gray-50/80'}`}>
                               <td className="px-2 py-2 truncate">
-                                {stockEditMode ? <input className={iCls} value={d.locazione || ''} onChange={e => setStockFieldChange(s.id, 'locazione', e.target.value)} {...nav('locazione')} /> : s.locazione || '—'}
+                                {editable ? <input className={iCls} value={d.locazione || ''} onChange={e => setStockFieldChange(s.id, 'locazione', e.target.value)} {...nav('locazione')} /> : s.locazione || '—'}
                               </td>
                               <td className="px-2 py-2 truncate">
-                                {stockEditMode ? <input className={iCls} value={d.numero_bancale || ''} onChange={e => setStockFieldChange(s.id, 'numero_bancale', e.target.value)} {...nav('numero_bancale')} /> : s.numero_bancale || '—'}
+                                {editable ? <input className={iCls} value={d.numero_bancale || ''} onChange={e => setStockFieldChange(s.id, 'numero_bancale', e.target.value)} {...nav('numero_bancale')} /> : s.numero_bancale || '—'}
                               </td>
                               <td className="px-2 py-2 truncate">
-                                {stockEditMode ? (
+                                {editable ? (
                                   <select className={iCls} value={d.magazzino || 'GESSATE'} onChange={e => setStockFieldChange(s.id, 'magazzino', e.target.value)} {...nav('magazzino')}>
                                     <option value="GESSATE">GESSATE</option>
                                     <option value="ESPRINET">ESPRINET</option>
@@ -3073,14 +3228,14 @@ export default function App() {
                                 ) : s.magazzino || '—'}
                               </td>
                               <td className="px-2 py-2 font-mono font-bold text-blue-700 truncate">
-                                {stockEditMode ? <input className={iCls + ' font-mono font-bold text-blue-700'} value={d.codice || ''} onChange={e => setStockFieldChange(s.id, 'codice', e.target.value)} {...nav('codice')} /> : s.codice}
+                                {editable ? <input className={iCls + ' font-mono font-bold text-blue-700'} value={d.codice || ''} onChange={e => setStockFieldChange(s.id, 'codice', e.target.value)} {...nav('codice')} /> : s.codice}
                               </td>
+                              <td className="px-2 py-2 text-[10px] truncate">{s.cluster || '—'}</td>
                               <td className="px-2 py-2 font-mono font-bold text-gray-700 text-[10px] truncate">{s.modello || '—'}</td>
                               <td className="px-1 py-2 text-center">{eolBadge(s.eol)}</td>
-                              <td className="px-2 py-2 text-[10px] leading-snug">{s.english_name || '—'}</td>
                               <td className="px-2 py-2 text-[10px] leading-snug">{s.descrizione || '—'}</td>
                               <td className="px-2 py-2 text-right font-mono font-black">
-                                {stockEditMode ? <input className={iCls + ' text-right font-mono font-black'} value={d.stock ?? ''} onChange={e => setStockFieldChange(s.id, 'stock', e.target.value)} {...nav('stock')} /> : (s.stock ?? '—')}
+                                {editable ? <input className={iCls + ' text-right font-mono font-black'} value={d.stock ?? ''} onChange={e => setStockFieldChange(s.id, 'stock', e.target.value)} {...nav('stock')} /> : (s.stock ?? '—')}
                               </td>
                               <td className="px-2 py-2 text-center">
                                 {pending && (
@@ -3096,9 +3251,9 @@ export default function App() {
                 </div>
               )}
 
-              {!stockLoading && stockItems.length === 0 && (
+              {!stockLoading && stockSource.length === 0 && (
                 <div className="text-center py-20 text-gray-400 text-sm">
-                  Nessun record stock. Importa il file Excel per iniziare.
+                  Nessun record. Importa lo stock o le giacenze accessori per iniziare.
                 </div>
               )}
             </div>
@@ -3436,7 +3591,7 @@ export default function App() {
         {activeModule === 'riepilogo' && (() => {
           // Stock totale per codice
           const stockByCodice = {};
-          stockItems.forEach(s => { if (s.stock > 0) stockByCodice[s.codice] = (stockByCodice[s.codice] || 0) + s.stock; });
+          stockItems.forEach(s => { if (s.stock > 0 && s.fonte !== 'accessori') stockByCodice[s.codice] = (stockByCodice[s.codice] || 0) + s.stock; });
 
           // IN ARRIVO per codice: dal Piano Arrivi (po_lines), somma qty_expected per item_code
           const arrivoByCodice = {};
@@ -3682,7 +3837,7 @@ export default function App() {
         {activeModule === 'matrice' && (() => {
           // Stock / in arrivo / in ordine per codice
           const stockByCodice = {};
-          stockItems.forEach(s => { if (s.stock > 0) stockByCodice[s.codice] = (stockByCodice[s.codice] || 0) + s.stock; });
+          stockItems.forEach(s => { if (s.stock > 0 && s.fonte !== 'accessori') stockByCodice[s.codice] = (stockByCodice[s.codice] || 0) + s.stock; });
           const arrivoByCodice = {};
           poLines.forEach(l => {
             const cod = String(l.item_code || '').trim();
@@ -3904,7 +4059,7 @@ export default function App() {
           const list = anagrafica.filter(a => {
             if (anagCluster && (a.cluster || '').trim() !== anagCluster) return false;
             if (!q) return true;
-            return `${a.codice} ${a.descrizione} ${a.vpn} ${a.note} ${a.gruppo}`.toLowerCase().includes(q);
+            return `${a.codice} ${a.display_name} ${a.descrizione} ${a.vpn} ${a.note} ${a.gruppo}`.toLowerCase().includes(q);
           });
           const isHardware = (a) => (a.cluster || '').trim().toLowerCase() === 'hardware';
           return (
@@ -3912,7 +4067,7 @@ export default function App() {
             <div className="flex items-center justify-between flex-wrap gap-3">
               <div>
                 <h2 className="text-lg font-black text-gray-800">📇 Anagrafica Articoli</h2>
-                <p className="text-xs text-gray-500">Anagrafica completa (chiave <strong>Internal ID</strong>). Name = codice, Display Name = descrizione. Per gli item <strong>Hardware</strong> puoi specificare il <strong>Gruppo</strong>.</p>
+                <p className="text-xs text-gray-500">Anagrafica completa (chiave <strong>Internal ID</strong>). Name = codice, Display Name, Description. Per gli item <strong>Hardware</strong> puoi specificare il <strong>Gruppo</strong>.</p>
                 {importMeta.anagrafica && <p className="text-[11px] text-gray-400">Ultimo aggiornamento: {new Date(importMeta.anagrafica).toLocaleString('it-IT')}</p>}
               </div>
               <div className="flex gap-2 flex-wrap">
@@ -3946,10 +4101,11 @@ export default function App() {
 
             {!anagLoading && list.length > 0 && (
               <div className="bg-white rounded-2xl border border-gray-200 shadow-xs overflow-x-auto">
-                <table className="w-full min-w-[860px] text-left border-collapse text-xs">
+                <table className="w-full min-w-[980px] text-left border-collapse text-xs">
                   <thead className="bg-gray-50 border-b border-gray-200 text-[10px] font-black text-gray-500 uppercase tracking-wider">
                     <tr>
                       <th className="px-3 py-3">Codice</th>
+                      <th className="px-3 py-3">Display Name</th>
                       <th className="px-3 py-3">Descrizione</th>
                       <th className="px-3 py-3">Cluster</th>
                       <th className="px-3 py-3">VPN</th>
@@ -3961,7 +4117,8 @@ export default function App() {
                     {list.map(a => (
                       <tr key={a.internal_id} className="hover:bg-blue-50/50 transition">
                         <td className="px-3 py-2.5 font-mono font-bold text-blue-700">{a.codice}</td>
-                        <td className="px-3 py-2.5 text-gray-700">{a.descrizione || '—'}</td>
+                        <td className="px-3 py-2.5 text-gray-700">{a.display_name || '—'}</td>
+                        <td className="px-3 py-2.5 text-gray-600">{a.descrizione || '—'}</td>
                         <td className="px-3 py-2.5 text-gray-600">{a.cluster || '—'}</td>
                         <td className="px-3 py-2.5 font-mono text-gray-500 text-[10px]">{a.vpn || '—'}</td>
                         <td className="px-3 py-2.5 text-center">
@@ -3997,10 +4154,16 @@ export default function App() {
                   className="bg-gray-100 hover:bg-gray-200 text-gray-600 text-sm font-bold px-3 py-2.5 rounded-xl cursor-pointer transition" title="Aggiorna">
                   ↻
                 </button>
-                {prelieviList.some(p => p.stato !== 'registrato') && (
+                {prelievoTipo === 'chiamata' && prelieviList.some(p => !isWorkOrder(p) && p.stato !== 'registrato') && (
                   <button onClick={exportPrelieviRettifica}
                     className="bg-green-50 hover:bg-green-100 text-green-700 border border-green-200 text-sm font-bold px-4 py-2.5 rounded-xl cursor-pointer transition">
                     📥 Esporta rettifica
+                  </button>
+                )}
+                {prelievoTipo === 'workorder' && (
+                  <button disabled title="Formato file da definire"
+                    className="bg-gray-100 text-gray-400 border border-gray-200 text-sm font-bold px-4 py-2.5 rounded-xl cursor-not-allowed">
+                    📥 Esporta Work Order (da definire)
                   </button>
                 )}
                 <button onClick={() => { setPrelievoView('new'); setPrelievoRighe([]); setPrelievoFeedback({ text: '', type: '' }); setTimeout(() => prelievoScannerRef.current?.focus(), 100); }}
@@ -4010,11 +4173,24 @@ export default function App() {
               </div>
             </div>
 
-            {/* Sotto-schede: Attivi / Registrati */}
+            {/* Tipologia: prelievo "chiamata" (Secure Room / Repair) vs "Work Order" (trasferimento a produzione) */}
+            <div className="flex gap-1 bg-indigo-50 p-1 rounded-xl w-fit border border-indigo-100">
+              {[
+                { id: 'chiamata', label: '📞 Chiamata', n: prelieviList.filter(p => !isWorkOrder(p)).length },
+                { id: 'workorder', label: '🏭 Work Order', n: prelieviList.filter(p => isWorkOrder(p)).length },
+              ].map(t => (
+                <button key={t.id} onClick={() => setPrelievoTipo(t.id)}
+                  className={`text-xs font-bold px-4 py-2 rounded-lg cursor-pointer transition ${prelievoTipo === t.id ? 'bg-white text-indigo-800 shadow-xs' : 'text-indigo-400 hover:text-indigo-600'}`}>
+                  {t.label} <span className="ml-1 text-[10px] opacity-70">({t.n})</span>
+                </button>
+              ))}
+            </div>
+
+            {/* Sotto-schede: Attivi / Registrati (nella tipologia selezionata) */}
             <div className="flex gap-1 bg-gray-100 p-1 rounded-xl w-fit">
               {[
-                { id: 'attivi', label: 'Attivi', n: prelieviList.filter(p => p.stato !== 'registrato').length },
-                { id: 'registrati', label: 'Registrati', n: prelieviList.filter(p => p.stato === 'registrato').length },
+                { id: 'attivi', label: 'Attivi', n: prelieviList.filter(p => matchTipo(p) && p.stato !== 'registrato').length },
+                { id: 'registrati', label: 'Registrati', n: prelieviList.filter(p => matchTipo(p) && p.stato === 'registrato').length },
               ].map(t => (
                 <button key={t.id} onClick={() => setPrelievoTab(t.id)}
                   className={`text-xs font-bold px-4 py-2 rounded-lg cursor-pointer transition ${prelievoTab === t.id ? 'bg-white text-gray-800 shadow-xs' : 'text-gray-500 hover:text-gray-700'}`}>
@@ -4026,7 +4202,7 @@ export default function App() {
             {prelieviLoading && <div className="text-center py-4 text-xs font-bold text-amber-600 animate-pulse">Caricamento...</div>}
 
             {(() => {
-              const filtered = prelieviList.filter(p => prelievoTab === 'registrati' ? p.stato === 'registrato' : p.stato !== 'registrato');
+              const filtered = prelieviList.filter(p => matchTipo(p) && (prelievoTab === 'registrati' ? p.stato === 'registrato' : p.stato !== 'registrato'));
               if (prelieviLoading) return null;
               if (filtered.length === 0) return (
                 <div className="text-center py-16 text-gray-400 text-sm">
@@ -4135,8 +4311,10 @@ export default function App() {
         {/* ==================== MODULO PRELIEVI — NUOVO ==================== */}
         {activeModule === 'prelievi' && prelievoView === 'new' && (() => {
           // Mappa pn -> descrizione (precalcolata una volta)
+          // Descrizione: prima l'anagrafica articoli (Description), poi il DB spare parts
           const spDescMap = {};
           for (const p of spareParts) { if (!spDescMap[p.pn]) spDescMap[p.pn] = p.descrizione || p.english_name || ''; }
+          for (const a of anagrafica) { const c = String(a.codice || '').trim(); if (c && a.descrizione) spDescMap[c] = a.descrizione; }
           // Codici in stock, filtrati sul testo digitato (max 50 suggerimenti)
           const allStockCodici = [...new Set(stockItems.filter(s => s.stock > 0).map(s => s.codice).filter(Boolean))].sort();
           const q = prelievoManuale.codice.trim().toLowerCase();
@@ -4174,13 +4352,24 @@ export default function App() {
                   </div>
                   <div className="space-y-1">
                     <label className="block text-xs font-bold text-gray-500">Destinazione</label>
-                    <select value={prelievoDest} onChange={e => setPrelievoDest(e.target.value)}
+                    <select value={prelievoDest} onChange={e => { setPrelievoDest(e.target.value); if (e.target.value !== 'Work Order') setPrelievoWO(''); }}
                       className="w-full bg-gray-50 border border-gray-300 rounded-xl p-2.5 text-sm focus:outline-hidden">
                       <option value="">Seleziona destinazione...</option>
                       <option value="Secure Room">Secure Room</option>
                       <option value="Repair">Repair</option>
+                      <option value="Work Order">Work Order</option>
                     </select>
                   </div>
+                  {prelievoDest === 'Work Order' && (
+                    <div className="space-y-1">
+                      <label className="block text-xs font-bold text-gray-500">Work Order <span className="text-red-500">*</span> <span className="text-gray-400 font-normal">(rileva o digita)</span></label>
+                      <input value={prelievoWO} onChange={e => setPrelievoWO(e.target.value.toUpperCase().replace(/\s+/g, ''))}
+                        placeholder="Es. WO1454" autoComplete="off"
+                        className={`w-full bg-gray-50 border rounded-xl p-2.5 text-sm font-mono font-bold focus:outline-hidden ${prelievoWO && !WO_RE.test(prelievoWO) ? 'border-red-400 text-red-600' : 'border-gray-300'}`} />
+                      {!prelievoWO && <p className="text-[11px] font-bold text-red-600">Obbligatorio per i prelievi Work Order.</p>}
+                      {prelievoWO && !WO_RE.test(prelievoWO) && <p className="text-[11px] font-bold text-red-600">Formato non valido: atteso WO seguito dal numero (es. WO1454).</p>}
+                    </div>
+                  )}
                 </div>
                 <label className="flex items-center gap-2 cursor-pointer pt-1">
                   <input type="checkbox" checked={prelievoShowEsprinet} onChange={e => { setPrelievoShowEsprinet(e.target.checked); setPrelievoManuale(v => ({ ...v, stockId: '' })); }} className="w-4 h-4 accent-blue-600 cursor-pointer" />
@@ -4289,9 +4478,11 @@ export default function App() {
                   </table>
                   </div>
                   <div className="p-4 border-t border-gray-100">
-                    <button onClick={registraPrelievo} disabled={loading}
+                    <button onClick={registraPrelievo} disabled={loading || (prelievoDest === 'Work Order' && !WO_RE.test(prelievoWO.trim()))}
                       className="w-full bg-green-600 hover:bg-green-700 disabled:opacity-50 disabled:cursor-not-allowed text-white font-black p-4 rounded-xl text-base shadow-md transition cursor-pointer flex items-center justify-center gap-2">
-                      {loading ? 'Registrazione in corso…' : `✓ Registra prelievo (${prelievoRighe.length} righe — ${totalePezzi} pz)`}
+                      {loading ? 'Registrazione in corso…'
+                        : (prelievoDest === 'Work Order' && !WO_RE.test(prelievoWO.trim())) ? 'Inserisci il Work Order per registrare'
+                        : `✓ Registra prelievo (${prelievoRighe.length} righe — ${totalePezzi} pz)`}
                     </button>
                   </div>
                 </div>
@@ -4339,6 +4530,19 @@ export default function App() {
 
             {poLines.length > 0 && (
               <>
+                {/* Schede: Spedizioni (CI No. presente) vs PO ancora aperti */}
+                <div className="flex gap-1 bg-gray-100 p-1 rounded-xl w-fit">
+                  {[
+                    { id: 'spedizioni', label: '🚢 Spedizioni', n: nSpedizioni, hint: 'Merce partita, con fattura doganale (CI No.)' },
+                    { id: 'po', label: '📋 PO aperti', n: nPoAperti, hint: 'Ordini non ancora spediti (senza CI No.)' },
+                  ].map(t => (
+                    <button key={t.id} onClick={() => setArriviTab(t.id)} title={t.hint}
+                      className={`text-xs font-bold px-4 py-2 rounded-lg cursor-pointer transition ${arriviTab === t.id ? 'bg-white text-gray-800 shadow-xs' : 'text-gray-500 hover:text-gray-700'}`}>
+                      {t.label} <span className="ml-1 text-[10px] opacity-70">({t.n})</span>
+                    </button>
+                  ))}
+                </div>
+
                 {/* Filtri */}
                 <div className="bg-white p-4 rounded-2xl border border-gray-200 shadow-xs space-y-3">
                   <span className="text-[10px] font-black text-gray-400 uppercase tracking-wider block">Filtri di Visualizzazione</span>
@@ -4392,8 +4596,11 @@ export default function App() {
                       <div className="flex justify-between items-center border-b border-gray-200 pb-2">
                         <div className="flex flex-wrap items-center gap-2">
                           <span className="text-sm sm:text-base font-black text-gray-800 tracking-tight">
-                            📄 Arrivo del: {group.lines[0]?.arrival_date || '—'} — {group.invoice}
+                            {group.spedizione ? '🚢' : '📋'} {group.spedizione ? 'Arrivo del' : 'ETA'}: {group.lines[0]?.arrival_date || '—'} — {group.invoice}
                           </span>
+                          {group.lines[0]?.fornitore && (
+                            <span className="text-[10px] text-gray-400 font-semibold uppercase tracking-wider">{group.lines[0].fornitore}</span>
+                          )}
                         </div>
                         {!group.snRequired && !group.lines.every(l => l.is_user_confirmed) && (
                           <button
