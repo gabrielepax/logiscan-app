@@ -241,7 +241,6 @@ export default function App() {
   const [poLines, setPoLines] = useState([]);
   const [activeLineKey, setActiveLineKey] = useState(null);
   const [activeGroupKeys, setActiveGroupKeys] = useState([]); // righe dello stesso invoice+codice lavorate insieme
-  const [arriviTab, setArriviTab] = useState('spedizioni'); // 'spedizioni' (CI No. presente) | 'po' (PO ancora aperti)
   const [loading, setLoading] = useState(false);
 
   const [activeLine, setActiveLine] = useState(null);
@@ -1733,13 +1732,50 @@ export default function App() {
     reader.onload = async function(e) {
       const records = parseCSV(e.target.result, ',');
 
-      if (records.length === 0 || !records[0]["PO INTERNAL ID"] || !records[0]["Line ID"]) {
-        alert("Formato file non valido. Controlla la presenza delle colonne 'PO INTERNAL ID' e 'Line ID'.");
+      if (records.length === 0) { alert("File vuoto o non leggibile."); setLoading(false); return; }
+
+      // Risoluzione flessibile delle colonne (supporta le varianti dei file NetSuite)
+      const norm = s => String(s).toLowerCase().replace(/[^a-z0-9]/g, '');
+      const headers = Object.keys(records[0] || {});
+      // I candidati sono in ORDINE DI PREFERENZA: vince il primo candidato trovato,
+      // non il primo header del file (es. "PO INTERNAL ID" deve battere "Internal ID")
+      const colFor = (...cands) => {
+        for (const c of cands) {
+          const h = headers.find(x => norm(x) === c);
+          if (h) return h;
+        }
+        return undefined;
+      };
+      const C = {
+        poId: colFor('pointernalid', 'internalid'),
+        lineId: colFor('lineid'),
+        po: colFor('itemspo', 'po'),
+        item: colFor('itemsitem', 'pnit'),
+        desc: colFor('itemsdescription', 'description', 'descrizione'),
+        qty: colFor('itemsquantityexpected', 'pendingqty', 'quantita'),
+        shipment: colFor('shipmentnumber', 'spedizione'),
+        eta: colFor('datadiarrivo', 'etagessate', 'eta'),
+        ci: colFor('paxchinainvoice', 'chinainvoice', 'cino'),
+        vpn: headers.find(h => { const n = norm(h); return n.includes('vendorpartnumber') || n.includes('vendorpn') || n === 'vpn' || n === 'pn'; }),
+        sn: colFor('sn'),
+        fornitore: colFor('fornitore', 'mainlinename', 'vendor', 'supplier'),
+      };
+      if (!C.poId || !C.lineId || !C.item) {
+        alert(`CARICAMENTO BLOCCATO — colonne obbligatorie non riconosciute:\n\n${!C.poId ? '• PO INTERNAL ID\n' : ''}${!C.lineId ? '• Line ID\n' : ''}${!C.item ? '• Items - Item' : ''}`);
         setLoading(false);
         return;
       }
+      const g = (row, col) => col ? String(row[col] ?? '').trim() : '';
 
-      const newKeys = new Set(records.map(row => `${row["PO INTERNAL ID"]}_${row["Line ID"]}`));
+      // Identità di una riga d'arrivo: PO + Linea + SPEDIZIONE (la stessa linea può essere
+      // spedita in più tranche, ognuna con la sua quantità e data di arrivo)
+      const rigaKey = (row) => {
+        const base = `${g(row, C.poId)}_${g(row, C.lineId)}`;
+        const sh = g(row, C.shipment);
+        return sh ? `${base}_${sh}` : base;
+      };
+
+      const newKeys = new Set(records.map(rigaKey));
 
       const { data: existingLines } = await supabase.from('po_lines').select('unique_key, is_user_confirmed, item_code, line_id, sn_required');
       const existing = existingLines || [];
@@ -1778,35 +1814,10 @@ export default function App() {
 
       const existingKeys = new Set(existing.map(l => l.unique_key));
 
-      // Risoluzione flessibile delle colonne: supporta sia la nuova search (GMOpenPOGLOBAL) sia il vecchio file
-      const norm = s => String(s).toLowerCase().replace(/[^a-z0-9]/g, '');
-      const headers = Object.keys(records[0] || {});
-      const colFor = (...cands) => headers.find(h => cands.includes(norm(h)));
-      const C = {
-        poId: colFor('pointernalid', 'internalid'),
-        lineId: colFor('lineid'),
-        po: colFor('itemspo', 'po'),
-        item: colFor('itemsitem', 'pnit'),
-        desc: colFor('itemsdescription', 'description', 'descrizione'),
-        qty: colFor('itemsquantityexpected', 'pendingqty', 'quantita'),
-        eta: colFor('datadiarrivo', 'etagessate', 'eta'),
-        ci: colFor('paxchinainvoice', 'chinainvoice', 'cino'),
-        vpn: headers.find(h => { const n = norm(h); return n.includes('vendorpartnumber') || n.includes('vendorpn') || n === 'vpn' || n === 'pn'; }),
-        sn: colFor('sn'),
-        fornitore: colFor('mainlinename', 'fornitore', 'vendor', 'supplier'),
-      };
-      if (!C.poId || !C.lineId || !C.item) {
-        alert(`CARICAMENTO BLOCCATO — colonne obbligatorie non riconosciute nel file:\n\n${!C.poId ? '• Internal ID / PO INTERNAL ID\n' : ''}${!C.lineId ? '• Line ID\n' : ''}${!C.item ? '• PNIT / Items - Item' : ''}`);
-        setLoading(false);
-        return;
-      }
-      const g = (row, col) => col ? String(row[col] ?? '').trim() : '';
-
-      // Controllo righe duplicate nel file (stessa PO INTERNAL ID + Line ID): il file NON deve contenerle
+      // Controllo righe duplicate nel file: lo stesso PO+Linea+Spedizione NON deve comparire due volte
       const keyCount = new Map();
       records.forEach(row => {
-        const key = `${g(row, C.poId)}_${g(row, C.lineId)}`;
-        keyCount.set(key, (keyCount.get(key) || 0) + 1);
+        keyCount.set(rigaKey(row), (keyCount.get(rigaKey(row)) || 0) + 1);
       });
       const dupKeys = [...keyCount.entries()].filter(([, n]) => n > 1);
       if (dupKeys.length > 0) {
@@ -1822,9 +1833,10 @@ export default function App() {
       const rowsToUpsert = records.map(row => {
         const poInternalId = g(row, C.poId);
         const lineId = g(row, C.lineId);
-        const key = `${poInternalId}_${lineId}`;
-        // CI No. presente = spedizione partita (raggruppata per invoice); assente = PO ancora aperto
-        const chinaInvoice = g(row, C.ci);
+        const key = rigaKey(row); // PO + Linea + Spedizione
+        // L'arrivo è identificato dalla fattura doganale; se assente (fornitori senza CI)
+        // si usa il numero di spedizione, così ogni spedizione resta una scheda a sé.
+        const chinaInvoice = g(row, C.ci) || g(row, C.shipment) || "SENZA FATTURA (N/D)";
         const itemCode = g(row, C.item) || "N/D";
 
         const base = {
@@ -1835,6 +1847,7 @@ export default function App() {
           description: g(row, C.desc) || "N/D",
           qty_expected: parseInt(g(row, C.qty)) || 0,
           china_invoice: chinaInvoice,
+          shipment_number: g(row, C.shipment),
           item_code: itemCode,
           arrival_date: g(row, C.eta) || "N/D",
           part_number: g(row, C.vpn),
@@ -2392,20 +2405,12 @@ export default function App() {
   const descByCodice = {};
   anagrafica.forEach(a => { const c = String(a.codice || '').trim(); if (c && a.descrizione) descByCodice[c] = a.descrizione; });
   spareParts.forEach(p => { const c = String(p.pn || '').trim(); if (c) descByCodice[c] = p.descrizione || p.english_name || descByCodice[c] || ''; });
-  // CI No. presente = spedizione partita (si raggruppa per invoice); assente = PO ancora aperto (si raggruppa per PO)
-  const isSpedizione = (l) => {
-    const c = String(l.china_invoice || '').trim();
-    return c !== '' && c !== 'SENZA FATTURA (N/D)' && c !== 'N/D';
-  };
-  const nSpedizioni = new Set(poLines.filter(isSpedizione).map(l => l.china_invoice)).size;
-  const nPoAperti = new Set(poLines.filter(l => !isSpedizione(l)).map(l => l.po_name)).size;
-
+  // Un arrivo = una fattura doganale (o, se assente, il numero di spedizione: valorizzato all'import)
   const invoiceGroups = {};
-  filteredLines.filter(l => arriviTab === 'po' ? !isSpedizione(l) : isSpedizione(l)).forEach(line => {
+  filteredLines.forEach(line => {
     const snRequired = line.sn_required == null ? true : line.sn_required;
-    const gKey = isSpedizione(line) ? line.china_invoice : (line.po_name || 'SENZA PO');
-    const groupKey = `${gKey}__${snRequired ? 'yes' : 'no'}`;
-    if (!invoiceGroups[groupKey]) invoiceGroups[groupKey] = { invoice: gKey, snRequired, spedizione: isSpedizione(line), lines: [] };
+    const groupKey = `${line.china_invoice}__${snRequired ? 'yes' : 'no'}`;
+    if (!invoiceGroups[groupKey]) invoiceGroups[groupKey] = { invoice: line.china_invoice, snRequired, lines: [] };
     invoiceGroups[groupKey].lines.push(line);
   });
 
@@ -4530,19 +4535,6 @@ export default function App() {
 
             {poLines.length > 0 && (
               <>
-                {/* Schede: Spedizioni (CI No. presente) vs PO ancora aperti */}
-                <div className="flex gap-1 bg-gray-100 p-1 rounded-xl w-fit">
-                  {[
-                    { id: 'spedizioni', label: '🚢 Spedizioni', n: nSpedizioni, hint: 'Merce partita, con fattura doganale (CI No.)' },
-                    { id: 'po', label: '📋 PO aperti', n: nPoAperti, hint: 'Ordini non ancora spediti (senza CI No.)' },
-                  ].map(t => (
-                    <button key={t.id} onClick={() => setArriviTab(t.id)} title={t.hint}
-                      className={`text-xs font-bold px-4 py-2 rounded-lg cursor-pointer transition ${arriviTab === t.id ? 'bg-white text-gray-800 shadow-xs' : 'text-gray-500 hover:text-gray-700'}`}>
-                      {t.label} <span className="ml-1 text-[10px] opacity-70">({t.n})</span>
-                    </button>
-                  ))}
-                </div>
-
                 {/* Filtri */}
                 <div className="bg-white p-4 rounded-2xl border border-gray-200 shadow-xs space-y-3">
                   <span className="text-[10px] font-black text-gray-400 uppercase tracking-wider block">Filtri di Visualizzazione</span>
@@ -4596,8 +4588,11 @@ export default function App() {
                       <div className="flex justify-between items-center border-b border-gray-200 pb-2">
                         <div className="flex flex-wrap items-center gap-2">
                           <span className="text-sm sm:text-base font-black text-gray-800 tracking-tight">
-                            {group.spedizione ? '🚢' : '📋'} {group.spedizione ? 'Arrivo del' : 'ETA'}: {group.lines[0]?.arrival_date || '—'} — {group.invoice}
+                            📄 Arrivo del: {group.lines[0]?.arrival_date || '—'} — {group.invoice}
                           </span>
+                          {group.lines[0]?.shipment_number && group.lines[0].shipment_number !== group.invoice && (
+                            <span className="text-[10px] text-gray-400 font-semibold">Sped: <span className="font-mono text-gray-600">{group.lines[0].shipment_number}</span></span>
+                          )}
                           {group.lines[0]?.fornitore && (
                             <span className="text-[10px] text-gray-400 font-semibold uppercase tracking-wider">{group.lines[0].fornitore}</span>
                           )}
