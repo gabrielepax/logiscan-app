@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, Fragment } from 'react';
+import { useState, useEffect, useRef, useMemo, Fragment } from 'react';
 import { supabase } from './supabaseClient';
 import * as XLSX from 'xlsx';
 import { useColumnWidths } from './useColumnWidths';
@@ -15,20 +15,32 @@ const APP_MODULES = [
   { id: 'sposta-bancale', label: 'Sposta Bancale', group: 'Magazzino' },
   { id: 'stock', label: 'Inventario', group: 'Magazzino', upload: true, edit: true },
   { id: 'riepilogo', label: 'Stock Spare Parts', group: 'Magazzino' },
-  { id: 'spare-parts', label: 'DB Spare Parts', group: 'Repair', upload: true, edit: true },
-  { id: 'matrice', label: 'Matrice PNIT × TYPE', group: 'Repair', upload: true },
+  { id: 'spare-parts', label: 'Compatibilità', group: 'Repair', upload: true, edit: true },
+  { id: 'distinte-base', label: 'Distinte Base', group: 'Repair', edit: true, genera: true },
+  { id: 'matrice', label: 'MRP', group: 'Repair', upload: true },
   { id: 'anagrafica', label: 'Anagrafica', group: 'Repair', upload: true, edit: true },
 ];
 
 const SP_DEFAULT_WIDTHS = {
-  pn: 130, terminal_pn: 120, modello: 60, pnit: 80, english_name: 110,
-  descrizione: 175, type: 120, eol: 36, ref: 34, rplus: 34,
-  to_order: 36, price: 50, locked: 34, edit: 56,
+  pn: 130, terminal_pn: 120, modello: 60, pnit: 80, hwStatus: 90, displayName: 110,
+  descrizione: 175, type: 120, cl: 36, ref: 34, rplus: 34,
+  price: 60, edit: 56,
 };
 
 const STOCK_DEFAULT_WIDTHS = {
   locazione: 110, numero_bancale: 110, magazzino: 110,
   codice: 140, cluster: 100, modello: 80, eol: 40, descrizione: 300, stock: 68, edit: 60,
+};
+
+const CURRENCY_SYMBOLS = {
+  'us dollar': '$', usd: '$', dollar: '$', dollari: '$',
+  euro: '€', eur: '€',
+  'british pound': '£', gbp: '£', pound: '£', sterlina: '£',
+  'japanese yen': '¥', jpy: '¥', yen: '¥',
+};
+const currencySymbol = (valuta) => {
+  const key = String(valuta || '').trim().toLowerCase();
+  return CURRENCY_SYMBOLS[key] || valuta || '';
 };
 
 // Web Audio API — crea il contesto la prima volta che l'utente interagisce
@@ -261,12 +273,11 @@ export default function App() {
   const [spareParts, setSpareParts] = useState([]);
   const [spLoading, setSpLoading] = useState(false);
   const [spSearch, setSpSearch] = useState('');
-  const [spFilterEOL, setSpFilterEOL] = useState('');
   const [spFilterType, setSpFilterType] = useState('');
-  const [spFilterToOrder, setSpFilterToOrder] = useState('');
   const [spFilterTerminalPN, setSpFilterTerminalPN] = useState('');
-  const [spFilterRef, setSpFilterRef] = useState('');
-  const [spFilterRplus, setSpFilterRplus] = useState('');
+  const [spFilterRef, setSpFilterRef] = useState(false);
+  const [spFilterRplus, setSpFilterRplus] = useState(false);
+  const [spFilterNoMatch, setSpFilterNoMatch] = useState(false);
 
   // Stock
   const [stockItems, setStockItems] = useState([]);
@@ -283,6 +294,16 @@ export default function App() {
   const [stockSearch2, setStockSearch2] = useState('');
   const [stockPendingChanges, setStockPendingChanges] = useState({});
   const [stockNewRows, setStockNewRows] = useState([]); // righe nuove da inserire (in modalità modifica)
+
+  // Inventario: sotto-scheda Controlli (verifica giacenza vs NetSuite)
+  const [stockTab, setStockTab] = useState('inventario'); // 'inventario' | 'controlli'
+  const [stockVerifica, setStockVerifica] = useState([]); // [{codice, magazzino, qty_netsuite}]
+  const [stockVerificaLoading, setStockVerificaLoading] = useState(false);
+  const [controlliSearch, setControlliSearch] = useState('');
+  const [controlliMagazzino, setControlliMagazzino] = useState('');
+  const [controlliSoloIncongruenze, setControlliSoloIncongruenze] = useState(false);
+  const [controlliPage, setControlliPage] = useState(0);
+  const [controlliSort, setControlliSort] = useState({ col: 'delta', dir: 'desc' });
 
   // Arrivo Quantità
   const [, setArrivoQtyActive] = useState(false);
@@ -341,6 +362,7 @@ export default function App() {
   const [anagLoading, setAnagLoading] = useState(false);
   const [anagSearch, setAnagSearch] = useState('');
   const [anagCluster, setAnagCluster] = useState('');
+  const [anagPage, setAnagPage] = useState(0);
 
   // Riepilogo Stock
   const [riepSearch, setRiepSearch] = useState('');
@@ -354,6 +376,7 @@ export default function App() {
   const [ordiniLoading, setOrdiniLoading] = useState(false);
   const [importMeta, setImportMeta] = useState({}); // chiave -> updated_at ISO
   const [matriceSearch, setMatriceSearch] = useState('');
+  const [matriceSearch2, setMatriceSearch2] = useState('');
   const [matriceSort, setMatriceSort] = useState({ col: 'pnit', dir: 'asc' });
   const [mediaData, setMediaData] = useState({}); // id (pnit+type) -> consumo medio mensile
   const [nomatData, setNomatData] = useState({}); // id (pnit+type) -> NoMaterial
@@ -364,6 +387,29 @@ export default function App() {
   const [refurbPerc, setRefurbPerc] = useState(50); // % di refurbishing
   const [matriceSoloStima, setMatriceSoloStima] = useState(false);
   const [matriceSoloDaOrdinare, setMatriceSoloDaOrdinare] = useState(false);
+  const [matriceSoloSenzaPN, setMatriceSoloSenzaPN] = useState(false);
+  const [matriceFilterPaxStatus, setMatriceFilterPaxStatus] = useState('');
+  const [matricePage, setMatricePage] = useState(0);
+
+  // Distinte Base (PNIT+TYPE -> PN ufficiale da ordinare)
+  const [distinteBase, setDistinteBase] = useState([]);
+  const [dbaseLoading, setDbaseLoading] = useState(false);
+  const [dbaseSearch, setDbaseSearch] = useState('');
+  const [dbaseSearch2, setDbaseSearch2] = useState('');
+  const [dbaseSoloDaAssegnare, setDbaseSoloDaAssegnare] = useState(false);
+  const [dbaseSoloAmbigui, setDbaseSoloAmbigui] = useState(false);
+  const [dbaseNascondiNA, setDbaseNascondiNA] = useState(true);
+  const [dbaseSoloOrfane, setDbaseSoloOrfane] = useState(false);
+  const [dbaseGenerating, setDbaseGenerating] = useState(false);
+  const [dbasePage, setDbasePage] = useState(0);
+  const [dbaseTab, setDbaseTab] = useState('assegnazioni'); // 'assegnazioni' | 'tipi'
+
+  // Elenco TYPE (distinte_base_tipi): lista curata dei componenti validi, sostituisce i TYPE dedotti dal DB spare parts
+  const [dbaseTipi, setDbaseTipi] = useState([]);
+  const [dbaseTipiLoading, setDbaseTipiLoading] = useState(false);
+  const [dbaseTipiMostraInattivi, setDbaseTipiMostraInattivi] = useState(false);
+  const [dbaseTipiSearch, setDbaseTipiSearch] = useState('');
+  const [dbaseNuovoTipo, setDbaseNuovoTipo] = useState('');
 
   const scannerInputRef = useRef(null);
 
@@ -377,6 +423,9 @@ export default function App() {
     fetchMedia();
     fetchNomat();
     fetchRefurb();
+    fetchDistinteBase();
+    fetchDistinteBaseTipi();
+    fetchStockVerifica();
     fetchImportMeta();
     // eslint-disable-next-line react-hooks/set-state-in-effect
     fetchPermessi();
@@ -552,6 +601,7 @@ export default function App() {
       const cNote = colFor('paxnotes', 'notes', 'note');
       const cPrice = colFor('vendorprice', 'price', 'prezzo');
       const cCur = colFor('vendorpricecurrency', 'currency', 'valuta');
+      const cStatus = colFor('paxstatus', 'status', 'stato');
       if (!cId || !cName) {
         alert("Colonne obbligatorie mancanti: servono 'Internal ID' e 'Name'.");
         setAnagLoading(false);
@@ -584,6 +634,7 @@ export default function App() {
           note: g(r, cNote),
           prezzo: cPrice ? toNum(r[cPrice]) : 0,
           valuta: g(r, cCur),
+          pax_status: g(r, cStatus),
           gruppo: gruppoPrev[id] || '',
           updated_at: new Date().toISOString(),
         };
@@ -616,7 +667,8 @@ export default function App() {
       let rows;
       try {
         const wb = XLSX.read(e.target.result, { type: 'array' });
-        const ws = wb.Sheets[wb.SheetNames[0]];
+        // Il file ufficiale ha più fogli (In Arrivo, Spare POT, BOM...): i dati sono nel foglio "Elenco spare parts".
+        const ws = wb.Sheets['Elenco spare parts'] || wb.Sheets[wb.SheetNames[0]];
         rows = XLSX.utils.sheet_to_json(ws, { defval: '' });
       } catch {
         alert("Errore: impossibile leggere il file Excel.");
@@ -638,22 +690,20 @@ export default function App() {
           seen.add(key);
           return true;
         })
-        .map(r => ({
-          pn:          String(r['PN'] || '').trim(),
-          terminal_pn:  String(r['Terminal PN'] || '').trim(),
-          eol:          String(r['EOL'] || '').trim(),
-          english_name: String(r['English name'] || '').trim(),
-          type:         String(r['TYPE'] || '').trim(),
-          to_order:     String(r['TO ORDER'] || '').trim(),
-          qty:          parseFloat(r['Qty.']) || 0,
-          descrizione:  String(r['DESCRIZIONE'] || '').trim(),
-          pnit:         String(r['PNIT'] || '').trim(),
-          ref:          String(r['REF'] || '').trim(),
-          rplus:        String(r['RPLUS'] || '').trim(),
-          price:        parseFloat(r['$']) || 0,
-          locked: (['EOL','CLI'].includes(String(r['EOL']||'').trim()) || String(r['TO ORDER']||'').trim() === 'NO' || String(r['TYPE']||'').trim() === 'NO') ? 'Y' : '',
-          modified_by:  currentUser || 'import',
-        }));
+        .map(r => {
+          const pnit = String(r['PNIT'] || '').trim();
+          const type = String(r['TYPE'] || '').trim();
+          // Compatibilità è solo anagrafica tecnica: si importano solo PN, Terminal PN, PNIT, TYPE.
+          // Tutto il resto (stato hardware, display name, descrizione, CL, REF, R+, prezzo) è ereditato
+          // da Anagrafica/Elenco TYPE e non viene più letto dal file.
+          return {
+            pn:          String(r['PN'] || '').trim(),
+            terminal_pn:  String(r['Terminal PN'] || '').trim(),
+            pnit, type,
+            codice: [pnit, type].filter(Boolean).join(''),
+            modified_by:  currentUser || 'import',
+          };
+        });
 
       const { error } = await supabase.from('spare_parts').upsert(toUpsert, { onConflict: 'pn,terminal_pn' });
       if (error) { alert("Errore salvataggio: " + error.message); }
@@ -680,41 +730,28 @@ export default function App() {
     if (!entries.length && validNewRows.length === 0) return;
     setSpLoading(true);
     const errors = [];
-    const calc = (m) => {
-      const pnit = (m.pnit || '').trim();
-      const type = (m.type || '').trim();
-      const eol = (m.eol || '').trim();
-      const to_order = (m.to_order || '').trim();
-      return {
-        pnit, type, eol, to_order,
-        codice: [pnit, type].filter(Boolean).join(''),
-        locked: (eol === 'EOL' || eol === 'CLI' || to_order === 'NO' || type === 'NO') ? 'Y' : '',
-      };
-    };
+    // Compatibilità è solo anagrafica tecnica: si modificano solo PNIT e TYPE (PN/Terminal PN sono la chiave,
+    // impostabile solo in inserimento). Tutto il resto è ereditato da Anagrafica/Elenco TYPE, non più scritto qui.
+    const calcCodice = (pnit, type) => [pnit, type].filter(Boolean).join('');
 
     // 1. Aggiornamenti righe esistenti
     for (const [rowKey, changes] of entries) {
       const original = spareParts.find(p => `${p.pn}_${p.terminal_pn}` === rowKey);
-      const merged = { ...original, ...changes };
-      const c = calc(merged);
+      const pnit = (changes.pnit ?? original.pnit ?? '').trim();
+      const type = (changes.type ?? original.type ?? '').trim();
       const { error } = await supabase.from('spare_parts').update({
-        eol: c.eol, english_name: merged.english_name, type: c.type, to_order: c.to_order,
-        qty: parseFloat(merged.qty) || 0, descrizione: merged.descrizione,
-        pnit: c.pnit, ref: merged.ref, rplus: merged.rplus,
-        price: parseFloat(merged.price) || 0, locked: c.locked, codice: c.codice, modified_by: user,
+        pnit, type, codice: calcCodice(pnit, type), modified_by: user,
       }).eq('pn', original.pn).eq('terminal_pn', original.terminal_pn);
       if (error) errors.push(error.message);
     }
 
     // 2. Inserimento righe nuove
     const toInsert = validNewRows.map(r => {
-      const c = calc(r);
+      const pnit = (r.pnit || '').trim();
+      const type = (r.type || '').trim();
       return {
         pn: r.pn.trim(), terminal_pn: r.terminal_pn.trim(),
-        eol: c.eol, english_name: (r.english_name || '').trim(), type: c.type, to_order: c.to_order,
-        qty: 0, descrizione: (r.descrizione || '').trim(), pnit: c.pnit,
-        ref: r.ref || '', rplus: r.rplus || '', price: parseFloat(r.price) || 0,
-        locked: c.locked, codice: c.codice, modified_by: user,
+        pnit, type, codice: calcCodice(pnit, type), modified_by: user,
       };
     });
     if (toInsert.length > 0) {
@@ -891,6 +928,80 @@ export default function App() {
       if (insErr) { alert("Errore salvataggio: " + insErr.message); }
       else { await fetchStock(); await recordImportMeta('stock_accessori'); alert(`${toInsert.length} giacenze accessori caricate.`); }
       setStockLoading(false);
+    };
+    reader.readAsArrayBuffer(file);
+  }
+
+  // ===== Controlli Inventario: verifica giacenza vs NetSuite (Item, LOCATION, Sum of On Hand) =====
+  async function fetchStockVerifica() {
+    setStockVerificaLoading(true);
+    const pageSize = 1000;
+    let all = [];
+    let from = 0;
+    while (true) {
+      const { data, error } = await supabase.from('stock_verifica').select('*').order('codice', { ascending: true }).range(from, from + pageSize - 1);
+      if (error) break;
+      all = [...all, ...(data || [])];
+      if (!data || data.length < pageSize) break;
+      from += pageSize;
+    }
+    setStockVerifica(all);
+    setStockVerificaLoading(false);
+  }
+
+  async function handleStockVerificaUpload(event) {
+    const file = event.target.files[0];
+    if (!file) return;
+    event.target.value = '';
+    setStockVerificaLoading(true);
+
+    const reader = new FileReader();
+    reader.onload = async function(e) {
+      let rows;
+      try {
+        const wb = XLSX.read(e.target.result, { type: 'array' });
+        const ws = wb.Sheets[wb.SheetNames[0]];
+        rows = XLSX.utils.sheet_to_json(ws, { defval: '', blankrows: false, raw: false });
+      } catch { alert("Errore: impossibile leggere il file."); setStockVerificaLoading(false); return; }
+      if (rows.length === 0) { alert("File vuoto."); setStockVerificaLoading(false); return; }
+
+      const norm = s => String(s).toLowerCase().replace(/[^a-z0-9]/g, '');
+      const cols = Object.keys(rows[0]);
+      const colFor = (...cands) => cols.find(k => cands.includes(norm(k)));
+      const cItem = colFor('item', 'codice');
+      const cLoc = colFor('location', 'magazzino', 'locazione');
+      const cQty = colFor('sumofonhand', 'onhand', 'quantita');
+      if (!cItem || !cLoc || !cQty) {
+        alert("Colonne mancanti: servono 'Item', 'LOCATION' e 'Sum of On Hand'.");
+        setStockVerificaLoading(false);
+        return;
+      }
+      const toNum = v => parseFloat(String(v || '').replace(/[^0-9.-]/g, '')) || 0;
+
+      // La riga di totale ("Overall Total") non ha LOCATION: viene scartata qui
+      const agg = new Map();
+      rows.forEach(r => {
+        const codice = String(r[cItem] || '').trim();
+        const magazzino = String(r[cLoc] || '').trim().toUpperCase();
+        if (!codice || !magazzino) return;
+        const key = `${codice}__${magazzino}`;
+        agg.set(key, { codice, magazzino, qty_netsuite: (agg.get(key)?.qty_netsuite || 0) + toNum(r[cQty]) });
+      });
+      const nowIso = new Date().toISOString();
+      const toInsert = [...agg.values()].map(v => ({ ...v, updated_at: nowIso, updated_by: currentUser || 'import' }));
+      if (toInsert.length === 0) { alert("Nessuna riga valida."); setStockVerificaLoading(false); return; }
+
+      // Snapshot completo: sostituisce l'intera tabella ad ogni caricamento
+      const { error: delErr } = await supabase.from('stock_verifica').delete().gte('codice', '');
+      if (delErr) { alert("Errore svuotamento: " + delErr.message); setStockVerificaLoading(false); return; }
+      let insErr = null;
+      for (let i = 0; i < toInsert.length; i += 500) {
+        const { error } = await supabase.from('stock_verifica').insert(toInsert.slice(i, i + 500));
+        if (error) { insErr = error; break; }
+      }
+      if (insErr) { alert("Errore salvataggio: " + insErr.message); }
+      else { await fetchStockVerifica(); await recordImportMeta('stock_verifica'); alert(`${toInsert.length} righe di verifica caricate.`); }
+      setStockVerificaLoading(false);
     };
     reader.readAsArrayBuffer(file);
   }
@@ -1134,6 +1245,331 @@ export default function App() {
     reader.readAsArrayBuffer(file);
   }
 
+  // ===== Distinte Base: PN ufficiale da ordinare per combinazione PNIT+TYPE =====
+  async function fetchDistinteBase() {
+    setDbaseLoading(true);
+    const pageSize = 1000;
+    let all = [];
+    let from = 0;
+    while (true) {
+      const { data, error } = await supabase.from('distinte_base').select('*').order('pnit', { ascending: true }).range(from, from + pageSize - 1);
+      if (error) break;
+      all = [...all, ...(data || [])];
+      if (!data || data.length < pageSize) break;
+      from += pageSize;
+    }
+    setDistinteBase(all);
+    setDbaseLoading(false);
+  }
+
+  // ===== Elenco TYPE (distinte_base_tipi): lista curata dei componenti validi, sotto-scheda di Distinte Base =====
+  async function fetchDistinteBaseTipi() {
+    setDbaseTipiLoading(true);
+    const pageSize = 1000;
+    let all = [];
+    let from = 0;
+    while (true) {
+      const { data, error } = await supabase.from('distinte_base_tipi').select('*').order('type', { ascending: true }).range(from, from + pageSize - 1);
+      if (error) break;
+      all = [...all, ...(data || [])];
+      if (!data || data.length < pageSize) break;
+      from += pageSize;
+    }
+    setDbaseTipi(all);
+    setDbaseTipiLoading(false);
+  }
+
+  // Aggiunge all'elenco i TYPE presenti in Compatibilità ma non ancora catalogati, e aggiorna REF/R+
+  // anche sui TYPE già presenti quando Compatibilità suggerisce un flag non ancora impostato.
+  // REF e R+ vengono dedotti dalle righe di Compatibilità con quel TYPE: basta che una sola riga abbia il flag
+  // per marcare l'intero TYPE (in caso di dubbio/valori misti, si flagga per eccesso di cautela).
+  // L'aggiornamento sui TYPE esistenti è solo "in avanti" (false -> true): non declassa mai un flag già impostato.
+  async function handleGeneraTipiDaSpareParts() {
+    setDbaseTipiLoading(true);
+    const byType = new Map(dbaseTipi.map(t => [t.type, t]));
+    const found = new Map(); // type -> { ref, rplus }
+    spareParts.forEach(p => {
+      const type = (p.type || '').trim();
+      if (!type || type.toUpperCase() === 'NO') return;
+      if (!found.has(type)) found.set(type, { ref: false, rplus: false });
+      const info = found.get(type);
+      if ((p.ref || '').trim().toUpperCase() === 'X') info.ref = true;
+      if ((p.rplus || '').trim().toUpperCase() === 'X') info.rplus = true;
+    });
+    const nowIso = new Date().toISOString();
+
+    const toInsert = [...found.entries()].filter(([type]) => !byType.has(type))
+      .map(([type, info]) => ({ type, attivo: true, ref: info.ref, rplus: info.rplus, updated_at: nowIso, updated_by: currentUser || 'auto' }));
+
+    const toUpdate = [...found.entries()]
+      .filter(([type, info]) => {
+        const existing = byType.get(type);
+        return existing && ((info.ref && !existing.ref) || (info.rplus && !existing.rplus));
+      })
+      .map(([type, info]) => {
+        const existing = byType.get(type);
+        return { type, ref: info.ref || !!existing.ref, rplus: info.rplus || !!existing.rplus };
+      });
+
+    if (toInsert.length === 0 && toUpdate.length === 0) {
+      alert('Nessun nuovo SPARE o aggiornamento REF/R+ trovato in Compatibilità.');
+      setDbaseTipiLoading(false);
+      return;
+    }
+
+    let err = null;
+    if (toInsert.length > 0) {
+      const { error } = await supabase.from('distinte_base_tipi').insert(toInsert);
+      if (error) err = error;
+    }
+    if (!err) {
+      for (const u of toUpdate) {
+        const { error } = await supabase.from('distinte_base_tipi')
+          .update({ ref: u.ref, rplus: u.rplus, updated_at: nowIso, updated_by: currentUser || 'auto' })
+          .eq('type', u.type);
+        if (error) { err = error; break; }
+      }
+    }
+    if (err) alert('Errore salvataggio: ' + err.message);
+    else {
+      await fetchDistinteBaseTipi();
+      const parti = [];
+      if (toInsert.length > 0) parti.push(`${toInsert.length} nuovi SPARE aggiunti`);
+      if (toUpdate.length > 0) parti.push(`${toUpdate.length} SPARE aggiornati (REF/R+)`);
+      alert(parti.join(', ') + '.');
+    }
+    setDbaseTipiLoading(false);
+  }
+
+  async function addDistinteBaseTipo() {
+    const type = dbaseNuovoTipo.trim();
+    if (!type) return;
+    if (type.toUpperCase() === 'NO') { alert('SPARE "NO" non è ammesso: indica assenza di componente.'); return; }
+    if (dbaseTipi.some(t => t.type.toLowerCase() === type.toLowerCase())) { alert('Questo TYPE è già presente in elenco.'); return; }
+    const { error } = await supabase.from('distinte_base_tipi').insert({ type, attivo: true, updated_at: new Date().toISOString(), updated_by: currentUser || '' });
+    if (error) { alert('Errore salvataggio: ' + error.message); return; }
+    setDbaseNuovoTipo('');
+    await fetchDistinteBaseTipi();
+  }
+
+  // field: 'attivo' | 'ref' | 'rplus'
+  async function setDistinteBaseTipoFlag(type, field, value) {
+    setDbaseTipi(prev => prev.map(t => t.type === type ? { ...t, [field]: value } : t));
+    const { error } = await supabase.from('distinte_base_tipi').update({ [field]: value, updated_at: new Date().toISOString(), updated_by: currentUser || '' }).eq('type', type);
+    if (error) { alert('Errore salvataggio: ' + error.message); fetchDistinteBaseTipi(); }
+  }
+
+  // Incrocio Hardware (da Anagrafica) × TYPE (dall'elenco curato in distinte_base_tipi):
+  // ogni codice hardware deve avere una riga per ciascun TYPE attivo, con i PN ordinabili (candidati) trovati per quella combinazione.
+  // Memoizzato: è un incrocio potenzialmente grande (centinaia di hardware × decine di type), va ricalcolato
+  // solo quando cambiano i dati sorgente, non ad ogni digitazione nei filtri o cambio di modulo attivo.
+  const dbaseComboMap = useMemo(() => {
+    const hwCodici = new Set(
+      anagrafica
+        .filter(a => (a.cluster || '').trim().toLowerCase() === 'hardware')
+        .filter(a => (a.pax_status || '').trim().toUpperCase() !== 'TESTING')
+        .map(a => (a.codice || '').trim())
+        .filter(Boolean)
+    );
+    const types = dbaseTipi.filter(t => t.attivo !== false).map(t => (t.type || '').trim()).filter(Boolean);
+    const orderableByKey = {};
+    const anyRefByKey = new Set(); // combinazioni per cui esiste almeno una riga in Compatibilità
+    spareParts.forEach(p => {
+      const pnit = (p.pnit || '').trim();
+      const type = (p.type || '').trim();
+      const pn = (p.pn || '').trim();
+      if (!type || !pn) return;
+      if (type.toUpperCase() === 'NO') return; // TYPE=NO non è un componente reale, va escluso dalla distinta
+      if (!pnit) return;
+      const key = `${pnit}||${type}`;
+      anyRefByKey.add(key);
+      // Il "locked" non vive più a livello di singolo PN in Compatibilità: ora si blocca
+      // l'intera combinazione PNIT+TYPE in Distinte Base, quindi tutti i PN trovati sono candidati.
+      if (!orderableByKey[key]) orderableByKey[key] = new Set();
+      orderableByKey[key].add(pn);
+    });
+    const comboMap = {};
+    hwCodici.forEach(pnit => {
+      types.forEach(type => {
+        const key = `${pnit}||${type}`;
+        comboMap[key] = { pnit, type, orderable: orderableByKey[key] || new Set(), hasAnyRef: anyRefByKey.has(key) };
+      });
+    });
+    return comboMap;
+  }, [anagrafica, spareParts, dbaseTipi]);
+
+  // Righe complete (combo + eventuale riga salvata in distinte_base) con stato derivato.
+  // Memoizzato separatamente: dipende solo da dbaseComboMap e distinteBase, non dai filtri di ricerca/UI.
+  const dbaseRows = useMemo(() => {
+    const typeFlagsByType = {};
+    dbaseTipi.forEach(t => { typeFlagsByType[t.type] = { ref: !!t.ref, rplus: !!t.rplus }; });
+
+    const dbaseMap = {};
+    distinteBase.forEach(r => { if ((r.type || '').trim().toUpperCase() !== 'NO') dbaseMap[`${r.pnit}||${r.type}`] = r; });
+    const keys = new Set([...Object.keys(dbaseComboMap), ...Object.keys(dbaseMap)]);
+    return [...keys].map(key => {
+      const combo = dbaseComboMap[key];
+      const saved = dbaseMap[key];
+      const pnit = combo?.pnit || saved?.pnit || '';
+      const type = combo?.type || saved?.type || '';
+      const candidati = combo ? [...combo.orderable].sort() : [];
+      const pnUfficiale = saved?.pn_ufficiale || '';
+      const isNA = !!saved?.n_a;
+      const locked = !!saved?.locked;
+      // REF/R+ ereditati dal TYPE (Elenco TYPE) + eventuale override manuale per questo specifico PNIT
+      // (solo additivo: aggiunge REF/R+ per una combinazione specifica, non toglie mai quello ereditato dal TYPE).
+      const typeFlags = typeFlagsByType[type];
+      const refOverride = !!saved?.ref_override;
+      const rplusOverride = !!saved?.rplus_override;
+      const refFromType = !!typeFlags?.ref;
+      const rplusFromType = !!typeFlags?.rplus;
+      const refEffective = refFromType || refOverride;
+      const rplusEffective = rplusFromType || rplusOverride;
+      // Orfana: riga salvata in distinte_base il cui codice hardware o TYPE non esiste più nell'incrocio corrente
+      // (hardware rinominato/rimosso/andato in TESTING, oppure TYPE rinominato/sparito dal DB spare parts).
+      const isOrphan = !combo && !!saved;
+      let stato;
+      if (isOrphan) stato = 'orfano';
+      else if (isNA) stato = 'na';
+      else if (pnUfficiale) stato = (candidati.length > 0 && !candidati.includes(pnUfficiale)) ? 'non_valido' : 'assegnato';
+      else stato = candidati.length > 1 ? 'ambiguo' : 'non_assegnato';
+      return {
+        pnit, type, candidati, pnUfficiale, isNA, isOrphan, locked, stato,
+        refFromType, rplusFromType, refOverride, rplusOverride, refEffective, rplusEffective,
+        updatedAt: saved?.updated_at, updatedBy: saved?.updated_by,
+      };
+    });
+  }, [dbaseComboMap, distinteBase, dbaseTipi]);
+
+  // Genera/aggiorna in distinte_base:
+  // - combinazioni MAI generate: assegna il PN se c'è un solo candidato ordinabile, altrimenti marca N/A
+  //   se non esiste proprio nessun riferimento di quel TYPE nel DB spare parts per quell'hardware;
+  // - righe GIÀ ESISTENTI ma senza un PN ufficiale (comprese quelle marcate NON SERVE): se ora c'è
+  //   esattamente un candidato, lo assegna e toglie il flag NON SERVE.
+  // Non tocca MAI una riga che ha già un PN ufficiale assegnato (nessuna sovrascrittura di scelte manuali).
+  async function handleGeneraDistinteBase() {
+    setDbaseGenerating(true);
+    const comboMap = dbaseComboMap;
+    const existingByKey = {};
+    distinteBase.forEach(r => { existingByKey[`${r.pnit}||${r.type}`] = r; });
+    const nowIso = new Date().toISOString();
+
+    let nAssegnateNuove = 0, nMarcateNA = 0, nRiassegnate = 0;
+    const toUpsert = [];
+    Object.values(comboMap).forEach(c => {
+      const key = `${c.pnit}||${c.type}`;
+      const saved = existingByKey[key];
+      if (!saved) {
+        if (c.orderable.size === 1) {
+          toUpsert.push({ pnit: c.pnit, type: c.type, pn_ufficiale: [...c.orderable][0], n_a: false, updated_at: nowIso, updated_by: currentUser || 'auto' });
+          nAssegnateNuove++;
+        } else if (!c.hasAnyRef) {
+          toUpsert.push({ pnit: c.pnit, type: c.type, n_a: true, updated_at: nowIso, updated_by: currentUser || 'auto' });
+          nMarcateNA++;
+        }
+        return;
+      }
+      if (saved.pn_ufficiale) return; // già assegnata: non si tocca mai
+      if (c.orderable.size === 1) {
+        toUpsert.push({ pnit: c.pnit, type: c.type, pn_ufficiale: [...c.orderable][0], n_a: false, updated_at: nowIso, updated_by: currentUser || 'auto' });
+        nRiassegnate++;
+      }
+    });
+
+    if (toUpsert.length === 0) {
+      alert('Nessuna combinazione da assegnare, riassegnare o marcare NON SERVE automaticamente.');
+      setDbaseGenerating(false);
+      return;
+    }
+    let upErr = null;
+    for (let i = 0; i < toUpsert.length; i += 500) {
+      const { error } = await supabase.from('distinte_base').upsert(toUpsert.slice(i, i + 500), { onConflict: 'pnit,type' });
+      if (error) { upErr = error; break; }
+    }
+    if (upErr) { alert('Errore salvataggio: ' + upErr.message); }
+    else {
+      await fetchDistinteBase();
+      await recordImportMeta('distinte_base');
+      const parti = [];
+      if (nAssegnateNuove > 0) parti.push(`${nAssegnateNuove} nuove assegnate`);
+      if (nMarcateNA > 0) parti.push(`${nMarcateNA} marcate NON SERVE`);
+      if (nRiassegnate > 0) parti.push(`${nRiassegnate} righe esistenti completate (uscite da NON SERVE o rimaste vuote)`);
+      alert(parti.join(', ') + '.');
+    }
+    setDbaseGenerating(false);
+  }
+
+  async function setDistinteBasePn(pnit, type, pn_ufficiale) {
+    const nowIso = new Date().toISOString();
+    const isNewRow = !distinteBase.some(r => r.pnit === pnit && r.type === type);
+    setDistinteBase(prev => {
+      const key = `${pnit}||${type}`;
+      const idx = prev.findIndex(r => `${r.pnit}||${r.type}` === key);
+      const row = { pnit, type, pn_ufficiale, updated_at: nowIso, updated_by: currentUser || '' };
+      if (idx === -1) return [...prev, { ...row, n_a: false }];
+      const next = [...prev];
+      next[idx] = { ...next[idx], ...row };
+      return next;
+    });
+    const payload = { pnit, type, pn_ufficiale, updated_at: nowIso, updated_by: currentUser || '' };
+    if (isNewRow) payload.n_a = false; // colonna NOT NULL: va specificata esplicitamente in inserimento
+    const { error } = await supabase.from('distinte_base').upsert(payload, { onConflict: 'pnit,type' });
+    if (error) { alert('Errore salvataggio: ' + error.message); fetchDistinteBase(); }
+  }
+
+  async function setDistinteBaseNA(pnit, type, n_a) {
+    const nowIso = new Date().toISOString();
+    setDistinteBase(prev => {
+      const key = `${pnit}||${type}`;
+      const idx = prev.findIndex(r => `${r.pnit}||${r.type}` === key);
+      if (idx === -1) return [...prev, { pnit, type, n_a, pn_ufficiale: null, updated_at: nowIso, updated_by: currentUser || '' }];
+      const next = [...prev];
+      next[idx] = { ...next[idx], n_a, updated_at: nowIso, updated_by: currentUser || '' };
+      return next;
+    });
+    const { error } = await supabase.from('distinte_base').upsert(
+      { pnit, type, n_a, updated_at: nowIso, updated_by: currentUser || '' },
+      { onConflict: 'pnit,type' }
+    );
+    if (error) { alert('Errore salvataggio: ' + error.message); fetchDistinteBase(); }
+  }
+
+  // Blocca/sblocca la combinazione PNIT+TYPE: quando bloccata, MRP forza "da ordinare" a 0.
+  async function setDistinteBaseLocked(pnit, type, locked) {
+    const nowIso = new Date().toISOString();
+    const isNewRow = !distinteBase.some(r => r.pnit === pnit && r.type === type);
+    setDistinteBase(prev => {
+      const key = `${pnit}||${type}`;
+      const idx = prev.findIndex(r => `${r.pnit}||${r.type}` === key);
+      if (idx === -1) return [...prev, { pnit, type, locked, n_a: false, pn_ufficiale: null, updated_at: nowIso, updated_by: currentUser || '' }];
+      const next = [...prev];
+      next[idx] = { ...next[idx], locked, updated_at: nowIso, updated_by: currentUser || '' };
+      return next;
+    });
+    const payload = { pnit, type, locked, updated_at: nowIso, updated_by: currentUser || '' };
+    if (isNewRow) payload.n_a = false; // colonna NOT NULL: va specificata esplicitamente in inserimento
+    const { error } = await supabase.from('distinte_base').upsert(payload, { onConflict: 'pnit,type' });
+    if (error) { alert('Errore salvataggio: ' + error.message); fetchDistinteBase(); }
+  }
+
+  // Aggiunge (solo additivo, mai toglie) un flag REF/R+ specifico per una combinazione PNIT+SPARE,
+  // indipendente dal flag globale del TYPE in Elenco TYPE. field: 'ref_override' | 'rplus_override'.
+  async function setDistinteBaseOverride(pnit, type, field, value) {
+    const nowIso = new Date().toISOString();
+    const isNewRow = !distinteBase.some(r => r.pnit === pnit && r.type === type);
+    setDistinteBase(prev => {
+      const key = `${pnit}||${type}`;
+      const idx = prev.findIndex(r => `${r.pnit}||${r.type}` === key);
+      if (idx === -1) return [...prev, { pnit, type, [field]: value, n_a: false, pn_ufficiale: null, updated_at: nowIso, updated_by: currentUser || '' }];
+      const next = [...prev];
+      next[idx] = { ...next[idx], [field]: value, updated_at: nowIso, updated_by: currentUser || '' };
+      return next;
+    });
+    const payload = { pnit, type, [field]: value, updated_at: nowIso, updated_by: currentUser || '' };
+    if (isNewRow) payload.n_a = false; // colonna NOT NULL: va specificata esplicitamente in inserimento
+    const { error } = await supabase.from('distinte_base').upsert(payload, { onConflict: 'pnit,type' });
+    if (error) { alert('Errore salvataggio: ' + error.message); fetchDistinteBase(); }
+  }
 
   function setStockFieldChange(id, field, value) {
     setStockPendingChanges(prev => ({
@@ -2421,6 +2857,7 @@ export default function App() {
   const canRead = (mod) => mod === 'utenti' ? isAdmin : (isAdmin || hasPerm(mod));
   const canUpload = (mod) => isAdmin || hasPerm(`${mod}:upload`); // caricamenti Excel/CSV per modulo
   const canEdit = (mod) => isAdmin || hasPerm(`${mod}:edit`);     // pulsante Modifica per modulo
+  const canGenera = (mod) => isAdmin || hasPerm(`${mod}:genera`); // pulsante "Genera da Compatibilità" per modulo
   const isSper = (mod) => moduliSper.has(mod);                    // modulo sperimentale (SP)
 
   // Se il modulo attivo non è accessibile col ruolo corrente, spostati sul primo consentito
@@ -2526,8 +2963,9 @@ export default function App() {
                   { id: 'riepilogo', label: 'Stock Spare Parts', icon: '📊' },
                 ]},
                 { group: 'Repair', modules: [
-                  { id: 'spare-parts', label: 'DB Spare Parts', icon: '🔧' },
-                  { id: 'matrice', label: 'Matrice PNIT × TYPE', icon: '🧮' },
+                  { id: 'spare-parts', label: 'Compatibilità', icon: '🔧' },
+                  { id: 'distinte-base', label: 'Distinte Base', icon: '📋' },
+                  { id: 'matrice', label: 'MRP', icon: '🧮' },
                   { id: 'anagrafica', label: 'Anagrafica', icon: '📇' },
                 ]},
                 { group: 'Impostazioni', adminOnly: true, modules: [
@@ -2588,11 +3026,12 @@ export default function App() {
             <h1 className="text-xl sm:text-2xl font-black tracking-tight text-gray-800 uppercase tracking-widest flex items-center gap-2">
               <span>
                 {activeModule === 'arrivi' && 'Piano Arrivi'}
-                {activeModule === 'spare-parts' && 'DB Spare Parts'}
+                {activeModule === 'spare-parts' && 'Compatibilità'}
                 {activeModule === 'stock' && 'Inventario'}
                 {activeModule === 'sposta-bancale' && 'Sposta Bancale'}
                 {activeModule === 'riepilogo' && 'Stock Spare Parts'}
-                {activeModule === 'matrice' && 'Matrice PNIT × TYPE'}
+                {activeModule === 'matrice' && 'MRP'}
+                {activeModule === 'distinte-base' && 'Distinte Base'}
                 {activeModule === 'prelievi' && 'Prelievi'}
                 {activeModule === 'anagrafica' && 'Anagrafica'}
                 {activeModule === 'utenti' && 'Utenti / Ruoli'}
@@ -2625,13 +3064,64 @@ export default function App() {
           </div>
         )}
 
-        {/* ==================== MODULO DB SPARE PARTS ==================== */}
+        {/* ==================== MODULO COMPATIBILITÀ ==================== */}
         {activeModule === 'spare-parts' && (() => {
-          const uniqueTypes       = [...new Set(spareParts.map(p => p.type).filter(Boolean))].sort();
-          const uniqueEOL         = [...new Set(spareParts.map(p => p.eol).filter(Boolean))].sort();
-          const uniqueTerminalPNs = [...new Set(spareParts.map(p => p.terminal_pn).filter(Boolean))].sort();
-          const uniqueRefs        = [...new Set(spareParts.map(p => p.ref).filter(Boolean))].sort();
-          const uniqueRplus       = [...new Set(spareParts.map(p => p.rplus).filter(Boolean))].sort();
+          // Join da Anagrafica: HW STATUS per PNIT (solo Hardware), Display Name/Descrizione/Prezzo/Conto Lavoro per PN
+          const hwStatusByPnit = {};
+          const anagByPn = {};
+          anagrafica.forEach(a => {
+            const codice = String(a.codice || '').trim();
+            if (!codice) return;
+            if ((a.cluster || '').trim().toLowerCase() === 'hardware') hwStatusByPnit[codice] = a.pax_status || '';
+            anagByPn[codice] = {
+              displayName: a.display_name || '',
+              descrizione: a.descrizione || '',
+              prezzo: a.prezzo || 0,
+              valuta: a.valuta || '',
+              cl: String(a.conto_lavoro || '').trim().toLowerCase() === 'yes',
+            };
+          });
+
+          // REF / R+ per TYPE: dall'elenco curato in Distinte Base (sotto-scheda Elenco TYPE)
+          const typeFlagsByType = {};
+          dbaseTipi.forEach(t => { typeFlagsByType[t.type] = { ref: !!t.ref, rplus: !!t.rplus }; });
+
+          // Override REF/R+ specifici per combinazione PNIT+TYPE (solo additivi, da Distinte Base → Assegnazioni)
+          const overrideByPnitType = {};
+          distinteBase.forEach(r => {
+            const key = `${(r.pnit || '').trim()}||${(r.type || '').trim()}`;
+            overrideByPnitType[key] = { ref: !!r.ref_override, rplus: !!r.rplus_override };
+          });
+
+          // Righe arricchite: PN/Terminal PN/PNIT/TYPE sono i soli dati "reali" di Compatibilità,
+          // tutto il resto è ereditato da Anagrafica/Elenco TYPE e non più editabile qui.
+          const enrichedSp = spareParts.map(p => {
+            const pn = (p.pn || '').trim();
+            const pnit = (p.pnit || '').trim();
+            const type = (p.type || '').trim();
+            const anag = anagByPn[pn];
+            const typeFlags = typeFlagsByType[type];
+            const override = overrideByPnitType[`${pnit}||${type}`];
+            return {
+              ...p,
+              modello: (p.terminal_pn || '').split('-')[0],
+              hwStatus: hwStatusByPnit[pnit] || '',
+              displayName: anag?.displayName || '',
+              descrizione: anag?.descrizione || '',
+              price: anag?.prezzo || 0,
+              valuta: anag?.valuta || '',
+              cl: !!anag?.cl,
+              ref: !!typeFlags?.ref || !!override?.ref,
+              rplus: !!typeFlags?.rplus || !!override?.rplus,
+              hasAnagMatch: !!anag,
+            };
+          });
+
+          // Riscontro codifica: PN verificato contro l'Anagrafica, stesso controllo del modulo Inventario
+          const noMatchCount = enrichedSp.filter(p => !p.hasAnagMatch).length;
+
+          const uniqueTypes       = [...new Set(enrichedSp.map(p => p.type).filter(Boolean))].sort();
+          const uniqueTerminalPNs = [...new Set(enrichedSp.map(p => p.terminal_pn).filter(Boolean))].sort();
           const toggleSort = (col) => {
             if (spSortCol === col) setSpSortDir(d => d === 'asc' ? 'desc' : 'asc');
             else { setSpSortCol(col); setSpSortDir('asc'); }
@@ -2639,32 +3129,25 @@ export default function App() {
           };
           const sortIcon = (col) => spSortCol === col ? (spSortDir === 'asc' ? ' ↑' : ' ↓') : '';
 
-          const filtered = spareParts.filter(p => {
+          const filtered = enrichedSp.filter(p => {
             const q = spSearch.toLowerCase();
             const q2 = spSearch2.toLowerCase();
-            const matchField = (val) => (val || '').toLowerCase().includes;
             const matchAny = (q) => !q ||
               (p.pn || '').toLowerCase().includes(q) ||
               (p.terminal_pn || '').toLowerCase().includes(q) ||
-              (p.english_name || '').toLowerCase().includes(q) ||
-              (p.descrizione || '').toLowerCase().includes(q) ||
+              (p.modello || '').toLowerCase().includes(q) ||
               (p.pnit || '').toLowerCase().includes(q) ||
-              ((p.terminal_pn || '').split('-')[0]).toLowerCase().includes(q) ||
-              (p.type || '').toLowerCase().includes(q) ||
-              (p.ref || '').toLowerCase().includes(q) ||
-              (p.rplus || '').toLowerCase().includes(q);
-            void matchField;
+              (p.type || '').toLowerCase().includes(q);
             const matchSearch = matchAny(q);
             const matchSearch2 = matchAny(q2);
-            const matchEOL        = !spFilterEOL        || p.eol === spFilterEOL;
             const matchType       = !spFilterType       || p.type === spFilterType;
-            const matchToOrder    = !spFilterToOrder    || p.to_order === spFilterToOrder;
             const matchTerminalPN = !spFilterTerminalPN || p.terminal_pn === spFilterTerminalPN;
-            const matchRef        = !spFilterRef        || p.ref === spFilterRef;
-            const matchRplus      = !spFilterRplus      || p.rplus === spFilterRplus;
-            return matchSearch && matchSearch2 && matchEOL && matchType && matchToOrder && matchTerminalPN && matchRef && matchRplus;
+            const matchRef        = !spFilterRef        || p.ref;
+            const matchRplus      = !spFilterRplus      || p.rplus;
+            const matchNoMatch    = !spFilterNoMatch    || !p.hasAnagMatch;
+            return matchSearch && matchSearch2 && matchType && matchTerminalPN && matchRef && matchRplus && matchNoMatch;
           }).sort((a, b) => {
-            const getVal = (row) => spSortCol === 'modello' ? (row.terminal_pn || '').split('-')[0].toLowerCase() : String(row[spSortCol] ?? '').toLowerCase();
+            const getVal = (row) => String(row[spSortCol] ?? '').toLowerCase();
             const va = getVal(a);
             const vb = getVal(b);
             const num_a = parseFloat(a[spSortCol]);
@@ -2688,7 +3171,7 @@ export default function App() {
                 </div>
                 )}
                 <div className="flex-grow">
-                  <p className="text-xs text-gray-400">Importa il file Excel del DB Spare Parts (Foglio 1). L&apos;import aggiorna i record esistenti per PN + Terminal PN.</p>
+                  <p className="text-xs text-gray-400">Importa il file Excel ufficiale (foglio "Elenco spare parts"): legge solo PN, Terminal PN, PNIT, SPARE — tutto il resto è ereditato da Anagrafica/Elenco SPARE. L&apos;import aggiorna i record esistenti per PN + Terminal PN.</p>
                   {importMeta.spare_parts && <p className="text-[11px] text-gray-400">Ultimo aggiornamento: {new Date(importMeta.spare_parts).toLocaleString('it-IT')}</p>}
                 </div>
                 {spareParts.length > 0 && (
@@ -2705,7 +3188,7 @@ export default function App() {
                   <div className="grid grid-cols-1 sm:grid-cols-4 gap-3">
                     <input
                       type="text" value={spSearch} onChange={e => { setSpSearch(e.target.value); setSpPage(0); }}
-                      placeholder="Cerca per PN, Terminal PN, nome, tipo, descrizione, REF, R+..."
+                      placeholder="Cerca per PN, Terminal PN, PNIT, SPARE..."
                       className="sm:col-span-2 bg-gray-50 border border-gray-300 rounded-xl p-2.5 text-xs focus:outline-hidden"
                     />
                     <input
@@ -2718,27 +3201,26 @@ export default function App() {
                       {uniqueTerminalPNs.map(t => <option key={t} value={t}>{t}</option>)}
                     </select>
                     <select value={spFilterType} onChange={e => { setSpFilterType(e.target.value); setSpPage(0); }} className="sm:col-span-2 bg-gray-50 border border-gray-300 rounded-xl p-2.5 text-xs focus:outline-hidden">
-                      <option value="">Tutti i TYPE</option>
+                      <option value="">Tutti gli SPARE</option>
                       {uniqueTypes.map(t => <option key={t} value={t}>{t}</option>)}
                     </select>
-                    <select value={spFilterEOL} onChange={e => { setSpFilterEOL(e.target.value); setSpPage(0); }} className="bg-gray-50 border border-gray-300 rounded-xl p-2.5 text-xs focus:outline-hidden">
-                      <option value="">Tutti gli stati</option>
-                      {uniqueEOL.map(eol => <option key={eol} value={eol}>{eol}</option>)}
-                    </select>
-                    <select value={spFilterToOrder} onChange={e => { setSpFilterToOrder(e.target.value); setSpPage(0); }} className="bg-gray-50 border border-gray-300 rounded-xl p-2.5 text-xs focus:outline-hidden">
-                      <option value="">To Order: tutti</option>
-                      <option value="SI">To Order: SI</option>
-                      <option value="NO">To Order: NO</option>
-                    </select>
-                    <select value={spFilterRef} onChange={e => { setSpFilterRef(e.target.value); setSpPage(0); }} className="bg-gray-50 border border-gray-300 rounded-xl p-2.5 text-xs focus:outline-hidden">
-                      <option value="">REF: tutti ({uniqueRefs.length})</option>
-                      {uniqueRefs.map(r => <option key={r} value={r}>{r}</option>)}
-                    </select>
-                    <select value={spFilterRplus} onChange={e => { setSpFilterRplus(e.target.value); setSpPage(0); }} className="bg-gray-50 border border-gray-300 rounded-xl p-2.5 text-xs focus:outline-hidden">
-                      <option value="">R+: tutti ({uniqueRplus.length})</option>
-                      {uniqueRplus.map(r => <option key={r} value={r}>{r}</option>)}
-                    </select>
+                    <label className="flex items-center gap-2 cursor-pointer bg-gray-50 border border-gray-300 rounded-xl p-2.5">
+                      <input type="checkbox" checked={spFilterRef} onChange={e => { setSpFilterRef(e.target.checked); setSpPage(0); }} className="w-4 h-4 accent-blue-600 cursor-pointer" />
+                      <span className="text-xs font-semibold text-gray-700">Solo REF</span>
+                    </label>
+                    <label className="flex items-center gap-2 cursor-pointer bg-gray-50 border border-gray-300 rounded-xl p-2.5">
+                      <input type="checkbox" checked={spFilterRplus} onChange={e => { setSpFilterRplus(e.target.checked); setSpPage(0); }} className="w-4 h-4 accent-purple-600 cursor-pointer" />
+                      <span className="text-xs font-semibold text-gray-700">Solo R+</span>
+                    </label>
                   </div>
+                  {noMatchCount > 0 && (
+                    <button
+                      onClick={() => { setSpFilterNoMatch(v => !v); setSpPage(0); }}
+                      className={`w-full text-left text-xs font-bold px-3 py-2 rounded-xl border transition cursor-pointer ${spFilterNoMatch ? 'bg-red-600 text-white border-red-700' : 'bg-red-50 text-red-600 border-red-200 hover:bg-red-100'}`}>
+                      ⚠ {noMatchCount} codici senza riscontro in Anagrafica
+                      {spFilterNoMatch ? ' — clicca per mostrare tutti' : ' — clicca per filtrare'}
+                    </button>
+                  )}
                 </div>
               )}
 
@@ -2763,15 +3245,15 @@ export default function App() {
                     {filtered.length > 0 && (
                       <button onClick={() => {
                         const rows = filtered.map(p => ({
-                          'PN': p.pn, 'Terminal PN': p.terminal_pn, 'Modello': (p.terminal_pn || '').split('-')[0], 'PNIT': p.pnit,
-                          'English Name': p.english_name, 'Descrizione': p.descrizione,
-                          'TYPE': p.type, 'Stato': p.eol, 'REF': p.ref, 'R+': p.rplus,
-                          'To Order': p.to_order, '$': p.price, 'Locked': p.locked, 'CODICE': p.codice
+                          'PN': p.pn, 'Terminal PN': p.terminal_pn, 'Modello': p.modello, 'PNIT': p.pnit, 'HW Status': p.hwStatus,
+                          'Display Name': p.displayName, 'Descrizione': p.descrizione,
+                          'SPARE': p.type, 'CL': p.cl ? 'SI' : '', 'REF': p.ref ? 'SI' : '', 'R+': p.rplus ? 'SI' : '',
+                          '$': p.price,
                         }));
                         const ws = XLSX.utils.json_to_sheet(rows);
                         const wb = XLSX.utils.book_new();
-                        XLSX.utils.book_append_sheet(wb, ws, 'Spare Parts');
-                        XLSX.writeFile(wb, `spare_parts_${filtered.length}.xlsx`);
+                        XLSX.utils.book_append_sheet(wb, ws, 'Compatibilità');
+                        XLSX.writeFile(wb, `compatibilita_${filtered.length}.xlsx`);
                       }} className="text-[10px] font-bold text-blue-600 hover:text-blue-800 bg-blue-50 hover:bg-blue-100 border border-blue-200 px-2.5 py-1 rounded-lg transition cursor-pointer">
                         📥 Esporta XLS ({filtered.length})
                       </button>
@@ -2783,12 +3265,12 @@ export default function App() {
                     </button>
                     )}
                     {spEditMode && (
-                      <button onClick={() => setSpNewRows(prev => [{ tempId: Date.now() + Math.random(), pn: '', terminal_pn: '', pnit: '', english_name: '', descrizione: '', type: '', eol: '', ref: '', rplus: '', to_order: 'SI', price: '' }, ...prev])}
+                      <button onClick={() => setSpNewRows(prev => [{ tempId: Date.now() + Math.random(), pn: '', terminal_pn: '', pnit: '', type: '' }, ...prev])}
                         className="text-[10px] font-bold text-white bg-green-600 hover:bg-green-700 px-2.5 py-1 rounded-lg transition cursor-pointer">
                         + Aggiungi riga
                       </button>
                     )}
-                    <button onClick={() => { setSpSearch(''); setSpSearch2(''); setSpFilterTerminalPN(''); setSpFilterType(''); setSpFilterEOL(''); setSpFilterToOrder(''); setSpFilterRef(''); setSpFilterRplus(''); setSpPage(0); }}
+                    <button onClick={() => { setSpSearch(''); setSpSearch2(''); setSpFilterTerminalPN(''); setSpFilterType(''); setSpFilterRef(false); setSpFilterRplus(false); setSpFilterNoMatch(false); setSpPage(0); }}
                       className="text-[10px] font-bold text-gray-400 hover:text-red-600 bg-gray-50 hover:bg-red-50 border border-gray-200 hover:border-red-200 px-2.5 py-1 rounded-lg transition cursor-pointer">
                       ✕ Reset filtri
                     </button>
@@ -2807,10 +3289,9 @@ export default function App() {
                     <thead className="bg-gray-50 border-b border-gray-200 text-[10px] font-black text-gray-500 uppercase tracking-wider">
                       <tr>
                         {[
-                          ['pn','PN'], ['terminal_pn','Terminal PN'], ['modello','Modello'], ['pnit','PNIT'],
-                          ['english_name','English Name', 'hidden md:table-cell'], ['descrizione','Descrizione', 'hidden md:table-cell'],
-                          ['type','TYPE'], ['eol','ST.'], ['ref','REF'], ['rplus','R+'],
-                          ['to_order','ORD'], ['price','$']
+                          ['pn','PN'], ['terminal_pn','Terminal PN'], ['pnit','PNIT'], ['type','SPARE'], ['modello','Modello'], ['hwStatus','HW STATUS'],
+                          ['displayName','Display Name', 'hidden md:table-cell'], ['descrizione','Descrizione', 'hidden md:table-cell'],
+                          ['cl','CL'], ['ref','REF'], ['rplus','R+'], ['price','$']
                         ].map(([col, label, extra = '']) => (
                           <th key={col}
                             style={{ width: spWidths[col] }}
@@ -2821,44 +3302,33 @@ export default function App() {
                               className="absolute right-0 top-0 h-full w-1.5 cursor-col-resize hover:bg-blue-400/40 z-10" />
                           </th>
                         ))}
-                        <th style={{ width: spWidths.locked }} className="relative px-2 py-3 text-center truncate">
-                          🔒
-                          <div onMouseDown={e => spStartResize('locked', e)} className="absolute right-0 top-0 h-full w-1.5 cursor-col-resize hover:bg-blue-400/40 z-10" />
-                        </th>
                         <th style={{ width: spWidths.edit }} className="px-2 py-3"></th>
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-gray-100">
-                      {/* Righe nuove in inserimento (modalità modifica) */}
+                      {/* Righe nuove in inserimento (modalità modifica): solo PN, Terminal PN, PNIT, TYPE — il resto si eredita dal vivo */}
                       {spEditMode && spNewRows.map(r => {
                         const nCls = "w-full bg-green-50 border border-green-300 rounded px-1 py-0.5 text-xs focus:outline-none";
                         const upd = (field, val) => setSpNewRows(prev => prev.map(x => x.tempId === r.tempId ? { ...x, [field]: val } : x));
-                        const locked = (r.eol === 'EOL' || r.eol === 'CLI' || r.to_order === 'NO' || r.type === 'NO') ? 'Y' : '';
+                        const pnit = (r.pnit || '').trim();
+                        const pn = (r.pn || '').trim();
+                        const type = (r.type || '').trim();
+                        const anag = anagByPn[pn];
+                        const typeFlags = typeFlagsByType[type];
                         return (
                           <tr key={r.tempId} className="bg-green-50/40">
                             <td className="px-2 py-1"><input className={nCls + ' font-mono font-bold text-blue-700'} value={r.pn} onChange={e => upd('pn', e.target.value)} placeholder="PN *" /></td>
                             <td className="px-2 py-1"><input className={nCls + ' font-mono text-[10px]'} value={r.terminal_pn} onChange={e => upd('terminal_pn', e.target.value)} placeholder="Terminal PN *" /></td>
-                            <td className="px-2 py-2 font-mono text-[10px] text-gray-400">{(r.terminal_pn || '').split('-')[0]}</td>
                             <td className="px-2 py-1"><input className={nCls + ' font-mono'} value={r.pnit} onChange={e => upd('pnit', e.target.value)} placeholder="PNIT" /></td>
-                            <td className="px-2 py-1 hidden md:table-cell"><input className={nCls} value={r.english_name} onChange={e => upd('english_name', e.target.value)} placeholder="English Name" /></td>
-                            <td className="px-2 py-1 hidden md:table-cell"><input className={nCls} value={r.descrizione} onChange={e => upd('descrizione', e.target.value)} placeholder="Descrizione" /></td>
-                            <td className="px-2 py-1"><input className={nCls} value={r.type} onChange={e => upd('type', e.target.value)} placeholder="TYPE" /></td>
-                            <td className="px-1 py-1 text-center">
-                              <select className={nCls} value={r.eol} onChange={e => upd('eol', e.target.value)}>
-                                <option value="">—</option><option value="EOL">EOL</option><option value="ALT">ALT</option><option value="CLI">CLI</option>
-                              </select>
-                            </td>
-                            <td className="px-1 py-1 text-center">
-                              <select className={nCls} value={r.ref} onChange={e => upd('ref', e.target.value)}><option value="">—</option><option value="X">X</option></select>
-                            </td>
-                            <td className="px-1 py-1 text-center">
-                              <select className={nCls} value={r.rplus} onChange={e => upd('rplus', e.target.value)}><option value="">—</option><option value="X">X</option></select>
-                            </td>
-                            <td className="px-1 py-1 text-center">
-                              <select className={nCls} value={r.to_order} onChange={e => upd('to_order', e.target.value)}><option value="SI">SI</option><option value="NO">NO</option></select>
-                            </td>
-                            <td className="px-2 py-1 text-right"><input className={nCls + ' text-right'} value={r.price} onChange={e => upd('price', e.target.value)} placeholder="0" /></td>
-                            <td className="px-2 py-2 text-center text-[11px]">{locked === 'Y' ? '🔒' : '—'}</td>
+                            <td className="px-2 py-1"><input className={nCls} value={r.type} onChange={e => upd('type', e.target.value)} placeholder="SPARE" /></td>
+                            <td className="px-2 py-2 font-mono text-[10px] text-gray-400">{(r.terminal_pn || '').split('-')[0]}</td>
+                            <td className="px-2 py-2 text-[10px] text-gray-400">{hwStatusByPnit[pnit] || '—'}</td>
+                            <td className="px-2 py-2 text-[10px] text-gray-400 hidden md:table-cell">{anag?.displayName || '—'}</td>
+                            <td className="px-2 py-2 text-[10px] text-gray-400 hidden md:table-cell">{anag?.descrizione || '—'}</td>
+                            <td className="px-1 py-2 text-center text-[11px]">{anag?.cl ? '✓' : ''}</td>
+                            <td className="px-1 py-2 text-center text-[11px]">{typeFlags?.ref ? '✓' : ''}</td>
+                            <td className="px-1 py-2 text-center text-[11px]">{typeFlags?.rplus ? '✓' : ''}</td>
+                            <td className="px-2 py-2 text-right font-mono text-gray-500 text-[10px]">{anag?.prezzo > 0 ? `${currencySymbol(anag.valuta)}${anag.prezzo.toFixed(2)}` : '—'}</td>
                             <td className="px-2 py-2 text-center">
                               <button onClick={() => setSpNewRows(prev => prev.filter(x => x.tempId !== r.tempId))}
                                 className="text-[10px] text-gray-400 hover:text-red-500 cursor-pointer" title="Rimuovi riga">✕</button>
@@ -2872,61 +3342,30 @@ export default function App() {
                         const d = pending ? { ...p, ...pending } : p;
                         const iCls = `w-full rounded px-1 py-0.5 text-xs focus:outline-none border ${pending ? 'bg-amber-50 border-amber-300' : 'bg-transparent border-transparent hover:border-gray-300 focus:border-blue-400 focus:bg-white'}`;
                         const nav = (field) => ({ 'data-sp-row': rowIndex, 'data-sp-field': field, onKeyDown: (e) => handleSpKeyNav(e, rowIndex, field) });
-                        const computedEol = (d.eol || '').trim();
-                        const computedType = (d.type || '').trim();
-                        const computedToOrder = (d.to_order || '').trim();
-                        const computedLocked = (computedEol === 'EOL' || computedEol === 'CLI' || computedToOrder === 'NO' || computedType === 'NO') ? 'Y' : '';
                         return (
                           <tr key={rowKey} className={`transition ${pending ? 'bg-amber-50/40' : 'hover:bg-gray-50/80'}`}>
                             <td className="px-2 py-2 font-mono font-bold text-blue-700 truncate" title={p.pn}>{p.pn}</td>
                             <td className="px-2 py-2 font-mono text-gray-600 text-[10px] truncate" title={p.terminal_pn}>{p.terminal_pn}</td>
-                            <td className="px-2 py-2 font-mono font-bold text-gray-700 text-[10px] truncate">{(p.terminal_pn || '').split('-')[0]}</td>
                             <td className="px-2 py-1 font-mono text-gray-500">
                               {spEditMode ? <input className={iCls + ' font-mono'} value={d.pnit || ''} onChange={e => setSpFieldChange(rowKey, 'pnit', e.target.value)} {...nav('pnit')} /> : p.pnit}
-                            </td>
-                            <td className="px-2 py-1 text-[10px] hidden md:table-cell">
-                              {spEditMode ? <input className={iCls} value={d.english_name || ''} onChange={e => setSpFieldChange(rowKey, 'english_name', e.target.value)} {...nav('english_name')} /> : p.english_name}
-                            </td>
-                            <td className="px-2 py-1 text-[10px] hidden md:table-cell">
-                              {spEditMode ? <input className={iCls} value={d.descrizione || ''} onChange={e => setSpFieldChange(rowKey, 'descrizione', e.target.value)} {...nav('descrizione')} /> : p.descrizione}
                             </td>
                             <td className="px-2 py-1 text-[10px]">
                               {spEditMode ? <input className={iCls} value={d.type || ''} onChange={e => setSpFieldChange(rowKey, 'type', e.target.value)} {...nav('type')} /> : p.type}
                             </td>
-                            <td className="px-1 py-1 text-center">
-                              {spEditMode
-                                ? <select className={iCls} value={d.eol || ''} onChange={e => setSpFieldChange(rowKey, 'eol', e.target.value)} {...nav('eol')}>
-                                    <option value="">—</option><option value="EOL">EOL</option><option value="ALT">ALT</option><option value="CLI">CLI</option>
-                                  </select>
-                                : p.eol ? <span className={`px-1 py-px rounded font-black text-[9px] border ${p.eol === 'EOL' ? 'bg-red-50 text-red-600 border-red-100' : p.eol === 'ALT' ? 'bg-amber-50 text-amber-700 border-amber-100' : 'bg-blue-50 text-blue-700 border-blue-100'}`}>{p.eol}</span> : ''}
+                            <td className="px-2 py-2 font-mono font-bold text-gray-700 text-[10px] truncate">{p.modello}</td>
+                            <td className="px-2 py-2 text-[10px] truncate">
+                              {p.hwStatus && (
+                                <span className={`px-1.5 py-0.5 rounded font-black text-[9px] border ${p.hwStatus.toUpperCase() === 'EOL' ? 'bg-red-50 text-red-700 border-red-100' : p.hwStatus.toUpperCase() === 'TESTING' ? 'bg-amber-50 text-amber-700 border-amber-100' : 'bg-gray-50 text-gray-500 border-gray-200'}`}>
+                                  {p.hwStatus}
+                                </span>
+                              )}
                             </td>
-                            <td className="px-1 py-1 text-center">
-                              {spEditMode
-                                ? <select className={iCls} value={d.ref || ''} onChange={e => setSpFieldChange(rowKey, 'ref', e.target.value)} {...nav('ref')}>
-                                    <option value="">—</option><option value="X">X</option>
-                                  </select>
-                                : p.ref === 'X' ? <span className="font-black text-gray-600 text-[11px]">✓</span> : ''}
-                            </td>
-                            <td className="px-1 py-1 text-center">
-                              {spEditMode
-                                ? <select className={iCls} value={d.rplus || ''} onChange={e => setSpFieldChange(rowKey, 'rplus', e.target.value)} {...nav('rplus')}>
-                                    <option value="">—</option><option value="X">X</option>
-                                  </select>
-                                : p.rplus === 'X' ? <span className="font-black text-gray-600 text-[11px]">✓</span> : ''}
-                            </td>
-                            <td className="px-1 py-1 text-center">
-                              {spEditMode
-                                ? <select className={iCls} value={d.to_order || ''} onChange={e => setSpFieldChange(rowKey, 'to_order', e.target.value)} {...nav('to_order')}>
-                                    <option value="SI">SI</option><option value="NO">NO</option>
-                                  </select>
-                                : p.to_order === 'SI'
-                                  ? <span className="bg-green-50 text-green-700 border border-green-100 px-1 py-px rounded font-black text-[9px]">SI</span>
-                                  : <span className="text-gray-300 text-[9px]">NO</span>}
-                            </td>
-                            <td className="px-2 py-1 text-right font-mono text-gray-700">
-                              {spEditMode ? <input className={iCls + ' text-right'} value={d.price ?? ''} onChange={e => setSpFieldChange(rowKey, 'price', e.target.value)} {...nav('price')} /> : (p.price > 0 ? `$${p.price.toFixed(2)}` : '—')}
-                            </td>
-                            <td className="px-2 py-2 text-center text-[11px]">{computedLocked === 'Y' ? '🔒' : '—'}</td>
+                            <td className="px-2 py-2 text-[10px] text-gray-600 hidden md:table-cell truncate" title={p.displayName}>{p.displayName || '—'}</td>
+                            <td className="px-2 py-2 text-[10px] text-gray-600 hidden md:table-cell truncate" title={p.descrizione}>{p.descrizione || '—'}</td>
+                            <td className="px-1 py-2 text-center">{p.cl && <span className="px-1 py-px rounded font-black text-[9px] border bg-amber-50 text-amber-700 border-amber-100" title="Conto Lavoro">CL</span>}</td>
+                            <td className="px-1 py-2 text-center">{p.ref ? <span className="font-black text-gray-600 text-[11px]">✓</span> : ''}</td>
+                            <td className="px-1 py-2 text-center">{p.rplus ? <span className="font-black text-gray-600 text-[11px]">✓</span> : ''}</td>
+                            <td className="px-2 py-2 text-right font-mono text-gray-700">{p.price > 0 ? `${currencySymbol(p.valuta)}${p.price.toFixed(2)}` : '—'}</td>
                             <td className="px-2 py-2 text-center">
                               {pending && (
                                 <button onClick={() => setSpPendingChanges(prev => { const n = {...prev}; delete n[rowKey]; return n; })}
@@ -2962,12 +3401,20 @@ export default function App() {
           // Cluster e Description per codice dall'anagrafica articoli
           const clusterByCodice = {};
           const anagDescByCodice = {};
-          anagrafica.forEach(a => { const c = String(a.codice || '').trim(); if (c) { clusterByCodice[c] = a.cluster || ''; if (a.descrizione) anagDescByCodice[c] = a.descrizione; } });
+          const anagCodiceSet = new Set();
+          anagrafica.forEach(a => {
+            const c = String(a.codice || '').trim();
+            if (!c) return;
+            anagCodiceSet.add(c);
+            clusterByCodice[c] = a.cluster || '';
+            if (a.descrizione) anagDescByCodice[c] = a.descrizione;
+          });
 
           // Inventario unico: spare parts + accessori (marcati con fonte)
           const stockSource = stockItems;
 
-          const noMatchCount = stockSource.filter(s => !spMap[s.codice]).length;
+          // Riscontro codifica: verificato contro l'Anagrafica (fonte anagrafica articoli), non contro Compatibilità
+          const noMatchCount = stockSource.filter(s => !anagCodiceSet.has(s.codice)).length;
           const uniqueMagazzini  = [...new Set(stockSource.map(s => s.magazzino).filter(Boolean))].sort();
           const uniqueLocazioni  = [...new Set(stockSource.map(s => s.locazione).filter(Boolean))].sort();
           const uniqueClusters   = [...new Set(stockSource.map(s => clusterByCodice[s.codice]).filter(Boolean))].sort();
@@ -2999,7 +3446,7 @@ export default function App() {
               const matchLoc = !stockFilterLocazione || s.locazione === stockFilterLocazione;
               const matchBancale = !stockFilterBancale || s.numero_bancale === stockFilterBancale;
               const matchCluster = !stockFilterCluster || s.cluster === stockFilterCluster;
-              const matchNoMatch = !stockFilterNoMatch || !spMap[s.codice];
+              const matchNoMatch = !stockFilterNoMatch || !anagCodiceSet.has(s.codice);
               return matchSearch && matchSearch2 && matchMag && matchLoc && matchBancale && matchCluster && matchNoMatch && s.stock && s.stock !== 0;
             })
             .sort((a, b) => {
@@ -3026,6 +3473,19 @@ export default function App() {
 
           return (
             <div className="space-y-5">
+
+              <div className="flex items-center gap-1 border-b border-gray-200">
+                <button onClick={() => setStockTab('inventario')}
+                  className={`px-4 py-2.5 text-xs font-bold rounded-t-xl cursor-pointer transition ${stockTab === 'inventario' ? 'bg-white border border-b-0 border-gray-200 text-blue-700' : 'text-gray-400 hover:text-gray-600'}`}>
+                  📦 Inventario
+                </button>
+                <button onClick={() => setStockTab('controlli')}
+                  className={`px-4 py-2.5 text-xs font-bold rounded-t-xl cursor-pointer transition ${stockTab === 'controlli' ? 'bg-white border border-b-0 border-gray-200 text-blue-700' : 'text-gray-400 hover:text-gray-600'}`}>
+                  🔍 Controlli
+                </button>
+              </div>
+
+              {stockTab === 'inventario' && (<div className="space-y-5">
 
               {/* Upload + contatore */}
               <div className="bg-white p-4 rounded-2xl border border-gray-200 shadow-xs flex flex-col sm:flex-row sm:items-center gap-4">
@@ -3101,7 +3561,7 @@ export default function App() {
                     <button
                       onClick={() => { setStockFilterNoMatch(v => !v); setStockPage(0); }}
                       className={`w-full text-left text-xs font-bold px-3 py-2 rounded-xl border transition cursor-pointer ${stockFilterNoMatch ? 'bg-red-600 text-white border-red-700' : 'bg-red-50 text-red-600 border-red-200 hover:bg-red-100'}`}>
-                      ⚠ {noMatchCount} codici senza riscontro nel DB Spare Parts
+                      ⚠ {noMatchCount} codici senza riscontro in Anagrafica
                       {stockFilterNoMatch ? ' — clicca per mostrare tutti' : ' — clicca per filtrare'}
                     </button>
                   )}
@@ -3261,6 +3721,144 @@ export default function App() {
                   Nessun record. Importa lo stock o le giacenze accessori per iniziare.
                 </div>
               )}
+              </div>)}
+
+              {stockTab === 'controlli' && (() => {
+                // Giacenza app raggruppata per magazzino + codice (somma stock), confrontata con l'import NetSuite
+                const rowMap = {};
+                stockItems.forEach(s => {
+                  const codice = String(s.codice || '').trim();
+                  const magazzino = String(s.magazzino || '').trim().toUpperCase();
+                  if (!codice || !magazzino) return;
+                  const key = `${codice}__${magazzino}`;
+                  if (!rowMap[key]) rowMap[key] = { codice, magazzino, stockApp: 0, stockNetsuite: 0 };
+                  rowMap[key].stockApp += (s.stock || 0);
+                });
+                stockVerifica.forEach(v => {
+                  const codice = String(v.codice || '').trim();
+                  const magazzino = String(v.magazzino || '').trim().toUpperCase();
+                  if (!codice || !magazzino) return;
+                  const key = `${codice}__${magazzino}`;
+                  if (!rowMap[key]) rowMap[key] = { codice, magazzino, stockApp: 0, stockNetsuite: 0 };
+                  rowMap[key].stockNetsuite += (v.qty_netsuite || 0);
+                });
+
+                let rows = Object.values(rowMap).map(r => ({ ...r, delta: r.stockApp - r.stockNetsuite }));
+
+                const uniqueMagazziniControlli = [...new Set(rows.map(r => r.magazzino).filter(Boolean))].sort();
+
+                const q = controlliSearch.trim().toLowerCase();
+                if (q) rows = rows.filter(r => r.codice.toLowerCase().includes(q));
+                if (controlliMagazzino) rows = rows.filter(r => r.magazzino === controlliMagazzino);
+                if (controlliSoloIncongruenze) rows = rows.filter(r => r.delta !== 0);
+
+                const { col, dir } = controlliSort;
+                const mul = dir === 'asc' ? 1 : -1;
+                rows.sort((a, b) => {
+                  const va = a[col], vb = b[col];
+                  if (typeof va === 'number') return (va - vb) * mul;
+                  return String(va).localeCompare(String(vb)) * mul;
+                });
+
+                const toggleControlliSort = (c) => setControlliSort(prev => prev.col === c ? { col: c, dir: prev.dir === 'asc' ? 'desc' : 'asc' } : { col: c, dir: 'asc' });
+                const controlliArrow = (c) => controlliSort.col === c ? (controlliSort.dir === 'asc' ? ' ▲' : ' ▼') : '';
+
+                const PAGE_SIZE = 100;
+                const totalPages = Math.max(1, Math.ceil(rows.length / PAGE_SIZE));
+                const page = Math.min(controlliPage, totalPages - 1);
+                const pageRows = rows.slice(page * PAGE_SIZE, page * PAGE_SIZE + PAGE_SIZE);
+                const nIncongruenze = rows.filter(r => r.delta !== 0).length;
+
+                return (
+                  <div className="space-y-5">
+                    <div className="flex items-center justify-between flex-wrap gap-3">
+                      <div>
+                        <h2 className="text-lg font-black text-gray-800">🔍 Controlli</h2>
+                        <p className="text-xs text-gray-500">Giacenza dell&apos;app raggruppata per Magazzino + Codice (somma Stock), confrontata con l&apos;export di verifica giacenza da NetSuite (Item, LOCATION, Sum of On Hand).</p>
+                        {importMeta.stock_verifica && <p className="text-[11px] text-gray-400">Ultimo caricamento NetSuite: {new Date(importMeta.stock_verifica).toLocaleString('it-IT')}</p>}
+                      </div>
+                      {canUpload('stock') && (
+                        <div className="relative flex-shrink-0">
+                          <button className="bg-blue-600 hover:bg-blue-700 text-white text-sm font-bold px-4 py-2.5 rounded-xl cursor-pointer shadow-xs transition">
+                            📥 Importa verifica NetSuite
+                          </button>
+                          <input type="file" accept=".csv,.xls,.xlsx" className="absolute inset-0 w-full h-full opacity-0 cursor-pointer" onChange={handleStockVerificaUpload} />
+                        </div>
+                      )}
+                    </div>
+
+                    <div className="flex items-center gap-3 flex-wrap">
+                      <input value={controlliSearch} onChange={e => { setControlliSearch(e.target.value); setControlliPage(0); }}
+                        placeholder="Cerca per codice..."
+                        className="min-w-[220px] bg-gray-50 border border-gray-300 rounded-xl p-2.5 text-xs focus:outline-hidden" />
+                      <select value={controlliMagazzino} onChange={e => { setControlliMagazzino(e.target.value); setControlliPage(0); }}
+                        className="bg-gray-50 border border-gray-300 rounded-xl p-2.5 text-xs focus:outline-hidden">
+                        <option value="">Tutti i magazzini ({uniqueMagazziniControlli.length})</option>
+                        {uniqueMagazziniControlli.map(m => <option key={m} value={m}>{m}</option>)}
+                      </select>
+                      <label className="flex items-center gap-2 cursor-pointer">
+                        <input type="checkbox" checked={controlliSoloIncongruenze} onChange={e => { setControlliSoloIncongruenze(e.target.checked); setControlliPage(0); }} className="w-4 h-4 accent-red-600 cursor-pointer" />
+                        <span className="text-xs font-semibold text-gray-700">Solo incongruenze ({nIncongruenze})</span>
+                      </label>
+                      {rows.length > 0 && (
+                        <button onClick={() => {
+                          const out = rows.map(r => ({ 'Codice': r.codice, 'Magazzino': r.magazzino, 'Stock App': r.stockApp, 'Stock NetSuite': r.stockNetsuite, 'Differenza': r.delta }));
+                          const ws = XLSX.utils.json_to_sheet(out);
+                          const wb = XLSX.utils.book_new();
+                          XLSX.utils.book_append_sheet(wb, ws, 'Controlli');
+                          XLSX.writeFile(wb, `controlli_giacenza_${new Date().toISOString().slice(0, 10)}.xlsx`);
+                        }} className="text-xs font-bold text-blue-600 hover:text-blue-800 bg-blue-50 hover:bg-blue-100 border border-blue-200 px-3 py-2.5 rounded-xl transition cursor-pointer ml-auto">
+                          📊 Esporta Excel
+                        </button>
+                      )}
+                    </div>
+
+                    {rows.length > 0 && (
+                      <div className="flex items-center justify-between gap-3 flex-wrap">
+                        <p className="text-[11px] text-gray-400">{rows.length} risultati — pag. {page + 1}/{totalPages}</p>
+                        {totalPages > 1 && (
+                          <div className="flex gap-1">
+                            <button onClick={() => setControlliPage(p => Math.max(0, p - 1))} disabled={page === 0}
+                              className="text-[10px] font-bold px-2.5 py-1 rounded-lg border transition cursor-pointer disabled:opacity-30 disabled:cursor-default bg-white hover:bg-gray-100 border-gray-200">← Prec.</button>
+                            <button onClick={() => setControlliPage(p => Math.min(totalPages - 1, p + 1))} disabled={page >= totalPages - 1}
+                              className="text-[10px] font-bold px-2.5 py-1 rounded-lg border transition cursor-pointer disabled:opacity-30 disabled:cursor-default bg-white hover:bg-gray-100 border-gray-200">Succ. →</button>
+                          </div>
+                        )}
+                      </div>
+                    )}
+
+                    {stockVerificaLoading && <div className="text-center py-4 text-xs font-bold text-amber-600 animate-pulse">Caricamento...</div>}
+                    {!stockVerificaLoading && (rows.length > 0 ? (
+                      <div className="bg-white rounded-2xl border border-gray-200 shadow-xs overflow-x-auto">
+                        <table className="w-full text-left border-collapse text-[11px]">
+                          <thead className="bg-gray-50 border-b border-gray-200 text-[10px] font-black text-gray-500 uppercase tracking-wider">
+                            <tr>
+                              <th className="px-3 py-3 cursor-pointer select-none whitespace-nowrap hover:bg-gray-100 transition" onClick={() => toggleControlliSort('codice')}>Codice{controlliArrow('codice')}</th>
+                              <th className="px-3 py-3 cursor-pointer select-none whitespace-nowrap hover:bg-gray-100 transition" onClick={() => toggleControlliSort('magazzino')}>Magazzino{controlliArrow('magazzino')}</th>
+                              <th className="px-3 py-3 text-right cursor-pointer select-none whitespace-nowrap hover:bg-gray-100 transition" onClick={() => toggleControlliSort('stockApp')}>Stock App{controlliArrow('stockApp')}</th>
+                              <th className="px-3 py-3 text-right cursor-pointer select-none whitespace-nowrap hover:bg-gray-100 transition" onClick={() => toggleControlliSort('stockNetsuite')}>Stock NetSuite{controlliArrow('stockNetsuite')}</th>
+                              <th className="px-3 py-3 text-right cursor-pointer select-none whitespace-nowrap hover:bg-gray-100 transition" onClick={() => toggleControlliSort('delta')}>Differenza{controlliArrow('delta')}</th>
+                            </tr>
+                          </thead>
+                          <tbody className="divide-y divide-gray-100">
+                            {pageRows.map(r => (
+                              <tr key={`${r.codice}__${r.magazzino}`} className={`hover:bg-blue-50/50 transition ${r.delta !== 0 ? 'bg-red-50/40' : ''}`}>
+                                <td className="px-3 py-2.5 font-mono font-bold text-blue-700">{r.codice}</td>
+                                <td className="px-3 py-2.5 text-gray-700">{r.magazzino}</td>
+                                <td className="px-3 py-2.5 text-right font-mono">{r.stockApp}</td>
+                                <td className="px-3 py-2.5 text-right font-mono">{r.stockNetsuite}</td>
+                                <td className={`px-3 py-2.5 text-right font-mono font-black ${r.delta > 0 ? 'text-amber-600' : r.delta < 0 ? 'text-red-600' : 'text-gray-300'}`}>{r.delta !== 0 ? (r.delta > 0 ? `+${r.delta}` : r.delta) : '—'}</td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    ) : (
+                      <div className="text-center py-16 text-gray-400 text-sm">Nessun dato. Importa il file di verifica giacenza da NetSuite.</div>
+                    ))}
+                  </div>
+                );
+              })()}
             </div>
           );
         })()}
@@ -3519,6 +4117,7 @@ export default function App() {
                             <th className="px-3 py-2 text-center">Visibile</th>
                             <th className="px-3 py-2 text-center">Carica Excel/CSV</th>
                             <th className="px-3 py-2 text-center">Modifica</th>
+                            <th className="px-3 py-2 text-center">Genera da Compatibilità</th>
                           </tr>
                         </thead>
                         <tbody className="divide-y divide-gray-100">
@@ -3541,13 +4140,18 @@ export default function App() {
                                     ? <input type="checkbox" checked={has(`${m.id}:edit`)} disabled={!vis} onChange={e => toggle(`${m.id}:edit`, e.target.checked)} className="w-4 h-4 accent-blue-600 cursor-pointer disabled:opacity-30" />
                                     : <span className="text-gray-300">—</span>}
                                 </td>
+                                <td className="px-3 py-2 text-center">
+                                  {m.genera
+                                    ? <input type="checkbox" checked={has(`${m.id}:genera`)} disabled={!vis} onChange={e => toggle(`${m.id}:genera`, e.target.checked)} className="w-4 h-4 accent-blue-600 cursor-pointer disabled:opacity-30" />
+                                    : <span className="text-gray-300">—</span>}
+                                </td>
                               </tr>
                             );
                           })}
                         </tbody>
                       </table>
                     </div>
-                    <p className="text-[11px] text-gray-400">Se un modulo è <strong>Visibile</strong>, il ruolo può usarne tutte le funzioni. <strong>Carica</strong> e <strong>Modifica</strong> sono eccezioni per modulo: se disattivate, quei controlli vengono nascosti (i moduli senza queste funzioni mostrano «—»).</p>
+                    <p className="text-[11px] text-gray-400">Se un modulo è <strong>Visibile</strong>, il ruolo può usarne tutte le funzioni. <strong>Carica</strong>, <strong>Modifica</strong> e <strong>Genera da Compatibilità</strong> sono eccezioni per modulo: se disattivate, quei controlli vengono nascosti (i moduli senza queste funzioni mostrano «—»).</p>
                   </div>
                   );
                 })()}
@@ -3851,66 +4455,69 @@ export default function App() {
             arrivoByCodice[cod] = (arrivoByCodice[cod] || 0) + (l.qty_expected || 0);
           });
 
-          // Prezzo unitario e stato locked per pn (dal DB spare parts)
+          // Prezzo unitario per pn: dall'Anagrafica (codice = pn ufficiale)
           const priceByPn = {};
-          const lockedByPn = {};
-          spareParts.forEach(p => {
-            const pn = (p.pn || '').trim();
-            if (!pn) return;
-            if (!priceByPn[pn]) priceByPn[pn] = p.price || 0;
-            // un pn è ordinabile se almeno una sua riga non è locked
-            if ((p.locked || '').trim().toUpperCase() !== 'Y') lockedByPn[pn] = false;
-            else if (lockedByPn[pn] === undefined) lockedByPn[pn] = true;
+          const valutaByPn = {};
+          anagrafica.forEach(a => {
+            const codice = String(a.codice || '').trim();
+            if (!codice || !a.prezzo) return;
+            priceByPn[codice] = a.prezzo;
+            valutaByPn[codice] = a.valuta || '';
           });
 
-          // Tutte le combinazioni (PNIT, TYPE) presenti nel DB spare parts.
-          // Ogni combinazione raccoglie i propri codici (pn) su cui sommare le quantità.
-          const comboMap = {};
-          spareParts.forEach(p => {
-            const pnit = (p.pnit || '').trim() || '—';
-            const type = (p.type || '').trim() || '—';
-            const pn = (p.pn || '').trim();
-            if (!pn) return;
-            const key = `${pnit}||${type}`;
-            if (!comboMap[key]) comboMap[key] = { pnit, type, codici: new Set(), orderable: new Set(), rplus: false };
-            comboMap[key].codici.add(pn);
-            // ordinabile = non locked (esclude EOL/CLI, TO ORDER=NO, TYPE=NO)
-            if ((p.locked || '').trim().toUpperCase() !== 'Y') comboMap[key].orderable.add(pn);
-            // R+ : referenza da acquistare per il refurbishing
-            if ((p.rplus || '').trim().toUpperCase() === 'X') comboMap[key].rplus = true;
+          // Stato PAX (EOL, TESTING, AVAILABLE...) dell'hardware per PNIT: dall'Anagrafica
+          const paxStatusByPnit = {};
+          anagrafica.forEach(a => {
+            if ((a.cluster || '').trim().toLowerCase() !== 'hardware') return;
+            const codice = String(a.codice || '').trim();
+            if (codice) paxStatusByPnit[codice] = a.pax_status || '';
           });
+
+          // Base: combinazioni ufficiali di Distinte Base (non orfane, non N/A). Il PN ufficiale può mancare
+          // (ambigua/non assegnata): la riga partecipa comunque al calcolo di stima/da ordinare, che dipende
+          // solo da PNIT+TYPE. Stock/in arrivo/in ordine NON dipendono dal solo PN ufficiale: si sommano su
+          // tutti i PN candidati per quella combinazione PNIT+SPARE in Compatibilità (più l'eventuale PN
+          // ufficiale stesso, per sicurezza) — altrimenti la giacenza registrata su un candidato non ancora
+          // "ufficializzato" (o su un PN diventato non più valido) sparirebbe dal calcolo.
+          const combosBase = dbaseRows.filter(r => r.stato !== 'orfano' && r.stato !== 'na');
 
           const mesi = parseFloat(mesiCopertura) || 0;
           const perc = (parseFloat(refurbPerc) || 0) / 100;
-          let combos = Object.values(comboMap).map(c => {
-            const codici = [...c.codici];
-            // Codice da ordinare: il più idoneo (ordinabile); se più d'uno equivalente, il primo per codice
-            const orderable = [...c.orderable].sort();
-            const codiceOrdine = (orderable.length > 0 ? orderable : codici.slice().sort())[0] || '';
-            const nOrderable = orderable.length;
-            const stock = codici.reduce((s, k) => s + (stockByCodice[k] || 0), 0);
-            const inArrivo = codici.reduce((s, k) => s + (arrivoByCodice[k] || 0), 0);
-            const inOrdine = codici.reduce((s, k) => s + (ordini[k]?.in_ordine || 0), 0);
-            const idConsumi = `${c.pnit}${c.type}`;
+          let combos = combosBase.map(r => {
+            const { pnit, type } = r;
+            const pn = r.pnUfficiale;
+            const codici = new Set(r.candidati);
+            if (pn) codici.add(pn);
+            const stock = [...codici].reduce((s, c) => s + (stockByCodice[c] || 0), 0);
+            const inArrivo = [...codici].reduce((s, c) => s + (arrivoByCodice[c] || 0), 0);
+            const inOrdine = [...codici].reduce((s, c) => s + (ordini[c]?.in_ordine || 0), 0);
+            const idConsumi = `${pnit}${type}`;
             const media = mediaData[idConsumi] || 0;
             const nomaterial = nomatData[idConsumi] || 0;
-            // Refurb: se la referenza è R+, servono (terminali da refurbishare del PNIT) × % refurbishing
-            const refurbQty = c.rplus ? Math.round((refurb[c.pnit] || 0) * perc) : 0;
+            // Refurb: se R+ (dal TYPE o dall'override specifico per questo PNIT), servono (terminali da refurbishare del PNIT) × % refurbishing
+            const refurbQty = r.rplusEffective ? Math.round((refurb[pnit] || 0) * perc) : 0;
             const stima = Math.round(media * mesi + nomaterial + refurbQty);
-            // Se il codice da ordinare è locked, la quantità da ordinare è 0
-            const locked = !!lockedByPn[codiceOrdine];
             const fabbisogno = stima - stock - inOrdine;
-            // Arrotonda per eccesso a multipli di 100
+            // Arrotonda per eccesso a multipli di 100. Se la combinazione è bloccata in Distinte Base, l'ordine resta a 0.
+            const locked = !!r.locked;
             const daOrdinare = (locked || fabbisogno <= 0) ? 0 : Math.ceil(fabbisogno / 100) * 100;
-            const prezzo = priceByPn[codiceOrdine] || 0;
+            const prezzo = pn ? (priceByPn[pn] || 0) : 0;
+            const valuta = pn ? (valutaByPn[pn] || '') : '';
             const ptot = daOrdinare > 0 ? prezzo * daOrdinare : 0;
-            return { pnit: c.pnit, type: c.type, nCodici: codici.length, codiceOrdine, nOrderable, locked, media, nomaterial, refurbQty, stock, inArrivo, inOrdine, stima, daOrdinare, prezzo, ptot };
+            const paxStatus = (paxStatusByPnit[pnit] || '').trim();
+            return { pnit, type, pn, media, nomaterial, refurbQty, stock, inArrivo, inOrdine, stima, daOrdinare, prezzo, valuta, ptot, paxStatus, locked };
           });
+
+          const uniquePaxStatus = [...new Set(combos.map(c => c.paxStatus).filter(Boolean))].sort();
 
           const q = matriceSearch.trim().toLowerCase();
           if (q) combos = combos.filter(c => `${c.pnit} ${c.type}`.toLowerCase().includes(q));
+          const q2 = matriceSearch2.trim().toLowerCase();
+          if (q2) combos = combos.filter(c => `${c.pnit} ${c.type}`.toLowerCase().includes(q2));
           if (matriceSoloStima) combos = combos.filter(c => c.stima > 0);
           if (matriceSoloDaOrdinare) combos = combos.filter(c => c.daOrdinare > 0);
+          if (matriceSoloSenzaPN) combos = combos.filter(c => !c.pn);
+          if (matriceFilterPaxStatus) combos = combos.filter(c => c.paxStatus === matriceFilterPaxStatus);
 
           const { col, dir } = matriceSort;
           const mul = dir === 'asc' ? 1 : -1;
@@ -3922,44 +4529,64 @@ export default function App() {
 
           const tot = combos.reduce((acc, c) => { acc.stock += c.stock; acc.inArrivo += c.inArrivo; acc.inOrdine += c.inOrdine; acc.ptot += c.ptot; return acc; }, { stock: 0, inArrivo: 0, inOrdine: 0, ptot: 0 });
           const fmtEuro = (n) => (n || 0).toLocaleString('it-IT', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-          const toggleSort = (c) => setMatriceSort(prev => prev.col === c ? { col: c, dir: prev.dir === 'asc' ? 'desc' : 'asc' } : { col: c, dir: 'asc' });
+          const toggleSort = (c) => { setMatriceSort(prev => prev.col === c ? { col: c, dir: prev.dir === 'asc' ? 'desc' : 'asc' } : { col: c, dir: 'asc' }); setMatricePage(0); };
           const arrow = (c) => matriceSort.col === c ? (matriceSort.dir === 'asc' ? ' ▲' : ' ▼') : '';
+          const MATRICE_PAGE_SIZE = 100;
+          const matriceTotalPages = Math.max(1, Math.ceil(combos.length / MATRICE_PAGE_SIZE));
+          const matricePageClamped = Math.min(matricePage, matriceTotalPages - 1);
+          const pageCombos = combos.slice(matricePageClamped * MATRICE_PAGE_SIZE, matricePageClamped * MATRICE_PAGE_SIZE + MATRICE_PAGE_SIZE);
 
           return (
             <div className="space-y-5">
               <div className="flex items-center justify-between flex-wrap gap-3">
                 <div>
-                  <h2 className="text-lg font-black text-gray-800">🧮 Matrice PNIT × TYPE</h2>
-                  <p className="text-xs text-gray-500">Tutte le combinazioni PNIT + TYPE del DB spare parts, con stock, in arrivo (Piano Arrivi) e in ordine.</p>
+                  <h2 className="text-lg font-black text-gray-800">🧮 MRP</h2>
+                  <p className="text-xs text-gray-500">Combinazioni ufficiali PNIT + SPARE da Distinte Base (escluse orfane e NON SERVE). Stima e Da ordinare si calcolano su PNIT+SPARE; stock, in arrivo e in ordine si sommano su tutti i PN candidati in Compatibilità per quella combinazione, anche senza un PN ufficiale ancora scelto. Prezzo da Anagrafica, legato al solo PN ufficiale.</p>
                 </div>
                 <div className="flex items-center gap-3 flex-wrap">
                   <button onClick={() => {
                     const rows = combos.map(c => ({
-                      'PNIT': c.pnit, 'TYPE': c.type, 'Codice da ordinare': c.codiceOrdine,
-                      'N. Codici': c.nCodici, 'Cons. medio/mese': c.media, 'NoMaterial': c.nomaterial,
+                      'PNIT': c.pnit, 'HW Status': c.paxStatus, 'SPARE': c.type, 'PN Ufficiale': c.pn,
+                      'Cons. medio/mese': c.media, 'NoMaterial': c.nomaterial,
                       'Refurb': c.refurbQty, 'Stima necessaria': c.stima, 'Stock': c.stock,
                       'In arrivo': c.inArrivo, 'In ordine': c.inOrdine, 'Da ordinare': c.daOrdinare,
                       'Locked': c.locked ? 'SI' : '', 'Prezzo unit.': c.prezzo, 'P.tot': c.ptot,
                     }));
                     const ws = XLSX.utils.json_to_sheet(rows);
                     const wb = XLSX.utils.book_new();
-                    XLSX.utils.book_append_sheet(wb, ws, 'Matrice');
-                    XLSX.writeFile(wb, `matrice_${new Date().toISOString().slice(0, 10)}.xlsx`);
+                    XLSX.utils.book_append_sheet(wb, ws, 'MRP');
+                    XLSX.writeFile(wb, `mrp_${new Date().toISOString().slice(0, 10)}.xlsx`);
                   }}
                     className="bg-green-50 hover:bg-green-100 text-green-700 border border-green-200 text-xs font-bold px-3 py-2.5 rounded-xl cursor-pointer transition">
                     📊 Esporta Excel
                   </button>
-                  <input value={matriceSearch} onChange={e => setMatriceSearch(e.target.value)}
-                    placeholder="Cerca per PNIT o TYPE..."
+                  <input value={matriceSearch} onChange={e => { setMatriceSearch(e.target.value); setMatricePage(0); }}
+                    placeholder="Cerca per PNIT o SPARE..."
+                    className="min-w-[220px] bg-gray-50 border border-gray-300 rounded-xl p-2.5 text-xs focus:outline-hidden" />
+                  <input value={matriceSearch2} onChange={e => { setMatriceSearch2(e.target.value); setMatricePage(0); }}
+                    placeholder="Secondo filtro (AND)..."
                     className="min-w-[220px] bg-gray-50 border border-gray-300 rounded-xl p-2.5 text-xs focus:outline-hidden" />
                   <label className="flex items-center gap-2 cursor-pointer">
-                    <input type="checkbox" checked={matriceSoloStima} onChange={e => setMatriceSoloStima(e.target.checked)} className="w-4 h-4 accent-blue-600 cursor-pointer" />
+                    <input type="checkbox" checked={matriceSoloStima} onChange={e => { setMatriceSoloStima(e.target.checked); setMatricePage(0); }} className="w-4 h-4 accent-blue-600 cursor-pointer" />
                     <span className="text-xs font-semibold text-gray-700">Solo con stima necessaria</span>
                   </label>
                   <label className="flex items-center gap-2 cursor-pointer">
-                    <input type="checkbox" checked={matriceSoloDaOrdinare} onChange={e => setMatriceSoloDaOrdinare(e.target.checked)} className="w-4 h-4 accent-blue-600 cursor-pointer" />
+                    <input type="checkbox" checked={matriceSoloDaOrdinare} onChange={e => { setMatriceSoloDaOrdinare(e.target.checked); setMatricePage(0); }} className="w-4 h-4 accent-blue-600 cursor-pointer" />
                     <span className="text-xs font-semibold text-gray-700">Solo da ordinare</span>
                   </label>
+                  <label className="flex items-center gap-2 cursor-pointer">
+                    <input type="checkbox" checked={matriceSoloSenzaPN} onChange={e => { setMatriceSoloSenzaPN(e.target.checked); setMatricePage(0); }} className="w-4 h-4 accent-red-600 cursor-pointer" />
+                    <span className="text-xs font-semibold text-gray-700">Solo senza PN ufficiale</span>
+                  </label>
+                  <select value={matriceFilterPaxStatus} onChange={e => { setMatriceFilterPaxStatus(e.target.value); setMatricePage(0); }}
+                    className="bg-gray-50 border border-gray-300 rounded-xl p-2.5 text-xs focus:outline-hidden">
+                    <option value="">HW STATUS: tutti ({uniquePaxStatus.length})</option>
+                    {uniquePaxStatus.map(s => <option key={s} value={s}>{s}</option>)}
+                  </select>
+                  <button onClick={() => { setMatriceSearch(''); setMatriceSearch2(''); setMatriceSoloStima(false); setMatriceSoloDaOrdinare(false); setMatriceSoloSenzaPN(false); setMatriceFilterPaxStatus(''); setMatricePage(0); }}
+                    className="text-[10px] font-bold text-gray-400 hover:text-red-600 bg-gray-50 hover:bg-red-50 border border-gray-200 hover:border-red-200 px-2.5 py-1 rounded-lg transition cursor-pointer">
+                    ✕ Reset filtri
+                  </button>
                 </div>
               </div>
 
@@ -4002,8 +4629,24 @@ export default function App() {
                   <span className="text-gray-400">· Stima = consumo × mesi + NoMaterial + Refurb</span>
                   <span>· {combos.length} combinazioni</span>
                 </div>
-                <span className="font-black text-blue-600">Stock: {tot.stock} · <span className="text-emerald-600">In arrivo: {tot.inArrivo}</span> · <span className="text-amber-600">In ordine: {tot.inOrdine}</span> · <span className="text-gray-800">Valore d&apos;acquisto: {fmtEuro(tot.ptot)} $</span></span>
+                <span className="font-black text-blue-600">Stock: {tot.stock} · <span className="text-emerald-600">In arrivo: {tot.inArrivo}</span> · <span className="text-amber-600">In ordine: {tot.inOrdine}</span> · <span className="text-gray-800">Valore d&apos;acquisto: {fmtEuro(tot.ptot)}</span></span>
               </div>
+
+              {combos.length > 0 && (
+                <div className="flex items-center justify-between gap-3 flex-wrap">
+                  <p className="text-[11px] text-gray-400">
+                    {combos.length} risultati — pag. {matricePageClamped + 1}/{matriceTotalPages}
+                  </p>
+                  {matriceTotalPages > 1 && (
+                    <div className="flex gap-1">
+                      <button onClick={() => setMatricePage(p => Math.max(0, p - 1))} disabled={matricePageClamped === 0}
+                        className="text-[10px] font-bold px-2.5 py-1 rounded-lg border transition cursor-pointer disabled:opacity-30 disabled:cursor-default bg-white hover:bg-gray-100 border-gray-200">← Prec.</button>
+                      <button onClick={() => setMatricePage(p => Math.min(matriceTotalPages - 1, p + 1))} disabled={matricePageClamped >= matriceTotalPages - 1}
+                        className="text-[10px] font-bold px-2.5 py-1 rounded-lg border transition cursor-pointer disabled:opacity-30 disabled:cursor-default bg-white hover:bg-gray-100 border-gray-200">Succ. →</button>
+                    </div>
+                  )}
+                </div>
+              )}
 
               {combos.length > 0 ? (
                 <div className="bg-white rounded-2xl border border-gray-200 shadow-xs overflow-x-auto">
@@ -4011,9 +4654,9 @@ export default function App() {
                     <thead className="bg-gray-50 border-b border-gray-200 text-[10px] font-black text-gray-500 uppercase tracking-wider">
                       <tr>
                         <th className="px-3 py-3 cursor-pointer select-none whitespace-nowrap hover:bg-gray-100 transition" onClick={() => toggleSort('pnit')}>PNIT{arrow('pnit')}</th>
-                        <th className="px-3 py-3 cursor-pointer select-none whitespace-nowrap hover:bg-gray-100 transition" onClick={() => toggleSort('type')}>TYPE{arrow('type')}</th>
-                        <th className="px-3 py-3 cursor-pointer select-none whitespace-nowrap hover:bg-gray-100 transition" onClick={() => toggleSort('codiceOrdine')}>Codice da ordinare{arrow('codiceOrdine')}</th>
-                        <th className="px-3 py-3 text-right cursor-pointer select-none whitespace-nowrap hover:bg-gray-100 transition" onClick={() => toggleSort('nCodici')}>N. Codici{arrow('nCodici')}</th>
+                        <th className="px-3 py-3 text-center cursor-pointer select-none whitespace-nowrap hover:bg-gray-100 transition" onClick={() => toggleSort('paxStatus')}>HW STATUS{arrow('paxStatus')}</th>
+                        <th className="px-3 py-3 cursor-pointer select-none whitespace-nowrap hover:bg-gray-100 transition" onClick={() => toggleSort('type')}>SPARE{arrow('type')}</th>
+                        <th className="px-3 py-3 cursor-pointer select-none whitespace-nowrap hover:bg-gray-100 transition" onClick={() => toggleSort('pn')}>PN Ufficiale{arrow('pn')}</th>
                         <th className="px-3 py-3 text-right text-purple-600 cursor-pointer select-none whitespace-nowrap hover:bg-gray-100 transition" onClick={() => toggleSort('media')}>Cons. medio/mese{arrow('media')}</th>
                         <th className="px-3 py-3 text-right text-rose-600 cursor-pointer select-none whitespace-nowrap hover:bg-gray-100 transition" onClick={() => toggleSort('nomaterial')}>NoMaterial{arrow('nomaterial')}</th>
                         <th className="px-3 py-3 text-right text-orange-600 cursor-pointer select-none whitespace-nowrap hover:bg-gray-100 transition" onClick={() => toggleSort('refurbQty')}>Refurb{arrow('refurbQty')}</th>
@@ -4028,12 +4671,18 @@ export default function App() {
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-gray-100">
-                      {combos.map(c => (
+                      {pageCombos.map(c => (
                         <tr key={`${c.pnit}||${c.type}`} className="hover:bg-blue-50/50 transition">
                           <td className="px-3 py-2.5 font-mono font-bold text-indigo-800">{c.pnit}</td>
+                          <td className="px-3 py-2.5 text-center">
+                            {c.paxStatus && (
+                              <span className={`text-[9px] font-black px-1.5 py-0.5 rounded border ${c.paxStatus.toUpperCase() === 'EOL' ? 'bg-red-50 text-red-700 border-red-100' : c.paxStatus.toUpperCase() === 'TESTING' ? 'bg-amber-50 text-amber-700 border-amber-100' : 'bg-gray-50 text-gray-500 border-gray-200'}`}>
+                                {c.paxStatus}
+                              </span>
+                            )}
+                          </td>
                           <td className="px-3 py-2.5 text-gray-700">{c.type}</td>
-                          <td className="px-3 py-2.5 font-mono font-bold text-blue-700">{c.codiceOrdine || '—'}{c.nOrderable > 1 && <span className="ml-1 text-[9px] font-black text-amber-600" title={`${c.nOrderable} codici equivalenti`}>⚑{c.nOrderable}</span>}</td>
-                          <td className="px-3 py-2.5 text-right font-mono text-gray-500">{c.nCodici}</td>
+                          <td className="px-3 py-2.5 font-mono font-bold text-blue-700">{c.pn}</td>
                           <td className="px-3 py-2.5 text-right font-mono text-purple-600">{c.media ? c.media.toFixed(1) : ''}</td>
                           <td className="px-3 py-2.5 text-right font-mono text-rose-600">{c.nomaterial || ''}</td>
                           <td className="px-3 py-2.5 text-right font-mono text-orange-600">{c.refurbQty || ''}</td>
@@ -4043,8 +4692,8 @@ export default function App() {
                           <td className="px-3 py-2.5 text-right font-mono font-black text-amber-600">{c.inOrdine || ''}</td>
                           <td className={`px-3 py-2.5 text-right font-mono font-black ${c.daOrdinare > 0 ? 'text-red-700' : 'text-gray-300'}`}>{c.daOrdinare > 0 ? c.daOrdinare : ''}</td>
                           <td className="px-3 py-2.5 text-center">{c.locked ? <span className="text-[9px] font-black text-red-600 bg-red-50 border border-red-100 px-1.5 py-0.5 rounded">🔒 LOCKED</span> : ''}</td>
-                          <td className="px-3 py-2.5 text-right font-mono text-gray-600">{c.prezzo ? fmtEuro(c.prezzo) : ''}</td>
-                          <td className="px-3 py-2.5 text-right font-mono font-black text-gray-800">{c.ptot ? fmtEuro(c.ptot) : ''}</td>
+                          <td className="px-3 py-2.5 text-right font-mono text-gray-600">{c.prezzo ? `${currencySymbol(c.valuta)}${fmtEuro(c.prezzo)}` : ''}</td>
+                          <td className="px-3 py-2.5 text-right font-mono font-black text-gray-800">{c.ptot ? `${currencySymbol(c.valuta)}${fmtEuro(c.ptot)}` : ''}</td>
                         </tr>
                       ))}
                     </tbody>
@@ -4052,6 +4701,297 @@ export default function App() {
                 </div>
               ) : (
                 <div className="text-center py-16 text-gray-400 text-sm">Nessuna combinazione da visualizzare.</div>
+              )}
+            </div>
+          );
+        })()}
+
+        {/* ==================== MODULO DISTINTE BASE ==================== */}
+        {activeModule === 'distinte-base' && (() => {
+          let rows = dbaseRows;
+          const q = dbaseSearch.trim().toLowerCase();
+          if (q) rows = rows.filter(r => `${r.pnit} ${r.type}`.toLowerCase().includes(q));
+          const q2 = dbaseSearch2.trim().toLowerCase();
+          if (q2) rows = rows.filter(r => `${r.pnit} ${r.type}`.toLowerCase().includes(q2));
+          if (dbaseSoloDaAssegnare) rows = rows.filter(r => r.stato === 'ambiguo' || r.stato === 'non_assegnato');
+          if (dbaseSoloAmbigui) rows = rows.filter(r => r.stato === 'ambiguo');
+          if (dbaseNascondiNA) rows = rows.filter(r => !r.isNA);
+          if (dbaseSoloOrfane) rows = rows.filter(r => r.stato === 'orfano');
+          rows = [...rows].sort((a, b) => a.pnit.localeCompare(b.pnit) || a.type.localeCompare(b.type));
+
+          const nDaAssegnare = rows.filter(r => r.stato === 'ambiguo' || r.stato === 'non_assegnato').length;
+          const nAmbigui = rows.filter(r => r.stato === 'ambiguo').length;
+          const nOrfane = rows.filter(r => r.stato === 'orfano').length;
+          const PAGE_SIZE = 100;
+          const totalPages = Math.max(1, Math.ceil(rows.length / PAGE_SIZE));
+          const page = Math.min(dbasePage, totalPages - 1);
+          const pageRows = rows.slice(page * PAGE_SIZE, page * PAGE_SIZE + PAGE_SIZE);
+
+          const statoBadge = (stato, nCandidati) => {
+            if (stato === 'orfano') return <span className="text-[9px] font-black text-red-700 bg-red-50 border border-red-100 px-1.5 py-0.5 rounded">👻 ORFANA</span>;
+            if (stato === 'na') return <span className="text-[9px] font-black text-gray-500 bg-gray-100 border border-gray-200 px-1.5 py-0.5 rounded">NON SERVE</span>;
+            if (stato === 'assegnato') return <span className="text-[9px] font-black text-emerald-700 bg-emerald-50 border border-emerald-100 px-1.5 py-0.5 rounded">✓ ASSEGNATO</span>;
+            if (stato === 'ambiguo') return <span className="text-[9px] font-black text-amber-700 bg-amber-50 border border-amber-100 px-1.5 py-0.5 rounded">⚑ DA ASSEGNARE ({nCandidati})</span>;
+            if (stato === 'non_valido') return <span className="text-[9px] font-black text-red-700 bg-red-50 border border-red-100 px-1.5 py-0.5 rounded">⚠ PN NON VALIDO</span>;
+            return <span className="text-[9px] font-black text-gray-400 bg-gray-50 border border-gray-200 px-1.5 py-0.5 rounded">— NON ASSEGNATO</span>;
+          };
+
+          const tq = dbaseTipiSearch.trim().toLowerCase();
+          const tipiVisibili = [...dbaseTipi]
+            .filter(t => dbaseTipiMostraInattivi || t.attivo !== false)
+            .filter(t => !tq || t.type.toLowerCase().includes(tq))
+            .sort((a, b) => a.type.localeCompare(b.type));
+
+          return (
+            <div className="space-y-5">
+              <div>
+                <h2 className="text-lg font-black text-gray-800">📋 Distinte Base</h2>
+                <p className="text-xs text-gray-500">PN ufficiale da ordinare per ogni combinazione Hardware (da Anagrafica, esclusi i codici con HW STATUS = TESTING) + SPARE (elenco curato nella sotto-scheda "Elenco SPARE").</p>
+              </div>
+
+              <div className="flex items-center gap-1 border-b border-gray-200">
+                <button onClick={() => setDbaseTab('assegnazioni')}
+                  className={`px-4 py-2.5 text-xs font-bold rounded-t-xl cursor-pointer transition ${dbaseTab === 'assegnazioni' ? 'bg-white border border-b-0 border-gray-200 text-blue-700' : 'text-gray-400 hover:text-gray-600'}`}>
+                  📋 Assegnazioni
+                </button>
+                <button onClick={() => setDbaseTab('tipi')}
+                  className={`px-4 py-2.5 text-xs font-bold rounded-t-xl cursor-pointer transition ${dbaseTab === 'tipi' ? 'bg-white border border-b-0 border-gray-200 text-blue-700' : 'text-gray-400 hover:text-gray-600'}`}>
+                  🏷️ Elenco SPARE ({dbaseTipi.length})
+                </button>
+              </div>
+
+              {dbaseTab === 'assegnazioni' && (
+                <div className="space-y-5">
+                  <div className="flex items-center justify-between flex-wrap gap-3">
+                    <div>
+                      {importMeta.distinte_base && <p className="text-[11px] text-gray-400">Ultimo aggiornamento: {new Date(importMeta.distinte_base).toLocaleString('it-IT')}</p>}
+                    </div>
+                    <div className="flex items-center gap-3 flex-wrap">
+                      {canGenera('distinte-base') && (
+                        <button onClick={handleGeneraDistinteBase} disabled={dbaseGenerating}
+                          className="bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white text-xs font-bold px-4 py-2.5 rounded-xl cursor-pointer shadow-xs transition">
+                          {dbaseGenerating ? 'Generazione...' : '🔄 Genera da Compatibilità'}
+                        </button>
+                      )}
+                      <button onClick={() => {
+                        const out = rows.map(r => ({
+                          'PNIT': r.pnit, 'SPARE': r.type, 'PN Ufficiale': r.pnUfficiale,
+                          'REF': r.refEffective ? 'SI' : '', 'R+': r.rplusEffective ? 'SI' : '',
+                          'N. Candidati': r.candidati.length, 'NON SERVE': r.isNA ? 'SI' : '', 'Orfana': r.isOrphan ? 'SI' : '', 'Bloccato': r.locked ? 'SI' : '', 'Stato': r.stato,
+                          'Ultimo aggiornamento': r.updatedAt ? new Date(r.updatedAt).toLocaleString('it-IT') : '',
+                          'Aggiornato da': r.updatedBy || '',
+                        }));
+                        const ws = XLSX.utils.json_to_sheet(out);
+                        const wb = XLSX.utils.book_new();
+                        XLSX.utils.book_append_sheet(wb, ws, 'Distinte Base');
+                        XLSX.writeFile(wb, `distinte_base_${new Date().toISOString().slice(0, 10)}.xlsx`);
+                      }} className="bg-green-50 hover:bg-green-100 text-green-700 border border-green-200 text-xs font-bold px-3 py-2.5 rounded-xl cursor-pointer transition">
+                        📊 Esporta Excel
+                      </button>
+                    </div>
+                  </div>
+
+                  <div className="flex items-center gap-3 flex-wrap">
+                    <input value={dbaseSearch} onChange={e => { setDbaseSearch(e.target.value); setDbasePage(0); }}
+                      placeholder="Cerca per PNIT o SPARE..."
+                      className="min-w-[220px] bg-gray-50 border border-gray-300 rounded-xl p-2.5 text-xs focus:outline-hidden" />
+                    <input value={dbaseSearch2} onChange={e => { setDbaseSearch2(e.target.value); setDbasePage(0); }}
+                      placeholder="Secondo filtro (AND)..."
+                      className="min-w-[220px] bg-gray-50 border border-gray-300 rounded-xl p-2.5 text-xs focus:outline-hidden" />
+                    <label className="flex items-center gap-2 cursor-pointer">
+                      <input type="checkbox" checked={dbaseSoloDaAssegnare} onChange={e => { setDbaseSoloDaAssegnare(e.target.checked); setDbasePage(0); }} className="w-4 h-4 accent-blue-600 cursor-pointer" />
+                      <span className="text-xs font-semibold text-gray-700">Solo da assegnare ({nDaAssegnare})</span>
+                    </label>
+                    <label className="flex items-center gap-2 cursor-pointer">
+                      <input type="checkbox" checked={dbaseSoloAmbigui} onChange={e => { setDbaseSoloAmbigui(e.target.checked); setDbasePage(0); }} className="w-4 h-4 accent-amber-600 cursor-pointer" />
+                      <span className="text-xs font-semibold text-gray-700">Solo ambigui, 2+ candidati ({nAmbigui})</span>
+                    </label>
+                    <label className="flex items-center gap-2 cursor-pointer">
+                      <input type="checkbox" checked={dbaseNascondiNA} onChange={e => { setDbaseNascondiNA(e.target.checked); setDbasePage(0); }} className="w-4 h-4 accent-gray-500 cursor-pointer" />
+                      <span className="text-xs font-semibold text-gray-700">Nascondi NON SERVE</span>
+                    </label>
+                    <label className="flex items-center gap-2 cursor-pointer">
+                      <input type="checkbox" checked={dbaseSoloOrfane} onChange={e => { setDbaseSoloOrfane(e.target.checked); setDbasePage(0); }} className="w-4 h-4 accent-red-600 cursor-pointer" />
+                      <span className="text-xs font-semibold text-gray-700">Solo orfane ({nOrfane})</span>
+                    </label>
+                  </div>
+
+                  {rows.length > 0 && (
+                    <div className="flex items-center justify-between gap-3 flex-wrap">
+                      <p className="text-[11px] text-gray-400">
+                        {rows.length} risultati — pag. {page + 1}/{totalPages}
+                      </p>
+                      {totalPages > 1 && (
+                        <div className="flex gap-1">
+                          <button onClick={() => setDbasePage(p => Math.max(0, p - 1))} disabled={page === 0}
+                            className="text-[10px] font-bold px-2.5 py-1 rounded-lg border transition cursor-pointer disabled:opacity-30 disabled:cursor-default bg-white hover:bg-gray-100 border-gray-200">← Prec.</button>
+                          <button onClick={() => setDbasePage(p => Math.min(totalPages - 1, p + 1))} disabled={page >= totalPages - 1}
+                            className="text-[10px] font-bold px-2.5 py-1 rounded-lg border transition cursor-pointer disabled:opacity-30 disabled:cursor-default bg-white hover:bg-gray-100 border-gray-200">Succ. →</button>
+                        </div>
+                      )}
+                    </div>
+                  )}
+
+                  {dbaseLoading && <div className="text-center py-4 text-xs font-bold text-amber-600 animate-pulse">Caricamento...</div>}
+                  {!dbaseLoading && (rows.length > 0 ? (
+                    <div className="bg-white rounded-2xl border border-gray-200 shadow-xs overflow-x-auto">
+                      <table className="w-full text-left border-collapse text-[11px]">
+                        <thead className="bg-gray-50 border-b border-gray-200 text-[10px] font-black text-gray-500 uppercase tracking-wider">
+                          <tr>
+                            <th className="px-3 py-3">PNIT</th>
+                            <th className="px-3 py-3">SPARE</th>
+                            <th className="px-3 py-3">PN Ufficiale</th>
+                            <th className="px-3 py-3 text-center">REF</th>
+                            <th className="px-3 py-3 text-center">R+</th>
+                            <th className="px-3 py-3 text-center">NON SERVE</th>
+                            <th className="px-3 py-3 text-center">🔒</th>
+                            <th className="px-3 py-3">Stato</th>
+                            <th className="px-3 py-3">Ultimo aggiornamento</th>
+                          </tr>
+                        </thead>
+                        <tbody className="divide-y divide-gray-100">
+                          {pageRows.map(r => (
+                            <tr key={`${r.pnit}||${r.type}`} className={`hover:bg-blue-50/50 transition ${r.isOrphan ? 'bg-red-50/50' : (r.isNA ? 'opacity-50' : '')}`}>
+                              <td className="px-3 py-2.5 font-mono font-bold text-indigo-800">{r.pnit}</td>
+                              <td className="px-3 py-2.5 text-gray-700">{r.type}</td>
+                              <td className="px-3 py-2.5">
+                                {r.isNA ? (
+                                  <span className="text-gray-300 italic">—</span>
+                                ) : canEdit('distinte-base') ? (
+                                  <select
+                                    value={r.pnUfficiale}
+                                    onChange={e => setDistinteBasePn(r.pnit, r.type, e.target.value)}
+                                    className="bg-gray-50 border border-gray-300 rounded-lg p-1.5 text-[11px] font-mono focus:outline-hidden"
+                                  >
+                                    <option value="">—</option>
+                                    {r.pnUfficiale && !r.candidati.includes(r.pnUfficiale) && (
+                                      <option value={r.pnUfficiale}>{r.pnUfficiale} (non più valido)</option>
+                                    )}
+                                    {r.candidati.map(pn => <option key={pn} value={pn}>{pn}</option>)}
+                                  </select>
+                                ) : (
+                                  <span className="font-mono font-bold text-blue-700">{r.pnUfficiale || '—'}</span>
+                                )}
+                              </td>
+                              <td className="px-3 py-2.5 text-center">
+                                {r.refFromType ? (
+                                  <span className="font-black text-blue-600 text-[11px]" title="Ereditato dallo SPARE (Elenco SPARE)">✓</span>
+                                ) : canEdit('distinte-base') ? (
+                                  <input type="checkbox" checked={r.refOverride} onChange={e => setDistinteBaseOverride(r.pnit, r.type, 'ref_override', e.target.checked)} className="w-4 h-4 accent-blue-600 cursor-pointer" title="Flag REF solo per questo PNIT" />
+                                ) : (r.refOverride ? '✓' : '')}
+                              </td>
+                              <td className="px-3 py-2.5 text-center">
+                                {r.rplusFromType ? (
+                                  <span className="font-black text-purple-600 text-[11px]" title="Ereditato dallo SPARE (Elenco SPARE)">✓</span>
+                                ) : canEdit('distinte-base') ? (
+                                  <input type="checkbox" checked={r.rplusOverride} onChange={e => setDistinteBaseOverride(r.pnit, r.type, 'rplus_override', e.target.checked)} className="w-4 h-4 accent-purple-600 cursor-pointer" title="Flag R+ solo per questo PNIT" />
+                                ) : (r.rplusOverride ? '✓' : '')}
+                              </td>
+                              <td className="px-3 py-2.5 text-center">
+                                {canEdit('distinte-base') ? (
+                                  <input type="checkbox" checked={r.isNA} onChange={e => setDistinteBaseNA(r.pnit, r.type, e.target.checked)} className="w-4 h-4 accent-gray-500 cursor-pointer" />
+                                ) : (r.isNA ? '✓' : '')}
+                              </td>
+                              <td className="px-3 py-2.5 text-center">
+                                {canEdit('distinte-base') ? (
+                                  <button onClick={() => setDistinteBaseLocked(r.pnit, r.type, !r.locked)}
+                                    title={r.locked ? 'Sblocca combinazione' : 'Blocca combinazione (azzera Da ordinare in MRP)'}
+                                    className="cursor-pointer text-sm hover:scale-110 transition">
+                                    {r.locked ? '🔒' : '🔓'}
+                                  </button>
+                                ) : (r.locked ? '🔒' : '')}
+                              </td>
+                              <td className="px-3 py-2.5">{statoBadge(r.stato, r.candidati.length)}</td>
+                              <td className="px-3 py-2.5 text-gray-400">{r.updatedAt ? new Date(r.updatedAt).toLocaleString('it-IT') : ''}{r.updatedBy ? ` (${r.updatedBy})` : ''}</td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  ) : (
+                    <div className="text-center py-16 text-gray-400 text-sm">Nessuna combinazione da visualizzare.</div>
+                  ))}
+                </div>
+              )}
+
+              {dbaseTab === 'tipi' && (
+                <div className="space-y-5">
+                  <div className="flex items-center justify-between flex-wrap gap-3">
+                    <p className="text-xs text-gray-500 max-w-2xl">Elenco curato degli SPARE (funzione/componente) validi: guida l'incrocio con l'Hardware in "Assegnazioni". Uno SPARE disattivato o rimosso da qui smette di generare nuove righe, ma quelle già assegnate restano visibili come «orfane».</p>
+                    {canGenera('distinte-base') && (
+                      <button onClick={handleGeneraTipiDaSpareParts} disabled={dbaseTipiLoading}
+                        className="bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white text-xs font-bold px-4 py-2.5 rounded-xl cursor-pointer shadow-xs transition shrink-0">
+                        🔄 Genera da Compatibilità
+                      </button>
+                    )}
+                  </div>
+
+                  {canEdit('distinte-base') && (
+                    <div className="flex items-center gap-2">
+                      <input value={dbaseNuovoTipo} onChange={e => setDbaseNuovoTipo(e.target.value)}
+                        onKeyDown={e => { if (e.key === 'Enter') addDistinteBaseTipo(); }}
+                        placeholder="Nuovo SPARE (es. BATTERY, SCREEN...)"
+                        className="min-w-[220px] bg-gray-50 border border-gray-300 rounded-xl p-2.5 text-xs focus:outline-hidden" />
+                      <button onClick={addDistinteBaseTipo}
+                        className="bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-bold px-4 py-2.5 rounded-xl cursor-pointer shadow-xs transition">
+                        + Aggiungi
+                      </button>
+                    </div>
+                  )}
+
+                  <div className="flex items-center gap-3 flex-wrap">
+                    <input value={dbaseTipiSearch} onChange={e => setDbaseTipiSearch(e.target.value)}
+                      placeholder="Cerca SPARE..."
+                      className="min-w-[220px] bg-gray-50 border border-gray-300 rounded-xl p-2.5 text-xs focus:outline-hidden" />
+                    <label className="flex items-center gap-2 cursor-pointer">
+                      <input type="checkbox" checked={dbaseTipiMostraInattivi} onChange={e => setDbaseTipiMostraInattivi(e.target.checked)} className="w-4 h-4 accent-gray-500 cursor-pointer" />
+                      <span className="text-xs font-semibold text-gray-700">Mostra anche gli SPARE disattivati</span>
+                    </label>
+                    <span className="text-[11px] text-gray-400">{tipiVisibili.length} / {dbaseTipi.length} TYPE</span>
+                  </div>
+
+                  {dbaseTipiLoading && <div className="text-center py-4 text-xs font-bold text-amber-600 animate-pulse">Caricamento...</div>}
+                  {!dbaseTipiLoading && (tipiVisibili.length > 0 ? (
+                    <div className="bg-white rounded-2xl border border-gray-200 shadow-xs overflow-x-auto">
+                      <table className="w-full text-left border-collapse text-[11px]">
+                        <thead className="bg-gray-50 border-b border-gray-200 text-[10px] font-black text-gray-500 uppercase tracking-wider">
+                          <tr>
+                            <th className="px-3 py-3">SPARE</th>
+                            <th className="px-3 py-3 text-center">Attivo</th>
+                            <th className="px-3 py-3 text-center">REF</th>
+                            <th className="px-3 py-3 text-center">R+</th>
+                            <th className="px-3 py-3">Ultimo aggiornamento</th>
+                          </tr>
+                        </thead>
+                        <tbody className="divide-y divide-gray-100">
+                          {tipiVisibili.map(t => (
+                            <tr key={t.type} className={`hover:bg-blue-50/50 transition ${t.attivo === false ? 'opacity-50' : ''}`}>
+                              <td className="px-3 py-2.5 font-mono font-bold text-indigo-800">{t.type}</td>
+                              <td className="px-3 py-2.5 text-center">
+                                {canEdit('distinte-base') ? (
+                                  <input type="checkbox" checked={t.attivo !== false} onChange={e => setDistinteBaseTipoFlag(t.type, 'attivo', e.target.checked)} className="w-4 h-4 accent-emerald-600 cursor-pointer" />
+                                ) : (t.attivo !== false ? '✓' : '')}
+                              </td>
+                              <td className="px-3 py-2.5 text-center">
+                                {canEdit('distinte-base') ? (
+                                  <input type="checkbox" checked={!!t.ref} onChange={e => setDistinteBaseTipoFlag(t.type, 'ref', e.target.checked)} className="w-4 h-4 accent-blue-600 cursor-pointer" />
+                                ) : (t.ref ? '✓' : '')}
+                              </td>
+                              <td className="px-3 py-2.5 text-center">
+                                {canEdit('distinte-base') ? (
+                                  <input type="checkbox" checked={!!t.rplus} onChange={e => setDistinteBaseTipoFlag(t.type, 'rplus', e.target.checked)} className="w-4 h-4 accent-purple-600 cursor-pointer" />
+                                ) : (t.rplus ? '✓' : '')}
+                              </td>
+                              <td className="px-3 py-2.5 text-gray-400">{t.updated_at ? new Date(t.updated_at).toLocaleString('it-IT') : ''}{t.updated_by ? ` (${t.updated_by})` : ''}</td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  ) : (
+                    <div className="text-center py-16 text-gray-400 text-sm">Nessuno SPARE in elenco. Usa "Genera da Compatibilità" o aggiungine uno manualmente.</div>
+                  ))}
+                </div>
               )}
             </div>
           );
@@ -4067,6 +5007,10 @@ export default function App() {
             return `${a.codice} ${a.display_name} ${a.descrizione} ${a.vpn} ${a.note} ${a.gruppo}`.toLowerCase().includes(q);
           });
           const isHardware = (a) => (a.cluster || '').trim().toLowerCase() === 'hardware';
+          const PAGE_SIZE = 100;
+          const totalPages = Math.max(1, Math.ceil(list.length / PAGE_SIZE));
+          const page = Math.min(anagPage, totalPages - 1);
+          const pageList = list.slice(page * PAGE_SIZE, page * PAGE_SIZE + PAGE_SIZE);
           return (
           <div className="space-y-5">
             <div className="flex items-center justify-between flex-wrap gap-3">
@@ -4087,16 +5031,32 @@ export default function App() {
             </div>
 
             <div className="flex items-center gap-3 flex-wrap">
-              <select value={anagCluster} onChange={e => setAnagCluster(e.target.value)}
+              <select value={anagCluster} onChange={e => { setAnagCluster(e.target.value); setAnagPage(0); }}
                 className="bg-gray-50 border border-gray-300 rounded-xl p-2.5 text-xs focus:outline-hidden">
                 <option value="">Tutti i cluster ({clusters.length})</option>
                 {clusters.map(c => <option key={c} value={c}>{c}</option>)}
               </select>
-              <input value={anagSearch} onChange={e => setAnagSearch(e.target.value)}
+              <input value={anagSearch} onChange={e => { setAnagSearch(e.target.value); setAnagPage(0); }}
                 placeholder="Cerca per codice, descrizione, VPN, gruppo..."
                 className="flex-grow min-w-[200px] bg-gray-50 border border-gray-300 rounded-xl p-2.5 text-xs focus:outline-hidden" />
               <span className="text-[11px] text-gray-500">{list.length} / {anagrafica.length} articoli</span>
             </div>
+
+            {list.length > 0 && (
+              <div className="flex items-center justify-between gap-3 flex-wrap">
+                <p className="text-[11px] text-gray-400">
+                  {list.length} risultati — pag. {page + 1}/{totalPages}
+                </p>
+                {totalPages > 1 && (
+                  <div className="flex gap-1">
+                    <button onClick={() => setAnagPage(p => Math.max(0, p - 1))} disabled={page === 0}
+                      className="text-[10px] font-bold px-2.5 py-1 rounded-lg border transition cursor-pointer disabled:opacity-30 disabled:cursor-default bg-white hover:bg-gray-100 border-gray-200">← Prec.</button>
+                    <button onClick={() => setAnagPage(p => Math.min(totalPages - 1, p + 1))} disabled={page >= totalPages - 1}
+                      className="text-[10px] font-bold px-2.5 py-1 rounded-lg border transition cursor-pointer disabled:opacity-30 disabled:cursor-default bg-white hover:bg-gray-100 border-gray-200">Succ. →</button>
+                  </div>
+                )}
+              </div>
+            )}
 
             {anagLoading && <div className="text-center py-4 text-xs font-bold text-amber-600 animate-pulse">Caricamento...</div>}
 
@@ -4114,20 +5074,30 @@ export default function App() {
                       <th className="px-3 py-3">Descrizione</th>
                       <th className="px-3 py-3">Cluster</th>
                       <th className="px-3 py-3">VPN</th>
-                      <th className="px-3 py-3 text-center">ST.</th>
+                      <th className="px-3 py-3 text-right">Prezzo</th>
+                      <th className="px-3 py-3 text-center">CL</th>
+                      <th className="px-3 py-3">HW STATUS</th>
                       <th className="px-3 py-3">Gruppo (Hardware)</th>
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-gray-100">
-                    {list.map(a => (
+                    {pageList.map(a => (
                       <tr key={a.internal_id} className="hover:bg-blue-50/50 transition">
                         <td className="px-3 py-2.5 font-mono font-bold text-blue-700">{a.codice}</td>
                         <td className="px-3 py-2.5 text-gray-700">{a.display_name || '—'}</td>
                         <td className="px-3 py-2.5 text-gray-600">{a.descrizione || '—'}</td>
                         <td className="px-3 py-2.5 text-gray-600">{a.cluster || '—'}</td>
                         <td className="px-3 py-2.5 font-mono text-gray-500 text-[10px]">{a.vpn || '—'}</td>
+                        <td className="px-3 py-2.5 text-right font-mono text-gray-600">{a.prezzo > 0 ? `${currencySymbol(a.valuta)}${a.prezzo.toFixed(2)}` : '—'}</td>
                         <td className="px-3 py-2.5 text-center">
-                          {String(a.conto_lavoro || '').trim().toLowerCase() === 'yes' && <span className="px-1 py-px rounded font-black text-[9px] border bg-amber-50 text-amber-700 border-amber-100" title="Conto Lavoro">CLI</span>}
+                          {String(a.conto_lavoro || '').trim().toLowerCase() === 'yes' && <span className="px-1 py-px rounded font-black text-[9px] border bg-amber-50 text-amber-700 border-amber-100" title="Conto Lavoro">CL</span>}
+                        </td>
+                        <td className="px-3 py-2.5">
+                          {a.pax_status && (
+                            <span className={`px-1.5 py-0.5 rounded font-black text-[9px] border ${a.pax_status.trim().toUpperCase() === 'TESTING' ? 'bg-amber-50 text-amber-700 border-amber-100' : 'bg-gray-50 text-gray-500 border-gray-200'}`}>
+                              {a.pax_status}
+                            </span>
+                          )}
                         </td>
                         <td className="px-3 py-2.5">
                           {isHardware(a)
