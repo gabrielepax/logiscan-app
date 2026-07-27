@@ -476,6 +476,7 @@ export default function App() {
     });
   }
   const orderByLineId = (a, b) => (parseInt(a.line_id) || 0) - (parseInt(b.line_id) || 0);
+  const orderByPoThenLine = (a, b) => (a.po_name || '').localeCompare(b.po_name || '') || orderByLineId(a, b);
 
   // Ricalcola qty_loaded per le righe NON serializzate, distribuendo per (invoice, codice)
   // il totale ricevuto su tutte le righe che condividono lo stesso codice.
@@ -3122,6 +3123,31 @@ export default function App() {
           // Riscontro codifica: PN verificato contro l'Anagrafica, stesso controllo del modulo Inventario
           const noMatchCount = enrichedSp.filter(p => !p.hasAnagMatch).length;
 
+          // Estrazione PN senza riscontro in Anagrafica, raggruppati per PN univoco
+          // (un PN può comparire su più Terminal PN/modelli e SPARE diversi in Compatibilità)
+          const stockByCodice = {};
+          stockItems.forEach(s => { if (s.stock > 0 && s.fonte !== 'accessori') stockByCodice[s.codice] = (stockByCodice[s.codice] || 0) + s.stock; });
+
+          const noMatchByPn = {};
+          enrichedSp.filter(p => !p.hasAnagMatch).forEach(p => {
+            const pn = (p.pn || '').trim();
+            if (!pn) return;
+            if (!noMatchByPn[pn]) noMatchByPn[pn] = { modelli: new Set(), types: new Set() };
+            if (p.modello) noMatchByPn[pn].modelli.add(p.modello);
+            if (p.type) noMatchByPn[pn].types.add(p.type);
+          });
+          const noMatchPnRows = Object.entries(noMatchByPn).map(([pn, v]) => {
+            const spare = [...v.types].join(', ');
+            const notes = [...v.modelli].join(', ');
+            return {
+              'PN': pn,
+              '[PAX] NOTES': notes,
+              'SPARE': spare,
+              'Stock': stockByCodice[pn] || 0,
+              'Purchase Description': `${spare}  - ${notes}`,
+            };
+          });
+
           const uniqueTypes       = [...new Set(enrichedSp.map(p => p.type).filter(Boolean))].sort();
           const uniqueTerminalPNs = [...new Set(enrichedSp.map(p => p.terminal_pn).filter(Boolean))].sort();
           const toggleSort = (col) => {
@@ -3258,6 +3284,16 @@ export default function App() {
                         XLSX.writeFile(wb, `compatibilita_${filtered.length}.xlsx`);
                       }} className="text-[10px] font-bold text-blue-600 hover:text-blue-800 bg-blue-50 hover:bg-blue-100 border border-blue-200 px-2.5 py-1 rounded-lg transition cursor-pointer">
                         📥 Esporta XLS ({filtered.length})
+                      </button>
+                    )}
+                    {noMatchPnRows.length > 0 && (
+                      <button onClick={() => {
+                        const ws = XLSX.utils.json_to_sheet(noMatchPnRows);
+                        const wb = XLSX.utils.book_new();
+                        XLSX.utils.book_append_sheet(wb, ws, 'Senza riscontro');
+                        XLSX.writeFile(wb, `compatibilita_senza_riscontro_${noMatchPnRows.length}.xlsx`);
+                      }} className="text-[10px] font-bold text-red-600 hover:text-red-800 bg-red-50 hover:bg-red-100 border border-red-200 px-2.5 py-1 rounded-lg transition cursor-pointer">
+                        📤 Esporta senza riscontro ({noMatchPnRows.length})
                       </button>
                     )}
                     {canEdit('spare-parts') && (
@@ -5637,7 +5673,7 @@ export default function App() {
                       <div className="flex flex-col space-y-3">
                         {/* I serializzati con stesso codice E stesso VPN si lavorano insieme: una sola scheda, con dettaglio per riga */}
                         {(group.snRequired
-                          ? Object.values(group.lines.reduce((acc, l) => { const k = `${l.item_code || ''}__${l.part_number || ''}`; (acc[k] = acc[k] || []).push(l); return acc; }, {})).map(ls => [...ls].sort(orderByLineId))
+                          ? Object.values(group.lines.reduce((acc, l) => { const k = `${l.item_code || ''}__${l.part_number || ''}`; (acc[k] = acc[k] || []).push(l); return acc; }, {})).map(ls => [...ls].sort(orderByPoThenLine))
                           : group.lines.map(l => [l])
                         ).map(cardLines => {
                           const item = cardLines[0];
@@ -5726,7 +5762,7 @@ export default function App() {
                                <div className="border-t border-gray-100 pt-2 space-y-1">
                                  {cardLines.map(l => (
                                    <div key={l.unique_key} className="flex items-center justify-between gap-2 text-[11px]">
-                                     <span className="text-gray-500 font-mono">L: <strong className="text-gray-700">{l.line_id}</strong></span>
+                                     <span className="text-gray-500 font-mono">Rif: <strong className="text-gray-600">{l.po_name}</strong> <span className="text-gray-400">— L: <strong className="text-gray-700">{l.line_id}</strong></span></span>
                                      <span className="font-mono text-gray-500">
                                        <span className={(l.scanned_count || 0) >= l.qty_expected ? 'text-green-600 font-black' : 'text-blue-600 font-black'}>{l.scanned_count || 0}</span>/{l.qty_expected} pz
                                      </span>
