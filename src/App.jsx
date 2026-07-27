@@ -2195,6 +2195,7 @@ export default function App() {
         vpn: headers.find(h => { const n = norm(h); return n.includes('vendorpartnumber') || n.includes('vendorpn') || n === 'vpn' || n === 'pn'; }),
         sn: colFor('sn'),
         fornitore: colFor('fornitore', 'mainlinename', 'vendor', 'supplier'),
+        shipType: colFor('paxtypeofshipment', 'typeofshipment', 'shipmenttype'),
       };
       if (!C.poId || !C.lineId || !C.item) {
         alert(`CARICAMENTO BLOCCATO — colonne obbligatorie non riconosciute:\n\n${!C.poId ? '• PO INTERNAL ID\n' : ''}${!C.lineId ? '• Line ID\n' : ''}${!C.item ? '• Items - Item' : ''}`);
@@ -2288,6 +2289,7 @@ export default function App() {
           arrival_date: g(row, C.eta) || "N/D",
           part_number: g(row, C.vpn),
           fornitore: g(row, C.fornitore),
+          shipment_type: g(row, C.shipType).trim().toUpperCase(),
         };
         // sn_required dalla colonna SN (Yes/Si = serializzato)
         const snValue = g(row, C.sn).toLowerCase();
@@ -5557,8 +5559,8 @@ export default function App() {
                     <div key={`${group.invoice}_${group.snRequired}`} className="bg-gray-100/60 p-4 sm:p-5 rounded-2xl border border-gray-200/80 space-y-3">
                       <div className="flex justify-between items-center border-b border-gray-200 pb-2">
                         <div className="flex flex-wrap items-center gap-2">
-                          <span className="text-sm sm:text-base font-black text-gray-800 tracking-tight">
-                            📄 Arrivo del: {group.lines[0]?.arrival_date || '—'} — {group.invoice}
+                          <span className="text-sm sm:text-base font-black text-gray-800 tracking-tight" title={group.lines[0]?.shipment_type === 'AIR' ? 'Spedizione aerea' : group.lines[0]?.shipment_type === 'SEA' ? 'Spedizione via mare' : 'Spedizione via terra'}>
+                            {group.lines[0]?.shipment_type === 'AIR' ? '✈️' : group.lines[0]?.shipment_type === 'SEA' ? '🚢' : '🚚'} Arrivo del: {group.lines[0]?.arrival_date || '—'} — {group.invoice}
                           </span>
                           {group.lines[0]?.shipment_number && group.lines[0].shipment_number !== group.invoice && (
                             <span className="text-[10px] text-gray-400 font-semibold">Sped: <span className="font-mono text-gray-600">{group.lines[0].shipment_number}</span></span>
