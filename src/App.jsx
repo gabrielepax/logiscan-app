@@ -335,7 +335,7 @@ export default function App() {
   const [prelievoView, setPrelievoView] = useState('list'); // 'list' | 'new' | 'detail'
   const [prelieviList, setPrelieviList] = useState([]);
   const [prelievoDetail, setPrelievoDetail] = useState(null); // { testata, righe }
-  const [prelievoTab, setPrelievoTab] = useState('attivi'); // 'attivi' | 'registrati'
+  const [prelievoTab, setPrelievoTab] = useState('missioni'); // 'missioni' | 'attivi' | 'registrati'
   const [prelievoTipo, setPrelievoTipo] = useState('chiamata'); // 'chiamata' | 'workorder'
   const [prelieviLoading, setPrelieviLoading] = useState(false);
   const [prelievoUtente, setPrelievoUtente] = useState('');
@@ -356,6 +356,21 @@ export default function App() {
     return /^work order/i.test(d) || WO_RE.test(d);
   };
   const matchTipo = (p) => prelievoTipo === 'workorder' ? isWorkOrder(p) : !isWorkOrder(p);
+
+  // Missioni di Prelievo: richiesta persistente (codice+quantità) creata da un utente dal carrello,
+  // evasa in un secondo momento da un altro utente (o dallo stesso) dal modulo Prelievi.
+  const [missioniList, setMissioniList] = useState([]);
+  const [missioniLoading, setMissioniLoading] = useState(false);
+  const [missioneDetail, setMissioneDetail] = useState(null); // { testata, righe }
+  const [missioneEsecuzione, setMissioneEsecuzione] = useState(null); // missione in corso di evasione da 'new', con le sue righe originarie
+  const [missioniPanelOpen, setMissioniPanelOpen] = useState(false); // pannello "Missioni attive" richiamabile da Stock Spare Parts
+  const [missioniPanelDetail, setMissioniPanelDetail] = useState(null); // { testata, righe } drill-down dentro il pannello
+
+  // Carrello Stock Spare Parts (solo sessione corrente, si svuota al refresh)
+  const [cartItems, setCartItems] = useState([]); // { codice, descrizione, quantita, disponibile }
+  const [cartOpen, setCartOpen] = useState(false);
+  const [cartDest, setCartDest] = useState(''); // destinazione richiesta per la missione: Secure Room | Repair | Reintegro
+  const [riepQtyDraft, setRiepQtyDraft] = useState({}); // codice -> quantità digitata in linea prima di aggiungere al carrello
 
   // Anagrafica Terminali (tipoterminale.xlsx → foglio "famiglie", chiave CODICE = PNIT del DB spare parts)
   const [anagrafica, setAnagrafica] = useState([]);
@@ -418,6 +433,7 @@ export default function App() {
     fetchSpareParts();
     fetchStock();
     fetchPrelievi();
+    fetchMissioni();
     fetchAnagrafica();
     fetchOrdini();
     fetchMedia();
@@ -1795,7 +1811,8 @@ export default function App() {
   async function fetchPrelievi() {
     setPrelieviLoading(true);
     const [{ data: testate, error }, { data: righe }] = await Promise.all([
-      supabase.from('prelievi').select('*').order('data_prelievo', { ascending: false }),
+      // Esclude le missioni ancora aperte (non evase): vivono nella stessa tabella ma non sono prelievi reali finché non evase
+      supabase.from('prelievi').select('*').or('stato.is.null,stato.neq.aperta').order('data_prelievo', { ascending: false }),
       supabase.from('prelievi_righe').select('prelievo_id, quantita')
     ]);
     if (error) { alert('Errore caricamento prelievi: ' + error.message); setPrelieviLoading(false); return; }
@@ -1807,6 +1824,131 @@ export default function App() {
     });
     setPrelieviList((testate || []).map(t => ({ ...t, n_righe: agg[t.id]?.righe || 0, n_pezzi: agg[t.id]?.pezzi || 0 })));
     setPrelieviLoading(false);
+  }
+
+  // Le missioni sono righe della stessa tabella prelievi/prelievi_righe (origine='missione', stato='aperta'
+  // finché non evase): niente più tabelle separate, solo un discriminante a livello di DB.
+  async function fetchMissioni() {
+    setMissioniLoading(true);
+    const [{ data: testate, error }, { data: righe }] = await Promise.all([
+      supabase.from('prelievi').select('*').eq('origine', 'missione').eq('stato', 'aperta').order('richiesta_at', { ascending: false }),
+      supabase.from('prelievi_righe').select('prelievo_id, quantita_richiesta')
+    ]);
+    if (error) { alert('Errore caricamento missioni: ' + error.message); setMissioniLoading(false); return; }
+    const agg = {};
+    (righe || []).forEach(r => {
+      if (!agg[r.prelievo_id]) agg[r.prelievo_id] = { righe: 0, richiesti: 0 };
+      agg[r.prelievo_id].righe += 1;
+      agg[r.prelievo_id].richiesti += (r.quantita_richiesta || 0);
+    });
+    setMissioniList((testate || []).map(t => ({
+      id: t.id,
+      id_missione: t.id_prelievo,
+      richiedente: t.richiedente,
+      destinazione: t.destinazione,
+      stato: t.stato,
+      created_at: t.richiesta_at,
+      n_righe: agg[t.id]?.righe || 0,
+      tot_richiesti: agg[t.id]?.richiesti || 0,
+    })));
+    setMissioniLoading(false);
+  }
+
+  async function generaIdPrelievo() {
+    const now = new Date();
+    const datePrefix = String(now.getFullYear()).slice(2).padStart(2, '0')
+      + String(now.getMonth() + 1).padStart(2, '0')
+      + String(now.getDate()).padStart(2, '0');
+    const { count } = await supabase.from('prelievi')
+      .select('*', { count: 'exact', head: true })
+      .like('id_prelievo', `${datePrefix}-%`);
+    return `${datePrefix}-${(count || 0) + 1}`;
+  }
+
+  async function creaMissionePrelievo() {
+    if (cartItems.length === 0) return;
+    if (!cartDest) { alert('Seleziona la destinazione dei materiali (Secure Room, Repair o Reintegro).'); setCartOpen(true); return; }
+    const destFinale = cartDest.trim();
+    let user = currentUser;
+    if (!user) {
+      const name = window.prompt('Inserisci il tuo nome utente:');
+      if (!name) return;
+      localStorage.setItem('logiscan_username', name);
+      setCurrentUser(name);
+      user = name;
+    }
+    if (!window.confirm(`Creare una missione di prelievo con ${cartItems.length} articoli per "${destFinale}"?\n\nUn operatore potrà evaderla in seguito dal modulo Prelievi.`)) return;
+    setLoading(true);
+    try {
+      const idMissione = await generaIdPrelievo();
+
+      const { data: testata, error: errT } = await supabase.from('prelievi')
+        .insert({ id_prelievo: idMissione, origine: 'missione', richiedente: user, stato: 'aperta', destinazione: destFinale, richiesta_at: new Date().toISOString(), data_prelievo: null })
+        .select('id').single();
+      if (errT) { alert('Errore creazione missione: ' + errT.message); return; }
+
+      const righeIns = cartItems.map(i => ({
+        prelievo_id: testata.id,
+        codice: i.codice,
+        quantita_richiesta: parseFloat(i.quantita) || 0,
+      }));
+      const { error: errR } = await supabase.from('prelievi_righe').insert(righeIns);
+      if (errR) { alert('Errore creazione righe missione: ' + errR.message); return; }
+
+      alert(`Missione ${idMissione} creata (${righeIns.length} articoli).`);
+      setCartItems([]);
+      setCartOpen(false);
+      setCartDest('');
+      await fetchMissioni();
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function openMissioneDetail(missione) {
+    setMissioniLoading(true);
+    const { data: righe, error } = await supabase.from('prelievi_righe')
+      .select('*').eq('prelievo_id', missione.id).order('id', { ascending: true });
+    setMissioniLoading(false);
+    if (error) { alert('Errore caricamento righe missione: ' + error.message); return; }
+    setMissioneDetail({ testata: missione, righe: (righe || []).map(r => ({ ...r, descrizione: descByCodice[r.codice] || '' })) });
+    setPrelievoView('missione-detail');
+  }
+
+  async function deleteMissione(missione) {
+    if (!window.confirm(`Eliminare la missione ${missione.id_missione}? Non è ancora stata evasa.`)) return;
+    await supabase.from('prelievi_righe').delete().eq('prelievo_id', missione.id);
+    const { error } = await supabase.from('prelievi').delete().eq('id', missione.id);
+    if (error) { alert('Errore eliminazione missione: ' + error.message); return; }
+    if (missioneDetail?.testata.id === missione.id) { setMissioneDetail(null); setPrelievoView('list'); }
+    if (missioniPanelDetail?.testata.id === missione.id) setMissioniPanelDetail(null);
+    await fetchMissioni();
+  }
+
+  async function eseguiMissione(missione) {
+    setMissioniLoading(true);
+    const { data: righe, error } = await supabase.from('prelievi_righe')
+      .select('*').eq('prelievo_id', missione.id).order('id', { ascending: true });
+    setMissioniLoading(false);
+    if (error) { alert('Errore caricamento righe missione: ' + error.message); return; }
+    if ((righe || []).length === 0) { alert('Questa missione non ha righe.'); return; }
+
+    // Nessuna compilazione automatica: l'operatore vede la richiesta come riferimento
+    // e preleva lui stesso codici, ubicazioni e quantità tramite scanner/inserimento manuale.
+    setPrelievoRighe([]);
+    setMissioneEsecuzione({ ...missione, righeOriginali: righe.map(r => ({ ...r, descrizione: descByCodice[r.codice] || '' })) });
+    // Destinazione già decisa dal richiedente in fase di creazione missione
+    setPrelievoDest(missione.destinazione || ''); setPrelievoWO('');
+    setPrelievoManuale({ codice: '', stockId: '', quantita: '' });
+    setPrelievoFeedback({ text: '', type: '' });
+    setPrelievoView('new');
+  }
+
+  async function openMissioniPanelDetail(missione) {
+    const { data: righe, error } = await supabase.from('prelievi_righe')
+      .select('*').eq('prelievo_id', missione.id).order('id', { ascending: true });
+    if (error) { alert('Errore caricamento righe missione: ' + error.message); return; }
+    setMissioniPanelDetail({ testata: missione, righe: (righe || []).map(r => ({ ...r, descrizione: descByCodice[r.codice] || '' })) });
   }
 
   async function exportPrelieviRettifica() {
@@ -2013,7 +2155,10 @@ export default function App() {
       setCurrentUser(name);
       user = name;
     }
-    if (!window.confirm(`Registrare il prelievo di ${prelievoRighe.length} righe?\n\nLe giacenze verranno decurtate dall'inventario.`)) return;
+    const evadeMissione = missioneEsecuzione;
+    if (!window.confirm(evadeMissione
+      ? `Registrare l'evasione della missione ${evadeMissione.id_missione} (${prelievoRighe.length} righe)?\n\nLe giacenze verranno decurtate dall'inventario.`
+      : `Registrare il prelievo di ${prelievoRighe.length} righe?\n\nLe giacenze verranno decurtate dall'inventario.`)) return;
 
     // Guard sincrono anti doppio-submit: blocca una seconda invocazione ravvicinata
     if (registraLockRef.current) return;
@@ -2022,27 +2167,32 @@ export default function App() {
     const errors = [];
 
     try {
-      // Genera id_prelievo AAMMGG-X
-      const now = new Date();
-      const datePrefix = String(now.getFullYear()).slice(2).padStart(2,'0')
-        + String(now.getMonth() + 1).padStart(2,'0')
-        + String(now.getDate()).padStart(2,'0');
-      const { count } = await supabase.from('prelievi')
-        .select('*', { count: 'exact', head: true })
-        .like('id_prelievo', `${datePrefix}-%`);
-      const idPrelievo = `${datePrefix}-${(count || 0) + 1}`;
+      let idPrelievo, prelievoId;
+      if (evadeMissione) {
+        // La missione è già una riga di prelievi (origine='missione', stato='aperta'): la si aggiorna
+        // sul posto e diventa un prelievo evaso a tutti gli effetti, senza creare un nuovo record.
+        idPrelievo = evadeMissione.id_missione;
+        prelievoId = evadeMissione.id;
+        const { error: errU } = await supabase.from('prelievi')
+          .update({ utente: user, destinazione: destFinale || null, stato: null, data_prelievo: new Date().toISOString() })
+          .eq('id', prelievoId);
+        if (errU) { alert('Errore aggiornamento missione: ' + errU.message); return; }
+        // Rimuove le righe-richiesta (placeholder, senza ubicazione) prima di inserire quelle effettivamente prelevate
+        await supabase.from('prelievi_righe').delete().eq('prelievo_id', prelievoId);
+      } else {
+        idPrelievo = await generaIdPrelievo();
+        const { data: testata, error: errT } = await supabase.from('prelievi')
+          .insert({ id_prelievo: idPrelievo, utente: user, destinazione: destFinale || null })
+          .select('id').single();
+        if (errT) { alert('Errore creazione prelievo: ' + errT.message); return; }
+        prelievoId = testata.id;
+      }
 
-      // 1. Crea testata prelievo
-      const { data: testata, error: errT } = await supabase.from('prelievi')
-        .insert({ id_prelievo: idPrelievo, utente: user, destinazione: destFinale || null })
-        .select('id').single();
-      if (errT) { alert('Errore creazione prelievo: ' + errT.message); return; }
-
-      // 2. Righe + decurtazione stock
+      // Righe + decurtazione stock
       for (const r of prelievoRighe) {
         const q = parseFloat(r.quantita);
         await supabase.from('prelievi_righe').insert({
-          prelievo_id: testata.id, stock_id: r.stockId, id_cartone: r.idCartone,
+          prelievo_id: prelievoId, stock_id: r.stockId, id_cartone: r.idCartone,
           codice: r.codice, numero_bancale: r.numero_bancale, magazzino: r.magazzino, quantita: q,
         });
         const nuovoStock = r.qtaDisponibile - q;
@@ -2056,18 +2206,45 @@ export default function App() {
       }
 
       if (errors.length) alert('Completato con errori:\n' + errors.join('\n'));
-      else alert(`Prelievo ${idPrelievo} registrato (${prelievoRighe.length} righe).`);
+      else alert(`Prelievo ${idPrelievo} registrato (${prelievoRighe.length} righe).${evadeMissione ? '\n\nMissione evasa.' : ''}`);
       setPrelievoRighe([]);
       setPrelievoDest('');
       setPrelievoWO('');
       setPrelievoFeedback({ text: '', type: '' });
+      setMissioneEsecuzione(null);
       setPrelievoView('list');
+      if (evadeMissione) setPrelievoTab('missioni');
       await fetchStock();
       await fetchPrelievi();
+      if (evadeMissione) await fetchMissioni();
     } finally {
       registraLockRef.current = false;
       setLoading(false);
     }
+  }
+
+  // Carrello Stock Spare Parts: accumula codice+quantità desiderata (svincolato dal singolo bancale);
+  // l'allocazione sui bancali/stockId effettivi avviene solo al momento della creazione del Prelievo.
+  function addToCart(codice, descrizione, disponibile, quantitaRichiesta) {
+    const qta = Math.max(1, parseFloat(quantitaRichiesta) || 1);
+    setCartItems(prev => {
+      const existing = prev.find(i => i.codice === codice);
+      if (existing) {
+        const nuovaQta = Math.min(existing.quantita + qta, disponibile);
+        return prev.map(i => i.codice === codice ? { ...i, quantita: nuovaQta, disponibile } : i);
+      }
+      return [...prev, { codice, descrizione, quantita: Math.min(qta, disponibile), disponibile }];
+    });
+    setRiepQtyDraft(prev => ({ ...prev, [codice]: '' }));
+    sounds.ok(); triggerVibration([100]);
+  }
+
+  function updateCartQty(codice, value) {
+    setCartItems(prev => prev.map(i => i.codice === codice ? { ...i, quantita: value } : i));
+  }
+
+  function removeFromCart(codice) {
+    setCartItems(prev => prev.filter(i => i.codice !== codice));
   }
 
   function handleStockKeyNav(e, rowIndex, field) {
@@ -2984,7 +3161,7 @@ export default function App() {
                     {visible.map(mod => (
                       <button
                         key={mod.id}
-                        onClick={() => { setActiveModule(mod.id); setMenuOpen(false); setCurrentView('dashboard'); if (mod.id === 'prelievi') { setPrelievoView('list'); fetchPrelievi(); } if (mod.id === 'utenti') fetchUtenti(); if (mod.id === 'moduli') fetchModuliConfig(); }}
+                        onClick={() => { setActiveModule(mod.id); setMenuOpen(false); setCurrentView('dashboard'); if (mod.id === 'prelievi') { setPrelievoView('list'); fetchPrelievi(); fetchMissioni(); } if (mod.id === 'utenti') fetchUtenti(); if (mod.id === 'moduli') fetchModuliConfig(); }}
                         className={`w-full flex items-center gap-3 px-4 py-3 rounded-xl text-sm font-bold transition cursor-pointer text-left ${activeModule === mod.id ? 'bg-blue-600 text-white' : 'text-gray-700 hover:bg-gray-100'}`}
                       >
                         <span className="text-lg">{mod.icon}</span>
@@ -3781,7 +3958,23 @@ export default function App() {
                   rowMap[key].stockNetsuite += (v.qty_netsuite || 0);
                 });
 
-                let rows = Object.values(rowMap).map(r => ({ ...r, delta: r.stockApp - r.stockNetsuite }));
+                // Prezzo unitario da Anagrafica (per codice), usato per valorizzare la differenza:
+                // il valore di magazzino è quello di NetSuite, quindi la differenza (NetSuite - App) * costo unitario
+                // rappresenta il valore da rettificare.
+                const anagByCodiceControlli = {};
+                anagrafica.forEach(a => {
+                  const c = String(a.codice || '').trim();
+                  if (c && !anagByCodiceControlli[c]) anagByCodiceControlli[c] = a;
+                });
+
+                let rows = Object.values(rowMap).map(r => {
+                  const delta = r.stockNetsuite - r.stockApp;
+                  const anag = anagByCodiceControlli[r.codice];
+                  const prezzo = anag?.prezzo || 0;
+                  const valuta = anag?.valuta || '';
+                  const valoreDelta = prezzo > 0 ? delta * prezzo : null;
+                  return { ...r, delta, prezzo, valuta, valoreDelta };
+                });
 
                 const uniqueMagazziniControlli = [...new Set(rows.map(r => r.magazzino).filter(Boolean))].sort();
 
@@ -3793,7 +3986,8 @@ export default function App() {
                 const { col, dir } = controlliSort;
                 const mul = dir === 'asc' ? 1 : -1;
                 rows.sort((a, b) => {
-                  const va = a[col], vb = b[col];
+                  let va = a[col], vb = b[col];
+                  if (col === 'valoreDelta') { va = va ?? 0; vb = vb ?? 0; }
                   if (typeof va === 'number') return (va - vb) * mul;
                   return String(va).localeCompare(String(vb)) * mul;
                 });
@@ -3812,7 +4006,7 @@ export default function App() {
                     <div className="flex items-center justify-between flex-wrap gap-3">
                       <div>
                         <h2 className="text-lg font-black text-gray-800">🔍 Controlli</h2>
-                        <p className="text-xs text-gray-500">Giacenza dell&apos;app raggruppata per Magazzino + Codice (somma Stock), confrontata con l&apos;export di verifica giacenza da NetSuite (Item, LOCATION, Sum of On Hand).</p>
+                        <p className="text-xs text-gray-500">Giacenza dell&apos;app raggruppata per Magazzino + Codice (somma Stock), confrontata con l&apos;export di verifica giacenza da NetSuite (Item, LOCATION, Sum of On Hand). Differenza calcolata come NetSuite - App (il valore di magazzino fa fede su NetSuite).</p>
                         {importMeta.stock_verifica && <p className="text-[11px] text-gray-400">Ultimo caricamento NetSuite: {new Date(importMeta.stock_verifica).toLocaleString('it-IT')}</p>}
                       </div>
                       {canUpload('stock') && (
@@ -3840,7 +4034,7 @@ export default function App() {
                       </label>
                       {rows.length > 0 && (
                         <button onClick={() => {
-                          const out = rows.map(r => ({ 'Codice': r.codice, 'Magazzino': r.magazzino, 'Stock App': r.stockApp, 'Stock NetSuite': r.stockNetsuite, 'Differenza': r.delta }));
+                          const out = rows.map(r => ({ 'Codice': r.codice, 'Magazzino': r.magazzino, 'Stock App': r.stockApp, 'Stock NetSuite': r.stockNetsuite, 'Differenza (NetSuite - App)': r.delta, 'Valore Differenza': r.valoreDelta !== null ? r.valoreDelta : '' }));
                           const ws = XLSX.utils.json_to_sheet(out);
                           const wb = XLSX.utils.book_new();
                           XLSX.utils.book_append_sheet(wb, ws, 'Controlli');
@@ -3876,6 +4070,7 @@ export default function App() {
                               <th className="px-3 py-3 text-right cursor-pointer select-none whitespace-nowrap hover:bg-gray-100 transition" onClick={() => toggleControlliSort('stockApp')}>Stock App{controlliArrow('stockApp')}</th>
                               <th className="px-3 py-3 text-right cursor-pointer select-none whitespace-nowrap hover:bg-gray-100 transition" onClick={() => toggleControlliSort('stockNetsuite')}>Stock NetSuite{controlliArrow('stockNetsuite')}</th>
                               <th className="px-3 py-3 text-right cursor-pointer select-none whitespace-nowrap hover:bg-gray-100 transition" onClick={() => toggleControlliSort('delta')}>Differenza{controlliArrow('delta')}</th>
+                              <th className="px-3 py-3 text-right cursor-pointer select-none whitespace-nowrap hover:bg-gray-100 transition" onClick={() => toggleControlliSort('valoreDelta')}>Valore Differenza{controlliArrow('valoreDelta')}</th>
                             </tr>
                           </thead>
                           <tbody className="divide-y divide-gray-100">
@@ -3886,6 +4081,9 @@ export default function App() {
                                 <td className="px-3 py-2.5 text-right font-mono">{r.stockApp}</td>
                                 <td className="px-3 py-2.5 text-right font-mono">{r.stockNetsuite}</td>
                                 <td className={`px-3 py-2.5 text-right font-mono font-black ${r.delta > 0 ? 'text-amber-600' : r.delta < 0 ? 'text-red-600' : 'text-gray-300'}`}>{r.delta !== 0 ? (r.delta > 0 ? `+${r.delta}` : r.delta) : '—'}</td>
+                                <td className={`px-3 py-2.5 text-right font-mono ${r.valoreDelta ? (r.valoreDelta > 0 ? 'text-amber-600' : 'text-red-600') : 'text-gray-300'}`}>
+                                  {r.valoreDelta !== null ? `${currencySymbol(r.valuta)}${r.valoreDelta.toLocaleString('it-IT', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}` : 'n/d'}
+                                </td>
                               </tr>
                             ))}
                           </tbody>
@@ -4372,14 +4570,18 @@ export default function App() {
                     <input type="checkbox" checked={riepFilterRplus} onChange={e => setRiepFilterRplus(e.target.checked)} className="w-4 h-4 accent-blue-600 cursor-pointer" />
                     <span className="text-xs font-semibold text-gray-700">Solo R+</span>
                   </label>
+                  <button onClick={() => { setMissioniPanelOpen(true); fetchMissioni(); }}
+                    className="ml-auto text-xs font-bold px-3 py-2 rounded-xl bg-amber-50 hover:bg-amber-100 text-amber-700 border border-amber-200 cursor-pointer transition">
+                    🛒 Missioni attive ({missioniList.length})
+                  </button>
                 </div>
                 <div className="flex items-center justify-between text-[11px] text-gray-500 flex-wrap gap-2">
                   <div className="flex items-center gap-2">
                     <span className="font-semibold text-gray-600">Vista:</span>
                     <div className="flex gap-1 bg-gray-100 p-1 rounded-lg">
                       {[
-                        { id: 'type', label: 'TYPE → PNIT' },
-                        { id: 'gruppo', label: 'PNIT → TYPE' },
+                        { id: 'type', label: 'SPARE → PNIT' },
+                        { id: 'gruppo', label: 'PNIT → SPARE' },
                       ].map(v => (
                         <button key={v.id} onClick={() => { setRiepGroupMode(v.id); setRiepExpanded(new Set()); }}
                           className={`text-[11px] font-bold px-3 py-1 rounded-md cursor-pointer transition ${riepGroupMode === v.id ? 'bg-white text-gray-800 shadow-xs' : 'text-gray-500 hover:text-gray-700'}`}>
@@ -4387,7 +4589,7 @@ export default function App() {
                         </button>
                       ))}
                     </div>
-                    <span>· {groupList.length} {riepGroupMode === 'gruppo' ? 'PNIT' : 'type'} · {codici.length} codici</span>
+                    <span>· {groupList.length} {riepGroupMode === 'gruppo' ? 'PNIT' : 'SPARE'} · {codici.length} codici</span>
                   </div>
                   <span className="font-black text-blue-600">Stock: {totaleGenerale} · <span className="text-emerald-600">In arrivo: {totArrivo}</span> · <span className="text-amber-600">In ordine: {totOrdine}</span></span>
                 </div>
@@ -4400,7 +4602,7 @@ export default function App() {
                     <thead className="bg-gray-50 border-b border-gray-200 text-[10px] font-black text-gray-500 uppercase tracking-wider">
                       <tr>
                         <th className="px-3 py-3 w-8"></th>
-                        <th className="px-3 py-3">{riepGroupMode === 'gruppo' ? 'PNIT' : 'Type'}</th>
+                        <th className="px-3 py-3">{riepGroupMode === 'gruppo' ? 'PNIT' : 'SPARE'}</th>
                         <th className="px-3 py-3 text-right">N. Codici</th>
                         <th className="px-3 py-3 text-right">Stock Totale</th>
                         <th className="px-3 py-3 text-right text-emerald-600">In arrivo</th>
@@ -4443,6 +4645,7 @@ export default function App() {
                                           <th className="px-3 py-1.5 text-right">Stock</th>
                                           <th className="px-3 py-1.5 text-right text-emerald-600">In arrivo</th>
                                           <th className="px-3 py-1.5 text-right text-amber-600">In ordine</th>
+                                          <th className="px-3 py-1.5 w-8"></th>
                                         </tr>
                                       </thead>
                                       <tbody>
@@ -4459,6 +4662,24 @@ export default function App() {
                                             <td className="px-3 py-1.5 text-right font-mono font-black">{c.stock}</td>
                                             <td className="px-3 py-1.5 text-right font-mono text-emerald-600">{c.inArrivo || ''}</td>
                                             <td className="px-3 py-1.5 text-right font-mono text-amber-600">{c.inOrdine || ''}</td>
+                                            <td className="px-3 py-1.5">
+                                              <div className="flex items-center justify-center gap-1">
+                                                <input type="number" min="1" max={c.stock}
+                                                  value={riepQtyDraft[c.codice] ?? ''}
+                                                  onChange={e => setRiepQtyDraft(prev => ({ ...prev, [c.codice]: e.target.value }))}
+                                                  onClick={e => e.stopPropagation()}
+                                                  onKeyDown={e => { if (e.key === 'Enter') { e.preventDefault(); addToCart(c.codice, c.descrizione, c.stock, riepQtyDraft[c.codice]); } }}
+                                                  placeholder="Qtà"
+                                                  disabled={!c.stock}
+                                                  className="w-12 text-center bg-white border border-gray-300 rounded-md p-1 text-[11px] font-bold focus:outline-hidden disabled:opacity-30" />
+                                                <button onClick={e => { e.stopPropagation(); addToCart(c.codice, c.descrizione, c.stock, riepQtyDraft[c.codice]); }}
+                                                  disabled={!c.stock}
+                                                  title="Aggiungi al carrello"
+                                                  className="w-5 h-5 rounded-md bg-blue-50 hover:bg-blue-100 text-blue-600 font-black text-xs leading-none cursor-pointer disabled:opacity-30 disabled:cursor-not-allowed transition">
+                                                  +
+                                                </button>
+                                              </div>
+                                            </td>
                                           </tr>
                                         ))}
                                       </tbody>
@@ -5159,7 +5380,15 @@ export default function App() {
           <div className="space-y-5">
             <div className="flex items-center justify-between">
               <div>
-                <h2 className="text-lg font-black text-gray-800">📤 Prelievi effettuati</h2>
+                <div className="flex items-center gap-2">
+                  <h2 className="text-lg font-black text-gray-800">📤 Prelievi effettuati</h2>
+                  {missioniList.length > 0 && (
+                    <button onClick={() => setPrelievoTab('missioni')} title="Missioni in attesa di evasione"
+                      className="text-[10px] font-black text-white bg-amber-500 hover:bg-amber-600 px-2 py-1 rounded-full cursor-pointer">
+                      🛒 {missioniList.length} da evadere
+                    </button>
+                  )}
+                </div>
                 <p className="text-xs text-gray-500">{prelieviList.length} prelievi totali</p>
               </div>
               <div className="flex gap-2 flex-wrap">
@@ -5179,7 +5408,7 @@ export default function App() {
                     📥 Esporta Work Order (da definire)
                   </button>
                 )}
-                <button onClick={() => { setPrelievoView('new'); setPrelievoRighe([]); setPrelievoFeedback({ text: '', type: '' }); setTimeout(() => prelievoScannerRef.current?.focus(), 100); }}
+                <button onClick={() => { setPrelievoView('new'); setPrelievoRighe([]); setMissioneEsecuzione(null); setPrelievoFeedback({ text: '', type: '' }); setTimeout(() => prelievoScannerRef.current?.focus(), 100); }}
                   className="bg-blue-600 hover:bg-blue-700 text-white text-sm font-bold px-4 py-2.5 rounded-xl cursor-pointer transition shadow-xs">
                   + Nuovo prelievo
                 </button>
@@ -5199,19 +5428,68 @@ export default function App() {
               ))}
             </div>
 
-            {/* Sotto-schede: Attivi / Registrati (nella tipologia selezionata) */}
+            {/* Sotto-schede: Missioni (prima) / Attivi / Registrati (nella tipologia selezionata) */}
             <div className="flex gap-1 bg-gray-100 p-1 rounded-xl w-fit">
               {[
+                { id: 'missioni', label: '🛒 Missioni', n: missioniList.length },
                 { id: 'attivi', label: 'Attivi', n: prelieviList.filter(p => matchTipo(p) && p.stato !== 'registrato').length },
                 { id: 'registrati', label: 'Registrati', n: prelieviList.filter(p => matchTipo(p) && p.stato === 'registrato').length },
               ].map(t => (
-                <button key={t.id} onClick={() => setPrelievoTab(t.id)}
+                <button key={t.id} onClick={() => { setPrelievoTab(t.id); if (t.id === 'missioni') fetchMissioni(); }}
                   className={`text-xs font-bold px-4 py-2 rounded-lg cursor-pointer transition ${prelievoTab === t.id ? 'bg-white text-gray-800 shadow-xs' : 'text-gray-500 hover:text-gray-700'}`}>
                   {t.label} <span className="ml-1 text-[10px] opacity-70">({t.n})</span>
                 </button>
               ))}
             </div>
 
+            {prelievoTab === 'missioni' ? (
+              <>
+                {missioniLoading && <div className="text-center py-4 text-xs font-bold text-amber-600 animate-pulse">Caricamento...</div>}
+                {!missioniLoading && missioniList.length === 0 && (
+                  <div className="text-center py-16 text-gray-400 text-sm">
+                    Nessuna missione di prelievo. Si creano dal carrello in Stock Spare Parts.
+                  </div>
+                )}
+                {!missioniLoading && missioniList.length > 0 && (
+                  <div className="bg-white rounded-2xl border border-gray-200 shadow-xs overflow-x-auto">
+                    <table className="w-full min-w-[720px] text-left border-collapse text-xs">
+                      <thead className="bg-gray-50 border-b border-gray-200 text-[10px] font-black text-gray-500 uppercase tracking-wider">
+                        <tr>
+                          <th className="px-3 py-3">ID Missione</th>
+                          <th className="px-3 py-3">Data</th>
+                          <th className="px-3 py-3">Richiedente</th>
+                          <th className="px-3 py-3">Destinazione</th>
+                          <th className="px-3 py-3 text-right">Articoli</th>
+                          <th className="px-3 py-3 text-right">Richiesti</th>
+                          <th className="px-3 py-3"></th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-gray-100">
+                        {missioniList.map(m => (
+                          <tr key={m.id} className="hover:bg-blue-50/50 transition cursor-pointer" onClick={() => openMissioneDetail(m)}>
+                            <td className="px-3 py-2.5 font-mono font-bold text-blue-700 underline">{m.id_missione}</td>
+                            <td className="px-3 py-2.5 text-gray-600">{m.created_at ? new Date(m.created_at).toLocaleString('it-IT') : '—'}</td>
+                            <td className="px-3 py-2.5 text-gray-700">{m.richiedente || '—'}</td>
+                            <td className="px-3 py-2.5 text-gray-600">{m.destinazione || '—'}</td>
+                            <td className="px-3 py-2.5 text-right font-mono">{m.n_righe}</td>
+                            <td className="px-3 py-2.5 text-right font-mono">{m.tot_richiesti}</td>
+                            <td className="px-3 py-2.5 text-center" onClick={e => e.stopPropagation()}>
+                              <div className="flex gap-1 justify-center">
+                                <button onClick={() => eseguiMissione(m)}
+                                  className="text-[10px] text-white bg-blue-600 hover:bg-blue-700 px-2 py-1 rounded-lg cursor-pointer transition font-bold">▶ Evadi</button>
+                                <button onClick={() => deleteMissione(m)} title="Elimina missione"
+                                  className="text-[10px] text-gray-400 hover:text-red-600 bg-gray-50 hover:bg-red-50 border border-gray-200 hover:border-red-300 px-2 py-1 rounded-lg cursor-pointer transition">🗑</button>
+                              </div>
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+              </>
+            ) : (
+            <>
             {prelieviLoading && <div className="text-center py-4 text-xs font-bold text-amber-600 animate-pulse">Caricamento...</div>}
 
             {(() => {
@@ -5244,6 +5522,7 @@ export default function App() {
                         <td className="px-3 py-2.5 font-mono font-bold text-blue-700 underline">
                           {p.id_prelievo}
                           {p.stato === 'registrato' && <span className="ml-2 text-[9px] font-black text-emerald-700 bg-emerald-50 border border-emerald-200 px-1.5 py-0.5 rounded-md uppercase tracking-wide">Registrato</span>}
+                          {p.origine === 'missione' && <span className="ml-2 text-[9px] font-black text-indigo-700 bg-indigo-50 border border-indigo-200 px-1.5 py-0.5 rounded-md uppercase tracking-wide" title={`Richiesta da ${p.richiedente || '—'}`}>🛒 da missione</span>}
                         </td>
                         <td className="px-3 py-2.5 text-gray-600">{p.data_prelievo ? new Date(p.data_prelievo).toLocaleString('it-IT') : '—'}</td>
                         <td className="px-3 py-2.5 text-gray-700">{p.utente || '—'}</td>
@@ -5263,6 +5542,65 @@ export default function App() {
               </div>
               );
             })()}
+            </>
+            )}
+          </div>
+        )}
+
+        {/* ==================== MODULO MISSIONE PRELIEVO — DETTAGLIO ==================== */}
+        {activeModule === 'prelievi' && prelievoView === 'missione-detail' && missioneDetail && (
+          <div className="space-y-5 max-w-4xl mx-auto">
+            <div className="flex items-center justify-between">
+              <div>
+                <h2 className="text-lg font-black text-gray-800">🛒 Missione {missioneDetail.testata.id_missione}
+                  <span className="ml-2 text-[10px] align-middle font-black px-2 py-0.5 rounded-md uppercase tracking-wide border bg-amber-50 text-amber-700 border-amber-200">
+                    aperta
+                  </span>
+                </h2>
+                <p className="text-xs text-gray-500">
+                  {missioneDetail.testata.created_at ? new Date(missioneDetail.testata.created_at).toLocaleString('it-IT') : '—'}
+                  {' · '}Richiedente: <strong>{missioneDetail.testata.richiedente || '—'}</strong>
+                  {' · '}Destinazione: <strong>{missioneDetail.testata.destinazione || '—'}</strong>
+                </p>
+              </div>
+              <div className="flex gap-2">
+                <button onClick={() => eseguiMissione(missioneDetail.testata)}
+                  className="bg-blue-600 hover:bg-blue-700 text-white text-xs font-bold px-4 py-2.5 rounded-xl cursor-pointer transition">
+                  ▶ Evadi missione
+                </button>
+                <button onClick={() => deleteMissione(missioneDetail.testata)}
+                  className="bg-red-50 hover:bg-red-100 text-red-600 border border-red-200 text-xs font-bold px-4 py-2.5 rounded-xl cursor-pointer transition">
+                  🗑 Elimina
+                </button>
+                <button onClick={() => { setPrelievoView('list'); setMissioneDetail(null); }}
+                  className="bg-gray-100 hover:bg-gray-200 text-gray-700 text-xs font-bold px-4 py-2.5 rounded-xl cursor-pointer transition">
+                  ← Torna alla lista
+                </button>
+              </div>
+            </div>
+
+            <div className="bg-white rounded-2xl border border-gray-200 shadow-xs overflow-hidden">
+              <div className="overflow-x-auto">
+              <table className="w-full min-w-[520px] text-left border-collapse text-xs">
+                <thead className="bg-gray-50 border-b border-gray-200 text-[10px] font-black text-gray-500 uppercase tracking-wider">
+                  <tr>
+                    <th className="px-3 py-3">Codice</th>
+                    <th className="px-3 py-3">Descrizione</th>
+                    <th className="px-3 py-3 text-right">Richiesti</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-gray-100">
+                  {missioneDetail.righe.map(r => (
+                    <tr key={r.id} className="hover:bg-gray-50/80">
+                      <td className="px-3 py-2.5 font-mono font-bold text-blue-700">{r.codice}</td>
+                      <td className="px-3 py-2.5 text-gray-600">{r.descrizione || '—'}</td>
+                      <td className="px-3 py-2.5 text-right font-mono font-black">{r.quantita_richiesta}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+              </div>
+            </div>
           </div>
         )}
 
@@ -5273,11 +5611,13 @@ export default function App() {
               <div>
                 <h2 className="text-lg font-black text-gray-800">📤 Prelievo {prelievoDetail.testata.id_prelievo}
                   {prelievoDetail.testata.stato === 'registrato' && <span className="ml-2 text-[10px] align-middle font-black text-emerald-700 bg-emerald-50 border border-emerald-200 px-2 py-0.5 rounded-md uppercase tracking-wide">🔒 Registrato</span>}
+                  {prelievoDetail.testata.origine === 'missione' && <span className="ml-2 text-[10px] align-middle font-black text-indigo-700 bg-indigo-50 border border-indigo-200 px-2 py-0.5 rounded-md uppercase tracking-wide">🛒 da missione</span>}
                 </h2>
                 <p className="text-xs text-gray-500">
                   {prelievoDetail.testata.data_prelievo ? new Date(prelievoDetail.testata.data_prelievo).toLocaleString('it-IT') : '—'}
                   {' · '}Operatore: <strong>{prelievoDetail.testata.utente || '—'}</strong>
                   {prelievoDetail.testata.destinazione ? <> · Dest: <strong>{prelievoDetail.testata.destinazione}</strong></> : null}
+                  {prelievoDetail.testata.origine === 'missione' && prelievoDetail.testata.richiedente ? <> · Richiesta da: <strong>{prelievoDetail.testata.richiedente}</strong></> : null}
                 </p>
               </div>
               <button onClick={() => { setPrelievoView('list'); setPrelievoDetail(null); }}
@@ -5345,13 +5685,51 @@ export default function App() {
             <div className="space-y-5 max-w-4xl mx-auto">
 
               <div className="flex items-center justify-between">
-                <h2 className="text-lg font-black text-gray-800">📤 Nuovo prelievo</h2>
-                <button onClick={() => { if (prelievoRighe.length === 0 || window.confirm('Uscire? Le righe non registrate andranno perse.')) { setPrelievoView('list'); setPrelievoRighe([]); } }}
+                <div>
+                  <h2 className="text-lg font-black text-gray-800">📤 Nuovo prelievo</h2>
+                  {missioneEsecuzione && (
+                    <p className="text-xs font-bold text-indigo-600">
+                      Evasione missione {missioneEsecuzione.id_missione} · richiesta da {missioneEsecuzione.richiedente || '—'}
+                    </p>
+                  )}
+                </div>
+                <button onClick={() => { if (prelievoRighe.length === 0 || window.confirm('Uscire? Le righe non registrate andranno perse.')) { const eraMissione = !!missioneEsecuzione; setPrelievoView('list'); setPrelievoRighe([]); setMissioneEsecuzione(null); if (eraMissione) setPrelievoTab('missioni'); } }}
                   className="bg-gray-100 hover:bg-gray-200 text-gray-700 text-xs font-bold px-4 py-2.5 rounded-xl cursor-pointer transition">
                   ← Torna alla lista
                 </button>
               </div>
 
+              {/* Richiesta della missione: solo riferimento, il prelievo va fatto manualmente sotto */}
+              {missioneEsecuzione && (() => {
+                const presoByCodice = {};
+                prelievoRighe.forEach(r => { presoByCodice[r.codice] = (presoByCodice[r.codice] || 0) + (parseFloat(r.quantita) || 0); });
+                return (
+                  <div className="bg-indigo-50/60 p-4 rounded-2xl border border-indigo-200 space-y-2">
+                    <span className="text-[10px] font-black text-indigo-500 uppercase tracking-wider block">Richiesto dalla missione (riferimento — preleva tu le quantità e le ubicazioni)</span>
+                    <div className="divide-y divide-indigo-100 max-h-72 overflow-y-auto">
+                      {missioneEsecuzione.righeOriginali.map(item => {
+                        const preso = presoByCodice[item.codice] || 0;
+                        const richiesto = parseFloat(item.quantita_richiesta) || 0;
+                        const done = preso >= richiesto && richiesto > 0;
+                        return (
+                          <div key={item.id} className="flex items-center gap-3 py-2">
+                            <span className={`text-sm ${done ? 'text-emerald-600' : preso > 0 ? 'text-amber-500' : 'text-gray-300'}`}>{done ? '✓' : preso > 0 ? '◐' : '○'}</span>
+                            <div className="flex-grow min-w-0">
+                              <p className="text-sm font-mono font-bold text-blue-700">{item.codice}</p>
+                              <p className="text-xs text-gray-500 truncate">{item.descrizione || '—'}</p>
+                            </div>
+                            <span className={`text-sm font-mono font-black ${done ? 'text-emerald-600' : preso > 0 ? 'text-amber-600' : 'text-gray-400'}`}>{preso} / {richiesto}</span>
+                            <button onClick={() => { setPrelievoManuale(v => ({ ...v, codice: item.codice, stockId: '' })); document.getElementById('prelievo-manuale-codice')?.scrollIntoView({ behavior: 'smooth', block: 'center' }); }}
+                              className="text-[10px] font-bold text-indigo-600 hover:text-indigo-800 bg-white border border-indigo-200 hover:border-indigo-400 px-2 py-1 rounded-lg cursor-pointer transition">
+                              Cerca ↓
+                            </button>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                );
+              })()}
 
               {/* Testata prelievo */}
               <div className="bg-white p-4 rounded-2xl border border-gray-200 shadow-xs space-y-3">
@@ -5371,6 +5749,7 @@ export default function App() {
                       <option value="Secure Room">Secure Room</option>
                       <option value="Repair">Repair</option>
                       <option value="Work Order">Work Order</option>
+                      <option value="Reintegro">Reintegro</option>
                     </select>
                   </div>
                   {prelievoDest === 'Work Order' && (
@@ -5413,7 +5792,7 @@ export default function App() {
                 <div className="grid grid-cols-1 sm:grid-cols-12 gap-3 items-end">
                   <div className="sm:col-span-4 space-y-1">
                     <label className="block text-xs font-bold text-gray-500">Codice articolo</label>
-                    <input list="prelievo-codici" value={prelievoManuale.codice}
+                    <input id="prelievo-manuale-codice" list="prelievo-codici" value={prelievoManuale.codice}
                       onChange={e => setPrelievoManuale(v => ({ ...v, codice: e.target.value, stockId: '' }))}
                       placeholder="Cerca codice..."
                       className="w-full bg-gray-50 border border-gray-300 rounded-xl p-2.5 text-xs font-mono focus:outline-hidden" />
@@ -6303,6 +6682,152 @@ export default function App() {
               className="text-sm font-bold px-4 py-2 rounded-xl bg-green-600 hover:bg-green-700 text-white cursor-pointer transition shadow-xs">
               ✓ Salva
             </button>
+          </div>
+        </div>
+      )}
+
+      {/* Carrello Stock Spare Parts */}
+      {activeModule === 'riepilogo' && cartItems.length > 0 && (
+        <div className="fixed bottom-0 left-0 right-0 z-50 bg-white border-t border-blue-200 shadow-lg px-4 py-3 flex items-center justify-between gap-4">
+          <span className="text-sm font-bold text-blue-700">
+            🛒 {cartItems.length} {cartItems.length === 1 ? 'articolo' : 'articoli'} nel carrello
+          </span>
+          <div className="flex gap-2">
+            <button onClick={() => setCartOpen(true)}
+              className="text-sm font-bold px-4 py-2 rounded-xl bg-gray-100 hover:bg-gray-200 text-gray-600 cursor-pointer transition">
+              Vedi carrello
+            </button>
+            <button onClick={() => { setCartItems([]); setCartDest(''); }}
+              className="text-sm font-bold px-4 py-2 rounded-xl bg-gray-100 hover:bg-gray-200 text-gray-600 cursor-pointer transition">
+              Svuota
+            </button>
+            <select value={cartDest} onChange={e => setCartDest(e.target.value)}
+              className="bg-gray-50 border border-gray-300 rounded-xl px-3 py-2 text-sm font-bold focus:outline-hidden">
+              <option value="">Destinazione...</option>
+              <option value="Secure Room">Secure Room</option>
+              <option value="Repair">Repair</option>
+              <option value="Reintegro">Reintegro</option>
+            </select>
+            <button onClick={creaMissionePrelievo} disabled={!cartDest}
+              className="text-sm font-bold px-4 py-2 rounded-xl bg-blue-600 hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed text-white cursor-pointer transition shadow-xs">
+              ✓ Crea Missione di Prelievo
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* Pannello dettaglio carrello */}
+      {cartOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center">
+          <div className="fixed inset-0 bg-black/40" onClick={() => setCartOpen(false)} />
+          <div className="relative z-10 w-full max-w-lg bg-white rounded-2xl shadow-2xl flex flex-col max-h-[80vh]">
+            <div className="p-5 border-b border-gray-100 flex items-center justify-between">
+              <h3 className="text-lg font-black text-gray-800">🛒 Carrello</h3>
+              <button onClick={() => setCartOpen(false)} className="text-gray-400 hover:text-gray-700 text-2xl leading-none cursor-pointer">✕</button>
+            </div>
+            <div className="p-4 border-b border-gray-100 space-y-2 bg-gray-50/60">
+              <label className="block text-xs font-bold text-gray-500">Destinazione dei materiali <span className="text-red-500">*</span></label>
+              <select value={cartDest} onChange={e => setCartDest(e.target.value)}
+                className="w-full bg-white border border-gray-300 rounded-xl p-2.5 text-sm focus:outline-hidden">
+                <option value="">Seleziona destinazione...</option>
+                <option value="Secure Room">Secure Room</option>
+                <option value="Repair">Repair</option>
+                <option value="Reintegro">Reintegro</option>
+              </select>
+            </div>
+            <div className="flex-grow overflow-y-auto p-4 space-y-2">
+              {cartItems.length === 0 ? (
+                <p className="text-sm text-gray-400 text-center py-8">Carrello vuoto.</p>
+              ) : cartItems.map(item => (
+                <div key={item.codice} className="flex items-center gap-3 bg-gray-50 rounded-xl p-3">
+                  <div className="flex-grow min-w-0">
+                    <p className="text-sm font-bold text-blue-700 font-mono">{item.codice}</p>
+                    <p className="text-xs text-gray-500 truncate">{item.descrizione || '—'}</p>
+                    <p className="text-[10px] text-gray-400">Disponibilità: {item.disponibile}</p>
+                  </div>
+                  <input type="number" min="1" max={item.disponibile} value={item.quantita}
+                    onChange={e => updateCartQty(item.codice, e.target.value)}
+                    className="w-16 text-center bg-white border border-gray-300 rounded-lg p-1.5 text-sm font-bold focus:outline-hidden" />
+                  <button onClick={() => removeFromCart(item.codice)}
+                    className="text-red-500 hover:text-red-700 text-lg leading-none cursor-pointer px-1" title="Rimuovi">
+                    🗑️
+                  </button>
+                </div>
+              ))}
+            </div>
+            {cartItems.length > 0 && (
+              <div className="p-4 border-t border-gray-100 flex gap-2">
+                <button onClick={() => { setCartItems([]); setCartDest(''); }}
+                  className="flex-1 text-sm font-bold px-4 py-2.5 rounded-xl bg-gray-100 hover:bg-gray-200 text-gray-600 cursor-pointer transition">
+                  Svuota carrello
+                </button>
+                <button onClick={creaMissionePrelievo} disabled={!cartDest}
+                  className="flex-1 text-sm font-bold px-4 py-2.5 rounded-xl bg-blue-600 hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed text-white cursor-pointer transition shadow-xs">
+                  ✓ Crea Missione di Prelievo
+                </button>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* Pannello Missioni attive (richiamabile da Stock Spare Parts) */}
+      {missioniPanelOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center">
+          <div className="fixed inset-0 bg-black/40" onClick={() => { setMissioniPanelOpen(false); setMissioniPanelDetail(null); }} />
+          <div className="relative z-10 w-full max-w-2xl bg-white rounded-2xl shadow-2xl flex flex-col max-h-[80vh]">
+            <div className="p-5 border-b border-gray-100 flex items-center justify-between">
+              <h3 className="text-lg font-black text-gray-800">🛒 Missioni di Prelievo</h3>
+              <button onClick={() => { setMissioniPanelOpen(false); setMissioniPanelDetail(null); }} className="text-gray-400 hover:text-gray-700 text-2xl leading-none cursor-pointer">✕</button>
+            </div>
+            <div className="flex-grow overflow-y-auto p-4">
+              {missioniPanelDetail ? (
+                <div className="space-y-3">
+                  <button onClick={() => setMissioniPanelDetail(null)}
+                    className="text-xs font-bold text-gray-500 hover:text-gray-700 cursor-pointer">← Torna all'elenco</button>
+                  <div className="flex items-center justify-between">
+                    <div>
+                      <p className="text-sm font-black text-gray-800">Missione {missioniPanelDetail.testata.id_missione}</p>
+                      <p className="text-xs text-gray-500">
+                        Richiedente: <strong>{missioniPanelDetail.testata.richiedente || '—'}</strong>
+                        {' · '}Destinazione: <strong>{missioniPanelDetail.testata.destinazione || '—'}</strong>
+                        {' · '}{missioniPanelDetail.testata.created_at ? new Date(missioniPanelDetail.testata.created_at).toLocaleString('it-IT') : '—'}
+                      </p>
+                    </div>
+                    <button onClick={() => deleteMissione(missioniPanelDetail.testata)}
+                      className="text-xs font-bold px-3 py-2 rounded-xl bg-red-50 hover:bg-red-100 text-red-600 border border-red-200 cursor-pointer transition">
+                      🗑 Elimina
+                    </button>
+                  </div>
+                  <div className="divide-y divide-gray-100 border border-gray-100 rounded-xl overflow-hidden">
+                    {missioniPanelDetail.righe.map(r => (
+                      <div key={r.id} className="flex items-center gap-3 px-3 py-2 text-xs">
+                        <span className="font-mono font-bold text-blue-700 flex-grow">{r.codice}</span>
+                        <span className="text-gray-500 truncate max-w-[200px]">{r.descrizione || '—'}</span>
+                        <span className="font-mono font-black">{r.quantita_richiesta}</span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              ) : (
+                <div className="space-y-2">
+                  {missioniList.length === 0 ? (
+                    <p className="text-sm text-gray-400 text-center py-8">Nessuna missione aperta.</p>
+                  ) : missioniList.map(m => (
+                    <div key={m.id} className="flex items-center gap-3 bg-gray-50 rounded-xl p-3 cursor-pointer hover:bg-gray-100 transition" onClick={() => openMissioniPanelDetail(m)}>
+                      <div className="flex-grow min-w-0">
+                        <p className="text-sm font-bold text-blue-700 font-mono">{m.id_missione}</p>
+                        <p className="text-xs text-gray-500">Richiedente: {m.richiedente || '—'} · Dest: {m.destinazione || '—'} · {m.n_righe} articoli · {m.tot_richiesti} pz</p>
+                      </div>
+                      <button onClick={e => { e.stopPropagation(); deleteMissione(m); }}
+                        className="text-xs text-gray-400 hover:text-red-600 bg-white hover:bg-red-50 border border-gray-200 hover:border-red-300 px-2 py-2 rounded-xl cursor-pointer transition">
+                        🗑
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
           </div>
         </div>
       )}
