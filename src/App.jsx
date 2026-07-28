@@ -4447,6 +4447,21 @@ export default function App() {
             arrivoByCodice[cod] = (arrivoByCodice[cod] || 0) + (l.qty_expected || 0);
           });
 
+          // Vista ACC: accessori (fonte='accessori'), niente TYPE/PNIT — solo codice + descrizione + stock
+          const accByCodice = {};
+          stockItems.forEach(s => {
+            if (s.fonte !== 'accessori' || !(s.stock > 0)) return;
+            if (!accByCodice[s.codice]) accByCodice[s.codice] = { codice: s.codice, stock: 0 };
+            accByCodice[s.codice].stock += s.stock;
+          });
+          const qAcc = riepSearch.trim().toLowerCase();
+          const accList = Object.values(accByCodice)
+            .map(a => ({ ...a, descrizione: descByCodice[a.codice] || '', inArrivo: arrivoByCodice[a.codice] || 0 }))
+            .filter(a => !qAcc || `${a.codice} ${a.descrizione}`.toLowerCase().includes(qAcc))
+            .sort((a, b) => b.stock - a.stock);
+          const accTotale = accList.reduce((s, a) => s + a.stock, 0);
+          const accArrivo = accList.reduce((s, a) => s + a.inArrivo, 0);
+
           // Anagrafica articoli (Hardware) per codice (= PNIT): gruppo specificato manualmente
           const anagByCodice = {};
           anagrafica.forEach(a => { anagByCodice[String(a.codice || '').trim()] = a; });
@@ -4549,27 +4564,35 @@ export default function App() {
               {/* Controlli */}
               <div className="bg-white p-4 rounded-2xl border border-gray-200 shadow-xs space-y-3">
                 <div className="flex flex-wrap items-center gap-3">
-                  <select value={riepFilterModello} onChange={e => { setRiepFilterModello(e.target.value); setRiepExpanded(new Set()); }}
-                    className="bg-gray-50 border border-gray-300 rounded-xl p-2.5 text-xs focus:outline-hidden">
-                    <option value="">Tutti i modelli ({modelliList.length})</option>
-                    {modelliList.map(m => <option key={m} value={m}>{m}</option>)}
-                  </select>
-                  <select value={riepFilterPnit} onChange={e => { setRiepFilterPnit(e.target.value); setRiepExpanded(new Set()); }}
-                    className="bg-gray-50 border border-gray-300 rounded-xl p-2.5 text-xs focus:outline-hidden">
-                    <option value="">Tutti i PNIT ({pnitList.length})</option>
-                    {pnitList.map(p => <option key={p} value={p}>{p}</option>)}
-                  </select>
+                  {riepGroupMode !== 'acc' && (
+                    <>
+                      <select value={riepFilterModello} onChange={e => { setRiepFilterModello(e.target.value); setRiepExpanded(new Set()); }}
+                        className="bg-gray-50 border border-gray-300 rounded-xl p-2.5 text-xs focus:outline-hidden">
+                        <option value="">Tutti i modelli ({modelliList.length})</option>
+                        {modelliList.map(m => <option key={m} value={m}>{m}</option>)}
+                      </select>
+                      <select value={riepFilterPnit} onChange={e => { setRiepFilterPnit(e.target.value); setRiepExpanded(new Set()); }}
+                        className="bg-gray-50 border border-gray-300 rounded-xl p-2.5 text-xs focus:outline-hidden">
+                        <option value="">Tutti i PNIT ({pnitList.length})</option>
+                        {pnitList.map(p => <option key={p} value={p}>{p}</option>)}
+                      </select>
+                    </>
+                  )}
                   <input value={riepSearch} onChange={e => setRiepSearch(e.target.value)}
-                    placeholder="Cerca per type, codice, descrizione..."
+                    placeholder={riepGroupMode === 'acc' ? 'Cerca per codice, descrizione...' : 'Cerca per type, codice, descrizione...'}
                     className="flex-grow min-w-[200px] bg-gray-50 border border-gray-300 rounded-xl p-2.5 text-xs focus:outline-hidden" />
-                  <label className="flex items-center gap-2 cursor-pointer">
-                    <input type="checkbox" checked={riepFilterRef} onChange={e => setRiepFilterRef(e.target.checked)} className="w-4 h-4 accent-blue-600 cursor-pointer" />
-                    <span className="text-xs font-semibold text-gray-700">Solo REF</span>
-                  </label>
-                  <label className="flex items-center gap-2 cursor-pointer">
-                    <input type="checkbox" checked={riepFilterRplus} onChange={e => setRiepFilterRplus(e.target.checked)} className="w-4 h-4 accent-blue-600 cursor-pointer" />
-                    <span className="text-xs font-semibold text-gray-700">Solo R+</span>
-                  </label>
+                  {riepGroupMode !== 'acc' && (
+                    <>
+                      <label className="flex items-center gap-2 cursor-pointer">
+                        <input type="checkbox" checked={riepFilterRef} onChange={e => setRiepFilterRef(e.target.checked)} className="w-4 h-4 accent-blue-600 cursor-pointer" />
+                        <span className="text-xs font-semibold text-gray-700">Solo REF</span>
+                      </label>
+                      <label className="flex items-center gap-2 cursor-pointer">
+                        <input type="checkbox" checked={riepFilterRplus} onChange={e => setRiepFilterRplus(e.target.checked)} className="w-4 h-4 accent-blue-600 cursor-pointer" />
+                        <span className="text-xs font-semibold text-gray-700">Solo R+</span>
+                      </label>
+                    </>
+                  )}
                   <button onClick={() => { setMissioniPanelOpen(true); fetchMissioni(); }}
                     className="ml-auto text-xs font-bold px-3 py-2 rounded-xl bg-amber-50 hover:bg-amber-100 text-amber-700 border border-amber-200 cursor-pointer transition">
                     🛒 Missioni attive ({missioniList.length})
@@ -4582,6 +4605,7 @@ export default function App() {
                       {[
                         { id: 'type', label: 'SPARE → PNIT' },
                         { id: 'gruppo', label: 'PNIT → SPARE' },
+                        { id: 'acc', label: 'ACC' },
                       ].map(v => (
                         <button key={v.id} onClick={() => { setRiepGroupMode(v.id); setRiepExpanded(new Set()); }}
                           className={`text-[11px] font-bold px-3 py-1 rounded-md cursor-pointer transition ${riepGroupMode === v.id ? 'bg-white text-gray-800 shadow-xs' : 'text-gray-500 hover:text-gray-700'}`}>
@@ -4589,12 +4613,64 @@ export default function App() {
                         </button>
                       ))}
                     </div>
-                    <span>· {groupList.length} {riepGroupMode === 'gruppo' ? 'PNIT' : 'SPARE'} · {codici.length} codici</span>
+                    {riepGroupMode === 'acc'
+                      ? <span>· {accList.length} accessori</span>
+                      : <span>· {groupList.length} {riepGroupMode === 'gruppo' ? 'PNIT' : 'SPARE'} · {codici.length} codici</span>}
                   </div>
-                  <span className="font-black text-blue-600">Stock: {totaleGenerale} · <span className="text-emerald-600">In arrivo: {totArrivo}</span> · <span className="text-amber-600">In ordine: {totOrdine}</span></span>
+                  {riepGroupMode === 'acc'
+                    ? <span className="font-black text-blue-600">Stock: {accTotale} · <span className="text-emerald-600">In arrivo: {accArrivo}</span></span>
+                    : <span className="font-black text-blue-600">Stock: {totaleGenerale} · <span className="text-emerald-600">In arrivo: {totArrivo}</span> · <span className="text-amber-600">In ordine: {totOrdine}</span></span>}
                 </div>
               </div>
 
+              {/* Tabella ACC: elenco piatto accessori (niente SPARE/PNIT) */}
+              {riepGroupMode === 'acc' ? (
+                accList.length > 0 ? (
+                  <div className="bg-white rounded-2xl border border-gray-200 shadow-xs overflow-hidden">
+                    <table className="w-full text-left border-collapse text-xs">
+                      <thead className="bg-gray-50 border-b border-gray-200 text-[10px] font-black text-gray-500 uppercase tracking-wider">
+                        <tr>
+                          <th className="px-3 py-3">Codice</th>
+                          <th className="px-3 py-3">Descrizione</th>
+                          <th className="px-3 py-3 text-right">Stock</th>
+                          <th className="px-3 py-3 text-right text-emerald-600">In arrivo</th>
+                          <th className="px-3 py-3 w-28"></th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-gray-100">
+                        {accList.map(a => (
+                          <tr key={a.codice} className="hover:bg-blue-50/50 transition">
+                            <td className="px-3 py-2.5 font-mono font-bold text-blue-700">{a.codice}</td>
+                            <td className="px-3 py-2.5 text-gray-600">{a.descrizione || '—'}</td>
+                            <td className="px-3 py-2.5 text-right font-mono font-black">{a.stock}</td>
+                            <td className="px-3 py-2.5 text-right font-mono text-emerald-600">{a.inArrivo || ''}</td>
+                            <td className="px-3 py-2.5">
+                              <div className="flex items-center justify-center gap-1">
+                                <input type="number" min="1" max={a.stock}
+                                  value={riepQtyDraft[a.codice] ?? ''}
+                                  onChange={e => setRiepQtyDraft(prev => ({ ...prev, [a.codice]: e.target.value }))}
+                                  onKeyDown={e => { if (e.key === 'Enter') { e.preventDefault(); addToCart(a.codice, a.descrizione, a.stock, riepQtyDraft[a.codice]); } }}
+                                  placeholder="Qtà"
+                                  disabled={!a.stock}
+                                  className="w-12 text-center bg-white border border-gray-300 rounded-md p-1 text-[11px] font-bold focus:outline-hidden disabled:opacity-30" />
+                                <button onClick={() => addToCart(a.codice, a.descrizione, a.stock, riepQtyDraft[a.codice])}
+                                  disabled={!a.stock}
+                                  title="Aggiungi al carrello"
+                                  className="w-5 h-5 rounded-md bg-blue-50 hover:bg-blue-100 text-blue-600 font-black text-xs leading-none cursor-pointer disabled:opacity-30 disabled:cursor-not-allowed transition">
+                                  +
+                                </button>
+                              </div>
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                ) : (
+                  <div className="text-center py-16 text-gray-400 text-sm">Nessun accessorio da visualizzare.</div>
+                )
+              ) : (
+              <>
               {/* Tabella gruppi */}
               {groupList.length > 0 ? (
                 <div className="bg-white rounded-2xl border border-gray-200 shadow-xs overflow-hidden">
@@ -4696,6 +4772,8 @@ export default function App() {
                 </div>
               ) : (
                 <div className="text-center py-16 text-gray-400 text-sm">Nessuno stock da visualizzare.</div>
+              )}
+              </>
               )}
             </div>
           );
