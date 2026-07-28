@@ -10,7 +10,7 @@ const WIP_MODULE_IDS = ['riepilogo', 'anagrafica', 'matrice']; // default inizia
 
 // Catalogo moduli gestibili a livello di permessi ruolo (esclude 'utenti', sempre admin-only)
 const APP_MODULES = [
-  { id: 'arrivi', label: 'Piano Arrivi', group: 'Magazzino', upload: true },
+  { id: 'arrivi', label: 'Piano Arrivi', group: 'Magazzino', upload: true, manuale: true },
   { id: 'prelievi', label: 'Prelievi', group: 'Magazzino' },
   { id: 'sposta-bancale', label: 'Sposta Bancale', group: 'Magazzino' },
   { id: 'stock', label: 'Inventario', group: 'Magazzino', upload: true, edit: true },
@@ -318,6 +318,14 @@ export default function App() {
   const [riepCodiceOpen, setRiepCodiceOpen] = useState(true);
   const [arrivoQtyFeedback, setArrivoQtyFeedback] = useState({ text: '', type: '' });
   const arrivoQtyScannerRef = useRef(null);
+  const [arrivoManualMode, setArrivoManualMode] = useState(false); // true = "Arrivo Manuale" (nessun PO, nessuna validazione codici)
+
+  // Arrivi Manuali (arrivi senza PO precaricato)
+  const [arriviView, setArriviView] = useState('piano'); // 'piano' | 'manuali' | 'manuale-detail'
+  const [arriviManualiTab, setArriviManualiTab] = useState('attivi'); // 'attivi' | 'registrati'
+  const [arriviManualiList, setArriviManualiList] = useState([]);
+  const [arriviManualiLoading, setArriviManualiLoading] = useState(false);
+  const [arrivoManualeDetail, setArrivoManualeDetail] = useState(null); // { testata, righe }
   const [moveBancaleSrc, setMoveBancaleSrc] = useState('');
   const [moveBancaleDest, setMoveBancaleDest] = useState('GESSATE');
   const [moveBancaleLocazione, setMoveBancaleLocazione] = useState('');
@@ -1694,8 +1702,9 @@ export default function App() {
       sounds.error(); triggerVibration([300]);
       return;
     }
-    const matchedLine = checkCodiceInPianoArrivi(parsed.codice);
-    if (!matchedLine) {
+    // Arrivo Manuale: nessun piano di riferimento, il codice non viene validato
+    const matchedLine = arrivoManualMode ? null : checkCodiceInPianoArrivi(parsed.codice);
+    if (!arrivoManualMode && !matchedLine) {
       setArrivoQtyFeedback({ text: `Codice ${parsed.codice} non previsto in arrivo per invoice ${arrivoQtyInvoice}. Bloccato.`, type: 'error' });
       sounds.error(); triggerVibration([300]);
       return;
@@ -1710,8 +1719,9 @@ export default function App() {
     const { codice, quantita } = arrivoQtyManuale;
     if (!arrivoQtyBancale.trim()) { alert('Inserisci il nome del bancale prima di aggiungere.'); return; }
     if (!codice.trim() || !quantita) { alert('Inserisci codice e quantità.'); return; }
-    const matchedLine = checkCodiceInPianoArrivi(codice.trim());
-    if (!matchedLine) {
+    // Arrivo Manuale: nessun piano di riferimento, il codice non viene validato
+    const matchedLine = arrivoManualMode ? null : checkCodiceInPianoArrivi(codice.trim());
+    if (!arrivoManualMode && !matchedLine) {
       alert(`Il codice "${codice.trim()}" non è previsto in arrivo per invoice ${arrivoQtyInvoice}.\n\nOperazione bloccata.`);
       return;
     }
@@ -1737,41 +1747,26 @@ export default function App() {
 
     // Elimina i pending dell'invoice e resetta lo stato riga
     await supabase.from('carton_arrivals').delete().eq('invoice', arrivoQtyInvoice).eq('stato', 'pending');
-    await supabase.from('po_lines')
-      .update({ is_user_confirmed: false })
-      .eq('china_invoice', arrivoQtyInvoice)
-      .eq('sn_required', false);
+    if (!arrivoManualMode) {
+      await supabase.from('po_lines')
+        .update({ is_user_confirmed: false })
+        .eq('china_invoice', arrivoQtyInvoice)
+        .eq('sn_required', false);
+    }
 
     setArrivoQtyCartoni([]);
     setArrivoQtyFeedback({ text: '', type: '' });
     setCurrentView('dashboard');
     setArrivoQtyActive(false);
+    if (arrivoManualMode) { setArriviView('manuali'); setArrivoManualMode(false); await fetchArriviManuali(); }
     await fetchPOLines();
     await fetchStock();
   }
 
-  async function caricaArrivoSuInventario() {
-    if (arrivoQtyCartoni.length === 0) { alert('Nessuna riga da caricare.'); return; }
-    if (!window.confirm(`Caricare ${arrivoQtyCartoni.length} righe sull'Inventario Spare Parts?\n\nInvoice: ${arrivoQtyInvoice}`)) return;
-
-    setLoading(true);
+  // Applica una lista di cartoni {codice, quantita, magazzino, bancale} allo stock: incrementa o crea la riga
+  async function applyCartoniToStock(cartoni) {
     const errors = [];
-
-    // 1. Aggiorna pending → caricato
-    const { error: errArr } = await supabase.from('carton_arrivals')
-      .update({ stato: 'caricato' })
-      .eq('invoice', arrivoQtyInvoice)
-      .eq('stato', 'pending');
-    if (errArr) { errors.push('carton_arrivals: ' + errArr.message); }
-
-    // Marca le righe non serializzate dell'invoice come confermate
-    await supabase.from('po_lines')
-      .update({ is_user_confirmed: true })
-      .eq('china_invoice', arrivoQtyInvoice)
-      .eq('sn_required', false);
-
-    // 2. Applica allo stock secondo le coordinate (codice + magazzino + bancale): incrementa o crea la riga
-    for (const c of arrivoQtyCartoni) {
+    for (const c of cartoni) {
       const { data: existing } = await supabase.from('stock_inventory')
         .select('id, stock').eq('codice', c.codice).eq('magazzino', c.magazzino).eq('numero_bancale', c.bancale).limit(1);
       if (existing && existing.length > 0) {
@@ -1785,6 +1780,30 @@ export default function App() {
         if (error) errors.push(`${c.codice}: ${error.message}`);
       }
     }
+    return errors;
+  }
+
+  async function caricaArrivoSuInventario() {
+    if (arrivoQtyCartoni.length === 0) { alert('Nessuna riga da caricare.'); return; }
+    if (!window.confirm(`Caricare ${arrivoQtyCartoni.length} righe sull'Inventario Spare Parts?\n\nInvoice: ${arrivoQtyInvoice}`)) return;
+
+    setLoading(true);
+
+    // 1. Aggiorna pending → caricato
+    const { error: errArr } = await supabase.from('carton_arrivals')
+      .update({ stato: 'caricato' })
+      .eq('invoice', arrivoQtyInvoice)
+      .eq('stato', 'pending');
+    const errors = errArr ? ['carton_arrivals: ' + errArr.message] : [];
+
+    // Marca le righe non serializzate dell'invoice come confermate
+    await supabase.from('po_lines')
+      .update({ is_user_confirmed: true })
+      .eq('china_invoice', arrivoQtyInvoice)
+      .eq('sn_required', false);
+
+    // 2. Applica allo stock secondo le coordinate (codice + magazzino + bancale)
+    errors.push(...await applyCartoniToStock(arrivoQtyCartoni));
 
     if (errors.length) {
       alert('Completato con errori:\n' + errors.join('\n'));
@@ -1797,6 +1816,223 @@ export default function App() {
       await fetchStock();
     }
     setLoading(false);
+  }
+
+  async function caricaArrivoManualeSuInventario() {
+    if (arrivoQtyCartoni.length === 0) { alert('Nessuna riga da caricare.'); return; }
+    if (!window.confirm(`Caricare ${arrivoQtyCartoni.length} righe sull'Inventario Spare Parts?\n\nArrivo manuale: ${arrivoQtyInvoice}`)) return;
+
+    setLoading(true);
+
+    const { error: errArr } = await supabase.from('carton_arrivals')
+      .update({ stato: 'caricato' })
+      .eq('invoice', arrivoQtyInvoice)
+      .eq('stato', 'pending');
+    const errors = errArr ? ['carton_arrivals: ' + errArr.message] : [];
+
+    errors.push(...await applyCartoniToStock(arrivoQtyCartoni));
+
+    const { error: errCompl } = await supabase.from('arrivi_manuali')
+      .update({ completato_at: new Date().toISOString() })
+      .eq('id_arrivo', arrivoQtyInvoice);
+    if (errCompl) errors.push('arrivi_manuali: ' + errCompl.message);
+
+    if (errors.length) {
+      alert('Completato con errori:\n' + errors.join('\n'));
+    } else {
+      alert(`${arrivoQtyCartoni.length} righe caricate sull'inventario.`);
+    }
+    setArrivoQtyCartoni([]);
+    setArrivoQtyActive(false);
+    setArrivoQtyInvoice('');
+    setArrivoQtyBancale('');
+    setArrivoManualMode(false);
+    setCurrentView('dashboard');
+    setArriviView('manuali');
+    await fetchStock();
+    await fetchArriviManuali();
+    setLoading(false);
+  }
+
+  // ==================== ARRIVI MANUALI (arrivi senza PO precaricato) ====================
+  async function generaIdArrivoManuale() {
+    const now = new Date();
+    const datePrefix = String(now.getFullYear()).slice(2).padStart(2, '0')
+      + String(now.getMonth() + 1).padStart(2, '0')
+      + String(now.getDate()).padStart(2, '0');
+    const { count } = await supabase.from('arrivi_manuali')
+      .select('*', { count: 'exact', head: true })
+      .like('id_arrivo', `MAN-${datePrefix}-%`);
+    return `MAN-${datePrefix}-${(count || 0) + 1}`;
+  }
+
+  async function creaArrivoManuale() {
+    let user = currentUser;
+    if (!user) {
+      const name = window.prompt('Inserisci il tuo nome utente:');
+      if (!name) return;
+      localStorage.setItem('logiscan_username', name);
+      setCurrentUser(name);
+      user = name;
+    }
+    setLoading(true);
+    const idArrivo = await generaIdArrivoManuale();
+    const { error } = await supabase.from('arrivi_manuali')
+      .insert({ id_arrivo: idArrivo, utente: user, creato_at: new Date().toISOString() });
+    setLoading(false);
+    if (error) { alert('Errore creazione arrivo manuale: ' + error.message); return; }
+    setArrivoQtyInvoice(idArrivo);
+    setArrivoManualMode(true);
+    setArrivoQtyCartoni([]);
+    setArrivoQtyBancale('');
+    setArrivoQtyFeedback({ text: '', type: '' });
+    setArrivoQtyActive(true);
+    setCurrentView('arrivo_qty');
+  }
+
+  async function fetchArriviManuali() {
+    setArriviManualiLoading(true);
+    const { data: testate, error } = await supabase.from('arrivi_manuali').select('*').order('creato_at', { ascending: false });
+    if (error) { alert('Errore caricamento arrivi manuali: ' + error.message); setArriviManualiLoading(false); return; }
+    const ids = (testate || []).map(t => t.id_arrivo);
+    let righe = [];
+    if (ids.length > 0) {
+      const { data } = await supabase.from('carton_arrivals').select('invoice, quantita').in('invoice', ids);
+      righe = data || [];
+    }
+    const agg = {};
+    righe.forEach(r => {
+      if (!agg[r.invoice]) agg[r.invoice] = { righe: 0, pezzi: 0 };
+      agg[r.invoice].righe += 1;
+      agg[r.invoice].pezzi += (r.quantita || 0);
+    });
+    setArriviManualiList((testate || []).map(t => ({ ...t, n_righe: agg[t.id_arrivo]?.righe || 0, n_pezzi: agg[t.id_arrivo]?.pezzi || 0 })));
+    setArriviManualiLoading(false);
+  }
+
+  async function openArrivoManualeDetail(arrivo) {
+    setArriviManualiLoading(true);
+    const { data: righe, error } = await supabase.from('carton_arrivals')
+      .select('*').eq('invoice', arrivo.id_arrivo).order('id', { ascending: true });
+    if (error) { alert('Errore: ' + error.message); setArriviManualiLoading(false); return; }
+    setArrivoManualeDetail({ testata: arrivo, righe: righe || [] });
+    setArriviView('manuale-detail');
+    setArriviManualiLoading(false);
+  }
+
+  async function riprendiArrivoManuale(arrivo) {
+    setArrivoQtyInvoice(arrivo.id_arrivo);
+    setArrivoManualMode(true);
+    setArrivoQtyActive(true);
+    setArrivoQtyFeedback({ text: '', type: '' });
+    const { data: existing } = await supabase.from('carton_arrivals')
+      .select('*').eq('invoice', arrivo.id_arrivo).eq('stato', 'pending')
+      .order('id', { ascending: true });
+    if (existing && existing.length > 0) {
+      setArrivoQtyBancale(existing[existing.length - 1].bancale || '');
+      setArrivoQtyMagazzino(existing[existing.length - 1].magazzino || 'GESSATE');
+      const agg = new Map();
+      existing.forEach(c => {
+        const key = `${c.codice}__${c.magazzino}__${c.bancale}`;
+        if (agg.has(key)) { agg.get(key).quantita += (c.quantita || 0); agg.get(key).rilievi += (c.rilievi || 1); }
+        else agg.set(key, { codice: c.codice, quantita: c.quantita || 0, bancale: c.bancale, magazzino: c.magazzino, rilievi: c.rilievi || 1 });
+      });
+      setArrivoQtyCartoni([...agg.values()]);
+    } else {
+      setArrivoQtyCartoni([]);
+      setArrivoQtyBancale('');
+    }
+    setCurrentView('arrivo_qty');
+  }
+
+  async function deleteArrivoManuale(arrivo) {
+    if (arrivo.stato === 'registrato') { alert('Arrivo registrato: non può essere eliminato.'); return; }
+    if (!window.confirm(`Eliminare l'arrivo manuale ${arrivo.id_arrivo}?\n\n${arrivo.completato_at ? `Le ${arrivo.n_righe} righe verranno rimosse dall'inventario.` : 'Non ha ancora righe caricate a inventario.'}`)) return;
+    setArriviManualiLoading(true);
+
+    const { data: righe, error: errR } = await supabase.from('carton_arrivals').select('*').eq('invoice', arrivo.id_arrivo);
+    if (errR) { alert('Errore: ' + errR.message); setArriviManualiLoading(false); return; }
+
+    const errors = [];
+    if (arrivo.completato_at) {
+      for (const r of (righe || []).filter(r => r.stato === 'caricato')) {
+        const { data: existing } = await supabase.from('stock_inventory')
+          .select('id, stock').eq('codice', r.codice).eq('magazzino', r.magazzino).eq('numero_bancale', r.bancale).limit(1);
+        if (existing && existing.length > 0) {
+          const { error } = await supabase.from('stock_inventory').update({ stock: (existing[0].stock || 0) - (r.quantita || 0) }).eq('id', existing[0].id);
+          if (error) errors.push(error.message);
+        }
+      }
+    }
+
+    await supabase.from('carton_arrivals').delete().eq('invoice', arrivo.id_arrivo);
+    await supabase.from('arrivi_manuali').delete().eq('id', arrivo.id);
+
+    if (errors.length) alert('Completato con errori:\n' + errors.join('\n'));
+    if (arrivoManualeDetail?.testata.id === arrivo.id) { setArrivoManualeDetail(null); setArriviView('manuali'); }
+    await fetchArriviManuali();
+    await fetchStock();
+    setArriviManualiLoading(false);
+  }
+
+  async function exportArriviManualiRettifica() {
+    // Esporta solo gli arrivi manuali ATTIVI e già completati (stock già applicato)
+    const attivi = arriviManualiList.filter(a => a.stato !== 'registrato' && a.completato_at);
+    if (attivi.length === 0) { alert('Nessun arrivo manuale attivo da esportare.'); return; }
+    if (!window.confirm(`Esportare ${attivi.length} arrivi manuali?\n\nDopo il download verranno marcati come REGISTRATI e non saranno più eliminabili.`)) return;
+
+    setArriviManualiLoading(true);
+    const attiviIds = new Set(attivi.map(a => String(a.id)));
+    const attiviInvoices = new Set(attivi.map(a => a.id_arrivo));
+    const testataByInvoice = {};
+    attivi.forEach(a => { testataByInvoice[a.id_arrivo] = a; });
+
+    const { data: righe } = await supabase.from('carton_arrivals').select('*').in('invoice', [...attiviInvoices]).eq('stato', 'caricato');
+
+    // Raggruppa per arrivo → (codice + magazzino) sommando le quantità
+    const byArrivo = {};
+    (righe || []).forEach(r => {
+      if (!attiviInvoices.has(r.invoice)) return;
+      if (!byArrivo[r.invoice]) byArrivo[r.invoice] = {};
+      const key = `${r.codice}__${r.magazzino}`;
+      if (!byArrivo[r.invoice][key]) byArrivo[r.invoice][key] = { codice: r.codice, magazzino: r.magazzino, qty: 0 };
+      byArrivo[r.invoice][key].qty += (r.quantita || 0);
+    });
+
+    const locName = (mag) => mag === 'ESPRINET' ? 'ESVAL - PAX NUOVO CAVENAGO' : '0MAG03 - PAX NUOVO GESSATE';
+    const fmtDate = (iso) => { if (!iso) return ''; const d = new Date(iso); return `${String(d.getDate()).padStart(2,'0')}/${String(d.getMonth()+1).padStart(2,'0')}/${d.getFullYear()}`; };
+
+    const header = 'data;line;item;Inventory Location: Name;Adjust Qty. By;extid;[PAX] Document Type';
+    const rows = [];
+    Object.keys(byArrivo)
+      .sort((a, b) => a.localeCompare(b))
+      .forEach(invoice => {
+        const t = testataByInvoice[invoice];
+        const data = fmtDate(t?.completato_at);
+        let line = 0;
+        Object.values(byArrivo[invoice]).forEach(g => {
+          line += 1;
+          // Quantità positiva (arrivo, non prelievo) e destinazione fissa "Arrivo"
+          rows.push([data, line, g.codice, locName(g.magazzino), Math.abs(g.qty), invoice, 'Arrivo'].join(';'));
+        });
+      });
+
+    if (rows.length === 0) { alert('Nessun arrivo manuale da esportare.'); setArriviManualiLoading(false); return; }
+    const csv = [header, ...rows].join('\r\n');
+    const blob = new Blob(['﻿' + csv], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a'); a.href = url;
+    a.download = `rettifica_arrivi_manuali_${new Date().toISOString().slice(0,10)}.csv`; a.click();
+    URL.revokeObjectURL(url);
+
+    const { error: markErr } = await supabase.from('arrivi_manuali').update({ stato: 'registrato' }).in('id', [...attiviIds]);
+    if (markErr) {
+      alert('File scaricato, ma errore nel marcare gli arrivi come registrati: ' + markErr.message);
+    } else {
+      setArriviManualiList(prev => prev.map(a => attiviIds.has(String(a.id)) ? { ...a, stato: 'registrato' } : a));
+      setArriviManualiTab('registrati');
+    }
+    setArriviManualiLoading(false);
   }
 
   function handleSpKeyNav(e, rowIndex, field) {
@@ -3038,6 +3274,7 @@ export default function App() {
   const canUpload = (mod) => isAdmin || hasPerm(`${mod}:upload`); // caricamenti Excel/CSV per modulo
   const canEdit = (mod) => isAdmin || hasPerm(`${mod}:edit`);     // pulsante Modifica per modulo
   const canGenera = (mod) => isAdmin || hasPerm(`${mod}:genera`); // pulsante "Genera da Compatibilità" per modulo
+  const canManuale = (mod) => isAdmin || hasPerm(`${mod}:manuale`); // arrivi caricati a mano, senza PO
   const isSper = (mod) => moduliSper.has(mod);                    // modulo sperimentale (SP)
 
   // Se il modulo attivo non è accessibile col ruolo corrente, spostati sul primo consentito
@@ -3161,7 +3398,7 @@ export default function App() {
                     {visible.map(mod => (
                       <button
                         key={mod.id}
-                        onClick={() => { setActiveModule(mod.id); setMenuOpen(false); setCurrentView('dashboard'); if (mod.id === 'prelievi') { setPrelievoView('list'); fetchPrelievi(); fetchMissioni(); } if (mod.id === 'utenti') fetchUtenti(); if (mod.id === 'moduli') fetchModuliConfig(); }}
+                        onClick={() => { setActiveModule(mod.id); setMenuOpen(false); setCurrentView('dashboard'); if (mod.id === 'prelievi') { setPrelievoView('list'); fetchPrelievi(); fetchMissioni(); } if (mod.id === 'arrivi') { setArriviView('piano'); fetchArriviManuali(); } if (mod.id === 'utenti') fetchUtenti(); if (mod.id === 'moduli') fetchModuliConfig(); }}
                         className={`w-full flex items-center gap-3 px-4 py-3 rounded-xl text-sm font-bold transition cursor-pointer text-left ${activeModule === mod.id ? 'bg-blue-600 text-white' : 'text-gray-700 hover:bg-gray-100'}`}
                       >
                         <span className="text-lg">{mod.icon}</span>
@@ -4354,6 +4591,7 @@ export default function App() {
                             <th className="px-3 py-2 text-center">Carica Excel/CSV</th>
                             <th className="px-3 py-2 text-center">Modifica</th>
                             <th className="px-3 py-2 text-center">Genera da Compatibilità</th>
+                            <th className="px-3 py-2 text-center">Arrivo Manuale</th>
                           </tr>
                         </thead>
                         <tbody className="divide-y divide-gray-100">
@@ -4381,13 +4619,18 @@ export default function App() {
                                     ? <input type="checkbox" checked={has(`${m.id}:genera`)} disabled={!vis} onChange={e => toggle(`${m.id}:genera`, e.target.checked)} className="w-4 h-4 accent-blue-600 cursor-pointer disabled:opacity-30" />
                                     : <span className="text-gray-300">—</span>}
                                 </td>
+                                <td className="px-3 py-2 text-center">
+                                  {m.manuale
+                                    ? <input type="checkbox" checked={has(`${m.id}:manuale`)} disabled={!vis} onChange={e => toggle(`${m.id}:manuale`, e.target.checked)} className="w-4 h-4 accent-blue-600 cursor-pointer disabled:opacity-30" />
+                                    : <span className="text-gray-300">—</span>}
+                                </td>
                               </tr>
                             );
                           })}
                         </tbody>
                       </table>
                     </div>
-                    <p className="text-[11px] text-gray-400">Se un modulo è <strong>Visibile</strong>, il ruolo può usarne tutte le funzioni. <strong>Carica</strong>, <strong>Modifica</strong> e <strong>Genera da Compatibilità</strong> sono eccezioni per modulo: se disattivate, quei controlli vengono nascosti (i moduli senza queste funzioni mostrano «—»).</p>
+                    <p className="text-[11px] text-gray-400">Se un modulo è <strong>Visibile</strong>, il ruolo può usarne tutte le funzioni. <strong>Carica</strong>, <strong>Modifica</strong>, <strong>Genera da Compatibilità</strong> e <strong>Arrivo Manuale</strong> sono eccezioni per modulo: se disattivate, quei controlli vengono nascosti (i moduli senza queste funzioni mostrano «—»).</p>
                   </div>
                   );
                 })()}
@@ -5973,6 +6216,171 @@ export default function App() {
         {currentView === 'dashboard' && (
           <div className="space-y-6">
 
+            {canManuale('arrivi') && (
+              <div className="flex gap-1 bg-indigo-50 p-1 rounded-xl w-fit border border-indigo-100">
+                {[
+                  { id: 'piano', label: '📄 Piano Arrivi' },
+                  { id: 'manuali', label: '✍️ Arrivi Manuali' },
+                ].map(t => (
+                  <button key={t.id} onClick={() => { setArriviView(t.id); if (t.id === 'manuali') fetchArriviManuali(); }}
+                    className={`text-xs font-bold px-4 py-2 rounded-lg cursor-pointer transition ${arriviView === t.id ? 'bg-white text-indigo-800 shadow-xs' : 'text-indigo-400 hover:text-indigo-600'}`}>
+                    {t.label}
+                  </button>
+                ))}
+              </div>
+            )}
+
+            {arriviView === 'manuali' && (
+              <div className="space-y-5">
+                <div className="flex items-center justify-between">
+                  <div>
+                    <h2 className="text-lg font-black text-gray-800">✍️ Arrivi Manuali</h2>
+                    <p className="text-xs text-gray-500">{arriviManualiList.length} arrivi manuali totali</p>
+                  </div>
+                  <div className="flex gap-2 flex-wrap">
+                    <button onClick={fetchArriviManuali}
+                      className="bg-gray-100 hover:bg-gray-200 text-gray-600 text-sm font-bold px-3 py-2.5 rounded-xl cursor-pointer transition" title="Aggiorna">
+                      ↻
+                    </button>
+                    {arriviManualiTab === 'attivi' && arriviManualiList.some(a => a.stato !== 'registrato' && a.completato_at) && (
+                      <button onClick={exportArriviManualiRettifica}
+                        className="bg-green-50 hover:bg-green-100 text-green-700 border border-green-200 text-sm font-bold px-4 py-2.5 rounded-xl cursor-pointer transition">
+                        📥 Esporta rettifica
+                      </button>
+                    )}
+                    <button onClick={creaArrivoManuale}
+                      className="bg-blue-600 hover:bg-blue-700 text-white text-sm font-bold px-4 py-2.5 rounded-xl cursor-pointer transition shadow-xs">
+                      + Nuovo Arrivo Manuale
+                    </button>
+                  </div>
+                </div>
+
+                <div className="flex gap-1 bg-gray-100 p-1 rounded-xl w-fit">
+                  {[
+                    { id: 'attivi', label: 'Attivi', n: arriviManualiList.filter(a => a.stato !== 'registrato').length },
+                    { id: 'registrati', label: 'Registrati', n: arriviManualiList.filter(a => a.stato === 'registrato').length },
+                  ].map(t => (
+                    <button key={t.id} onClick={() => setArriviManualiTab(t.id)}
+                      className={`text-xs font-bold px-4 py-2 rounded-lg cursor-pointer transition ${arriviManualiTab === t.id ? 'bg-white text-gray-800 shadow-xs' : 'text-gray-500 hover:text-gray-700'}`}>
+                      {t.label} <span className="ml-1 text-[10px] opacity-70">({t.n})</span>
+                    </button>
+                  ))}
+                </div>
+
+                {arriviManualiLoading && <div className="text-center py-4 text-xs font-bold text-amber-600 animate-pulse">Caricamento...</div>}
+
+                {(() => {
+                  const filtered = arriviManualiList.filter(a => arriviManualiTab === 'registrati' ? a.stato === 'registrato' : a.stato !== 'registrato');
+                  if (arriviManualiLoading) return null;
+                  if (filtered.length === 0) return (
+                    <div className="text-center py-16 text-gray-400 text-sm">
+                      {arriviManualiTab === 'registrati'
+                        ? 'Nessun arrivo manuale registrato. Esporta la rettifica dagli attivi per registrarli.'
+                        : 'Nessun arrivo manuale attivo. Clicca "+ Nuovo Arrivo Manuale" per iniziare.'}
+                    </div>
+                  );
+                  return (
+                  <div className="bg-white rounded-2xl border border-gray-200 shadow-xs overflow-x-auto">
+                    <table className="w-full min-w-[680px] text-left border-collapse text-xs">
+                      <thead className="bg-gray-50 border-b border-gray-200 text-[10px] font-black text-gray-500 uppercase tracking-wider">
+                        <tr>
+                          <th className="px-3 py-3">ID Arrivo</th>
+                          <th className="px-3 py-3">Creato</th>
+                          <th className="px-3 py-3">Utente</th>
+                          <th className="px-3 py-3 text-right">Righe</th>
+                          <th className="px-3 py-3 text-right">Pezzi</th>
+                          <th className="px-3 py-3"></th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-gray-100">
+                        {filtered.map(a => (
+                          <tr key={a.id} className="hover:bg-blue-50/50 transition cursor-pointer" onClick={() => openArrivoManualeDetail(a)}>
+                            <td className="px-3 py-2.5 font-mono font-bold text-blue-700 underline">
+                              {a.id_arrivo}
+                              {a.stato === 'registrato' && <span className="ml-2 text-[9px] font-black text-emerald-700 bg-emerald-50 border border-emerald-200 px-1.5 py-0.5 rounded-md uppercase tracking-wide">Registrato</span>}
+                              {!a.completato_at && <span className="ml-2 text-[9px] font-black text-amber-700 bg-amber-50 border border-amber-200 px-1.5 py-0.5 rounded-md uppercase tracking-wide">In corso</span>}
+                            </td>
+                            <td className="px-3 py-2.5 text-gray-600">{a.creato_at ? new Date(a.creato_at).toLocaleString('it-IT') : '—'}</td>
+                            <td className="px-3 py-2.5 text-gray-700">{a.utente || '—'}</td>
+                            <td className="px-3 py-2.5 text-right font-mono">{a.n_righe}</td>
+                            <td className="px-3 py-2.5 text-right font-mono font-black">{a.n_pezzi}</td>
+                            <td className="px-3 py-2.5 text-center" onClick={e => e.stopPropagation()}>
+                              <div className="flex gap-1 justify-center">
+                                {!a.completato_at && (
+                                  <button onClick={() => riprendiArrivoManuale(a)}
+                                    className="text-[10px] text-white bg-blue-600 hover:bg-blue-700 px-2 py-1 rounded-lg cursor-pointer transition font-bold">▶ Riprendi</button>
+                                )}
+                                {a.stato === 'registrato'
+                                  ? <span className="text-[10px] text-gray-300" title="Arrivo registrato: non eliminabile">🔒</span>
+                                  : <button onClick={() => deleteArrivoManuale(a)}
+                                      className="text-[10px] text-gray-400 hover:text-red-600 bg-gray-50 hover:bg-red-50 border border-gray-200 hover:border-red-300 px-2 py-1 rounded-lg cursor-pointer transition" title="Elimina">🗑</button>}
+                              </div>
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                  );
+                })()}
+              </div>
+            )}
+
+            {arriviView === 'manuale-detail' && arrivoManualeDetail && (
+              <div className="space-y-5 max-w-4xl mx-auto">
+                <div className="flex items-center justify-between">
+                  <div>
+                    <h2 className="text-lg font-black text-gray-800">✍️ Arrivo Manuale {arrivoManualeDetail.testata.id_arrivo}
+                      {arrivoManualeDetail.testata.stato === 'registrato' && <span className="ml-2 text-[10px] align-middle font-black text-emerald-700 bg-emerald-50 border border-emerald-200 px-2 py-0.5 rounded-md uppercase tracking-wide">🔒 Registrato</span>}
+                    </h2>
+                    <p className="text-xs text-gray-500">
+                      Creato: {arrivoManualeDetail.testata.creato_at ? new Date(arrivoManualeDetail.testata.creato_at).toLocaleString('it-IT') : '—'}
+                      {' · '}Utente: <strong>{arrivoManualeDetail.testata.utente || '—'}</strong>
+                      {arrivoManualeDetail.testata.completato_at ? <> · Completato: <strong>{new Date(arrivoManualeDetail.testata.completato_at).toLocaleString('it-IT')}</strong></> : null}
+                    </p>
+                  </div>
+                  <button onClick={() => { setArriviView('manuali'); setArrivoManualeDetail(null); }}
+                    className="bg-gray-100 hover:bg-gray-200 text-gray-700 text-xs font-bold px-4 py-2.5 rounded-xl cursor-pointer transition">
+                    ← Torna alla lista
+                  </button>
+                </div>
+
+                <div className="bg-white rounded-2xl border border-gray-200 shadow-xs overflow-hidden">
+                  <div className="flex items-center justify-between px-4 py-3 border-b border-gray-100">
+                    <span className="text-xs font-black text-gray-500 uppercase tracking-wider">{arrivoManualeDetail.righe.length} righe</span>
+                    <span className="text-sm font-black text-blue-600">Tot. pezzi: {arrivoManualeDetail.righe.reduce((s, r) => s + (r.quantita || 0), 0)}</span>
+                  </div>
+                  <div className="overflow-x-auto">
+                  <table className="w-full min-w-[680px] text-left border-collapse text-xs">
+                    <thead className="bg-gray-50 border-b border-gray-200 text-[10px] font-black text-gray-500 uppercase tracking-wider">
+                      <tr>
+                        <th className="px-3 py-3">Codice</th>
+                        <th className="px-3 py-3">Descrizione</th>
+                        <th className="px-3 py-3">ID Cartone</th>
+                        <th className="px-3 py-3">Magazzino</th>
+                        <th className="px-3 py-3">Bancale</th>
+                        <th className="px-3 py-3 text-right">Quantità</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-gray-100">
+                      {arrivoManualeDetail.righe.map(r => (
+                        <tr key={r.id} className="hover:bg-gray-50/80">
+                          <td className="px-3 py-2.5 font-mono font-bold text-blue-700">{r.codice}</td>
+                          <td className="px-3 py-2.5 text-gray-600">{descByCodice[r.codice] || '—'}</td>
+                          <td className="px-3 py-2.5 font-mono text-[10px] text-gray-500">{r.id_cartone || '—'}</td>
+                          <td className="px-3 py-2.5 text-gray-600">{r.magazzino}</td>
+                          <td className="px-3 py-2.5 text-gray-600">{r.bancale || '—'}</td>
+                          <td className="px-3 py-2.5 text-right font-mono font-black">{r.quantita}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {arriviView === 'piano' && (<>
             {/* Box Caricamento File */}
             {canUpload('arrivi') && (
             <div className={`bg-white p-4 sm:p-5 rounded-2xl border border-gray-200 shadow-xs ${poLines.length === 0 ? 'max-w-xl mx-auto my-8 text-center space-y-4' : ''}`}>
@@ -6250,6 +6658,7 @@ export default function App() {
                 </div>
               </>
             )}
+            </>)}
           </div>
         )}
 
@@ -6258,8 +6667,8 @@ export default function App() {
           <div className="space-y-5 max-w-3xl mx-auto">
             <div className="flex items-center justify-between">
               <div>
-                <h2 className="text-lg font-black text-gray-800">📦 Arrivo Quantità</h2>
-                <p className="text-xs text-gray-500">Invoice: <span className="font-bold text-blue-600">{arrivoQtyInvoice}</span></p>
+                <h2 className="text-lg font-black text-gray-800">{arrivoManualMode ? '✍️ Nuovo Arrivo Manuale' : '📦 Arrivo Quantità'}</h2>
+                <p className="text-xs text-gray-500">{arrivoManualMode ? 'ID Arrivo' : 'Invoice'}: <span className="font-bold text-blue-600">{arrivoQtyInvoice}</span></p>
               </div>
               <div className="flex gap-2">
                 {arrivoQtyCartoni.length > 0 && (
@@ -6268,7 +6677,11 @@ export default function App() {
                     🗑 Annulla tutto
                   </button>
                 )}
-                <button onClick={async () => { setCurrentView('dashboard'); setArrivoQtyActive(false); await fetchPOLines(); }}
+                <button onClick={async () => {
+                    setCurrentView('dashboard'); setArrivoQtyActive(false);
+                    if (arrivoManualMode) { setArriviView('manuali'); setArrivoManualMode(false); await fetchArriviManuali(); }
+                    await fetchPOLines();
+                  }}
                   className="bg-gray-100 hover:bg-gray-200 text-gray-700 text-xs font-bold px-4 py-2.5 rounded-xl cursor-pointer transition">
                   ← Sospendi
                 </button>
@@ -6357,10 +6770,30 @@ export default function App() {
                     onFocus={() => setArrivoCodiceOpen(true)}
                     onBlur={() => setTimeout(() => setArrivoCodiceOpen(false), 200)}
                     autoComplete="off"
-                    placeholder="Cerca tra i codici attesi..."
+                    placeholder={arrivoManualMode ? 'Digita liberamente il codice...' : 'Cerca tra i codici attesi...'}
                     className="w-full bg-gray-50 border border-gray-300 rounded-xl p-2.5 text-xs font-mono focus:outline-hidden" />
                   {arrivoCodiceOpen && (() => {
                     const q = arrivoQtyManuale.codice.trim().toLowerCase();
+                    if (arrivoManualMode) {
+                      // Arrivo Manuale: nessun piano di riferimento — suggerisce dall'Anagrafica Articoli
+                      if (q.length < 2) return null;
+                      const opts = anagrafica
+                        .filter(a => (a.codice || '').toLowerCase().includes(q) || (a.descrizione || '').toLowerCase().includes(q))
+                        .slice(0, 30);
+                      if (opts.length === 0) return null;
+                      return (
+                        <div className="absolute z-30 left-0 right-0 mt-1 bg-white border border-gray-200 rounded-xl shadow-lg max-h-56 overflow-y-auto">
+                          {opts.map(a => (
+                            <button key={a.codice} type="button"
+                              onMouseDown={(ev) => { ev.preventDefault(); setArrivoQtyManuale(v => ({...v, codice: a.codice})); setArrivoCodiceOpen(false); }}
+                              className="w-full text-left px-3 py-2 hover:bg-blue-50 border-b border-gray-100 last:border-none">
+                              <div className="font-mono font-bold text-xs text-blue-700">{a.codice}</div>
+                              <div className="text-[10px] text-gray-500 truncate">{a.descrizione || '—'}</div>
+                            </button>
+                          ))}
+                        </div>
+                      );
+                    }
                     const opts = poLines
                       .filter(l => l.china_invoice === arrivoQtyInvoice && l.sn_required === false)
                       .filter(l => !q || (l.item_code || '').toLowerCase().includes(q) || (l.description || '').toLowerCase().includes(q))
@@ -6396,7 +6829,8 @@ export default function App() {
             {/* Lista cartoni */}
             {arrivoQtyCartoni.length > 0 && (() => {
               // Riepilogo per codice: la quantità attesa è la SOMMA delle righe con lo stesso codice
-              const invoiceLines = poLines.filter(l => l.china_invoice === arrivoQtyInvoice && l.sn_required === false);
+              // Arrivo Manuale: nessun piano di riferimento, quindi nessun "atteso" da rispettare
+              const invoiceLines = arrivoManualMode ? [] : poLines.filter(l => l.china_invoice === arrivoQtyInvoice && l.sn_required === false);
               const attesaByCodice = {};
               invoiceLines.forEach(l => {
                 const q = l.qty_expected || 0;
@@ -6415,7 +6849,7 @@ export default function App() {
                 const codice = l.item_code || l.part_number;
                 if (!summary[codice]) summary[codice] = { caricata: 0, attesa: attesaByCodice[codice] || 0 };
               });
-              const invoiceComplete = Object.values(summary).every(({ caricata, attesa }) => attesa > 0 && caricata >= attesa);
+              const invoiceComplete = arrivoManualMode || Object.values(summary).every(({ caricata, attesa }) => attesa > 0 && caricata >= attesa);
               return (
               <>
               {/* Riepilogo per codice — collassabile */}
@@ -6428,6 +6862,12 @@ export default function App() {
                 {riepCodiceOpen && (
                   <div className="divide-y divide-gray-100">
                     {Object.entries(summary).map(([codice, { caricata, attesa }]) => {
+                      if (arrivoManualMode) return (
+                        <div key={codice} className="flex items-center justify-between px-4 py-2.5 bg-gray-50">
+                          <span className="font-mono font-bold text-sm text-gray-800">{codice}</span>
+                          <span className="text-sm font-black text-gray-700">Caricati: {caricata}</span>
+                        </div>
+                      );
                       const status = caricata === attesa ? 'ok' : caricata < attesa ? 'under' : 'over';
                       return (
                         <div key={codice} className={`flex items-center justify-between px-4 py-2.5 ${status === 'under' ? 'bg-yellow-50' : status === 'over' ? 'bg-red-50' : 'bg-green-50'}`}>
@@ -6510,7 +6950,7 @@ export default function App() {
                   </p>
                 )}
                 <button
-                  onClick={caricaArrivoSuInventario}
+                  onClick={arrivoManualMode ? caricaArrivoManualeSuInventario : caricaArrivoSuInventario}
                   disabled={!invoiceComplete}
                   className={`w-full font-black p-4 rounded-xl text-base shadow-md transition flex items-center justify-center gap-2 ${!invoiceComplete ? 'bg-gray-200 text-gray-400 cursor-not-allowed' : 'bg-green-600 hover:bg-green-700 text-white cursor-pointer'}`}>
                   ✓ Carica su Inventario Spare Parts
