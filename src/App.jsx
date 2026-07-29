@@ -278,6 +278,8 @@ export default function App() {
   const [spFilterRef, setSpFilterRef] = useState(false);
   const [spFilterRplus, setSpFilterRplus] = useState(false);
   const [spFilterNoMatch, setSpFilterNoMatch] = useState(false);
+  const [spStaleImportRows, setSpStaleImportRows] = useState([]); // righe pre-import il cui PN+Terminal PN non compare più nel file appena caricato (probabile PN rinominato)
+  const [spFilterStale, setSpFilterStale] = useState(false);
 
   // Stock
   const [stockItems, setStockItems] = useState([]);
@@ -329,6 +331,13 @@ export default function App() {
   const [moveBancaleSrc, setMoveBancaleSrc] = useState('');
   const [moveBancaleDest, setMoveBancaleDest] = useState('GESSATE');
   const [moveBancaleLocazione, setMoveBancaleLocazione] = useState('');
+  const [spostaBancaleTab, setSpostaBancaleTab] = useState('sposta'); // 'sposta' | 'unisci'
+  const [mergeBancaleA, setMergeBancaleA] = useState('');
+  const [mergeBancaleB, setMergeBancaleB] = useState('');
+  const [mergeBancaleDestMode, setMergeBancaleDestMode] = useState('new'); // 'new' | 'a' | 'b'
+  const [mergeBancaleNewName, setMergeBancaleNewName] = useState('');
+  const [mergeBancaleMagazzino, setMergeBancaleMagazzino] = useState('GESSATE');
+  const [mergeBancaleLocazione, setMergeBancaleLocazione] = useState('');
   const [stockFilterBancale, setStockFilterBancale] = useState('');
   const [spSearch2, setSpSearch2] = useState('');
   const [spSortCol, setSpSortCol] = useState('pn');
@@ -686,6 +695,8 @@ export default function App() {
     if (!file) return;
     event.target.value = '';
     setSpLoading(true);
+    setSpStaleImportRows([]);
+    const previousRows = spareParts; // snapshot pre-import, per rilevare righe rimaste orfane (es. PN rinominato nel file)
 
     const reader = new FileReader();
     reader.onload = async function(e) {
@@ -732,9 +743,32 @@ export default function App() {
 
       const { error } = await supabase.from('spare_parts').upsert(toUpsert, { onConflict: 'pn,terminal_pn' });
       if (error) { alert("Errore salvataggio: " + error.message); }
-      else { await fetchSpareParts(); await recordImportMeta('spare_parts'); alert(`${toUpsert.length} ricambi caricati.`); }
+      else {
+        await fetchSpareParts();
+        await recordImportMeta('spare_parts');
+        // Righe presenti prima dell'import il cui PN+Terminal PN non compare nel nuovo file: l'upsert è
+        // solo additivo (non cancella), quindi restano a DB come orfane — es. quando si rinomina un PN
+        // nel file, la vecchia riga con il PN precedente non viene toccata dall'import.
+        const newKeys = new Set(toUpsert.map(r => `${r.pn}__${r.terminal_pn}`));
+        const stale = previousRows.filter(p => !newKeys.has(`${(p.pn || '').trim()}__${(p.terminal_pn || '').trim()}`));
+        setSpStaleImportRows(stale.map(p => ({ pn: p.pn, terminal_pn: p.terminal_pn, pnit: p.pnit, type: p.type })));
+        alert(`${toUpsert.length} ricambi caricati.`);
+      }
     };
     reader.readAsArrayBuffer(file);
+  }
+
+  async function removeStaleSparePart(row) {
+    if (myRole !== 'admin') return;
+    if (!window.confirm(`Eliminare definitivamente PN ${row.pn} — Terminal PN ${row.terminal_pn}?`)) return;
+    setSpLoading(true);
+    const { error } = await supabase.from('spare_parts').delete().eq('pn', row.pn).eq('terminal_pn', row.terminal_pn);
+    if (error) { alert('Errore: ' + error.message); setSpLoading(false); return; }
+    await fetchSpareParts();
+    const remaining = spStaleImportRows.filter(r => !(r.pn === row.pn && r.terminal_pn === row.terminal_pn));
+    setSpStaleImportRows(remaining);
+    if (remaining.length === 0) setSpFilterStale(false);
+    setSpLoading(false);
   }
 
   function setSpFieldChange(rowKey, field, value) {
@@ -1620,6 +1654,38 @@ export default function App() {
       setStockItems(prev => prev.map(s => s.numero_bancale === moveBancaleSrc ? { ...s, ...updates } : s));
       setMoveBancaleSrc('');
       setMoveBancaleLocazione('');
+    }
+    setStockLoading(false);
+  }
+
+  async function mergeBancali() {
+    if (!mergeBancaleA || !mergeBancaleB) { alert('Seleziona entrambi i bancali da unire.'); return; }
+    if (mergeBancaleA === mergeBancaleB) { alert('Seleziona due bancali diversi.'); return; }
+    const rowsA = stockItems.filter(s => s.numero_bancale === mergeBancaleA);
+    const rowsB = stockItems.filter(s => s.numero_bancale === mergeBancaleB);
+    if (rowsA.length === 0 && rowsB.length === 0) { alert('Nessuna riga trovata per questi bancali.'); return; }
+    const destName = mergeBancaleDestMode === 'a' ? mergeBancaleA : mergeBancaleDestMode === 'b' ? mergeBancaleB : mergeBancaleNewName.trim();
+    if (!destName) { alert('Specifica il nome del nuovo bancale.'); return; }
+    const updates = { numero_bancale: destName, magazzino: mergeBancaleMagazzino };
+    if (mergeBancaleLocazione.trim()) updates.locazione = mergeBancaleLocazione.trim();
+    const pezziA = rowsA.reduce((s, r) => s + (r.stock || 0), 0);
+    const pezziB = rowsB.reduce((s, r) => s + (r.stock || 0), 0);
+    const lines = [
+      `Bancale A: ${mergeBancaleA} (${rowsA.length} righe, ${pezziA} pezzi)`,
+      `Bancale B: ${mergeBancaleB} (${rowsB.length} righe, ${pezziB} pezzi)`,
+      `→ Bancale risultante: ${destName} · magazzino ${mergeBancaleMagazzino}${updates.locazione ? ' · locazione ' + updates.locazione : ''}`
+    ];
+    if (!window.confirm(`Unire i bancali?\n\n${lines.join('\n')}`)) return;
+    setStockLoading(true);
+    const { error } = await supabase.from('stock_inventory').update(updates).in('numero_bancale', [mergeBancaleA, mergeBancaleB]);
+    if (error) { alert('Errore: ' + error.message); }
+    else {
+      setStockItems(prev => prev.map(s => (s.numero_bancale === mergeBancaleA || s.numero_bancale === mergeBancaleB) ? { ...s, ...updates } : s));
+      setMergeBancaleA('');
+      setMergeBancaleB('');
+      setMergeBancaleNewName('');
+      setMergeBancaleLocazione('');
+      setMergeBancaleDestMode('new');
     }
     setStockLoading(false);
   }
@@ -3537,6 +3603,9 @@ export default function App() {
           // Riscontro codifica: PN verificato contro l'Anagrafica, stesso controllo del modulo Inventario
           const noMatchCount = enrichedSp.filter(p => !p.hasAnagMatch).length;
 
+          // Righe rimaste orfane dopo l'ultimo import (PN+Terminal PN non più nel file, es. PN rinominato)
+          const staleKeySet = new Set(spStaleImportRows.map(r => `${r.pn}__${r.terminal_pn}`));
+
           // Estrazione PN senza riscontro in Anagrafica, raggruppati per PN univoco
           // (un PN può comparire su più Terminal PN/modelli e SPARE diversi in Compatibilità)
           const stockByCodice = {};
@@ -3587,7 +3656,8 @@ export default function App() {
             const matchRef        = !spFilterRef        || p.ref;
             const matchRplus      = !spFilterRplus      || p.rplus;
             const matchNoMatch    = !spFilterNoMatch    || !p.hasAnagMatch;
-            return matchSearch && matchSearch2 && matchType && matchTerminalPN && matchRef && matchRplus && matchNoMatch;
+            const matchStale      = !spFilterStale      || staleKeySet.has(`${p.pn}__${p.terminal_pn}`);
+            return matchSearch && matchSearch2 && matchType && matchTerminalPN && matchRef && matchRplus && matchNoMatch && matchStale;
           }).sort((a, b) => {
             const getVal = (row) => String(row[spSortCol] ?? '').toLowerCase();
             const va = getVal(a);
@@ -3662,6 +3732,29 @@ export default function App() {
                       ⚠ {noMatchCount} codici senza riscontro in Anagrafica
                       {spFilterNoMatch ? ' — clicca per mostrare tutti' : ' — clicca per filtrare'}
                     </button>
+                  )}
+                  {spStaleImportRows.length > 0 && (
+                    <div className="space-y-1.5">
+                      <button
+                        onClick={() => { setSpFilterStale(v => !v); setSpPage(0); }}
+                        className={`w-full text-left text-xs font-bold px-3 py-2 rounded-xl border transition cursor-pointer ${spFilterStale ? 'bg-amber-500 text-white border-amber-600' : 'bg-amber-50 text-amber-700 border-amber-200 hover:bg-amber-100'}`}>
+                        ⚠ {spStaleImportRows.length} righe non più nell&apos;ultimo file importato (probabile PN rinominato)
+                        {spFilterStale ? ' — clicca per mostrare tutti' : ' — clicca per filtrare'}
+                      </button>
+                      <div className="max-h-40 overflow-y-auto space-y-1 bg-amber-50 border border-amber-200 rounded-xl p-2">
+                        {spStaleImportRows.map((r, i) => (
+                          <div key={i} className="flex items-center justify-between gap-2 text-[11px] text-amber-700">
+                            <span>PN <b>{r.pn}</b> — Terminal PN <b>{r.terminal_pn}</b> (PNIT {r.pnit}, SPARE {r.type})</span>
+                            {isAdmin && (
+                              <button onClick={() => removeStaleSparePart(r)} title="Rimuovi"
+                                className="shrink-0 text-red-600 hover:text-red-800 font-bold cursor-pointer px-1.5 py-0.5 rounded hover:bg-red-100 transition">
+                                🗑
+                              </button>
+                            )}
+                          </div>
+                        ))}
+                      </div>
+                    </div>
                   )}
                 </div>
               )}
@@ -4342,17 +4435,36 @@ export default function App() {
           const righeBancale = moveBancaleSrc ? stockItems.filter(s => s.numero_bancale === moveBancaleSrc) : [];
           const magSrc = righeBancale[0]?.magazzino || '';
           const pezziBancale = righeBancale.reduce((s, r) => s + (r.stock || 0), 0);
+
+          const righeA = mergeBancaleA ? stockItems.filter(s => s.numero_bancale === mergeBancaleA) : [];
+          const righeB = mergeBancaleB ? stockItems.filter(s => s.numero_bancale === mergeBancaleB) : [];
+          const pezziA = righeA.reduce((s, r) => s + (r.stock || 0), 0);
+          const pezziB = righeB.reduce((s, r) => s + (r.stock || 0), 0);
+          const mergeDestName = mergeBancaleDestMode === 'a' ? mergeBancaleA : mergeBancaleDestMode === 'b' ? mergeBancaleB : mergeBancaleNewName;
+          const mergeReady = mergeBancaleA && mergeBancaleB && mergeBancaleA !== mergeBancaleB && mergeDestName.trim();
+
           return (
             <div className="space-y-5 max-w-2xl mx-auto">
               <div>
                 <h2 className="text-lg font-black text-gray-800">🏭 Sposta Bancale</h2>
-                <p className="text-xs text-gray-500">Sposta tutte le righe di un bancale da un magazzino all&apos;altro (opzionale: nuova locazione).</p>
+                <p className="text-xs text-gray-500">Sposta le righe di un bancale, oppure unisci due bancali in uno solo.</p>
+              </div>
+
+              {/* Sotto-schede */}
+              <div className="flex gap-1 bg-gray-100 p-1 rounded-xl w-fit">
+                {[{ id: 'sposta', label: 'Sposta' }, { id: 'unisci', label: 'Unisci' }].map(t => (
+                  <button key={t.id} onClick={() => setSpostaBancaleTab(t.id)}
+                    className={`text-xs font-bold px-4 py-2 rounded-lg cursor-pointer transition ${spostaBancaleTab === t.id ? 'bg-white text-gray-800 shadow-xs' : 'text-gray-500 hover:text-gray-700'}`}>
+                    {t.label}
+                  </button>
+                ))}
               </div>
 
               {stockItems.length === 0 ? (
                 <div className="text-center py-16 text-gray-400 text-sm">Nessuno stock caricato. Importa l&apos;inventario per movimentare i bancali.</div>
-              ) : (
+              ) : spostaBancaleTab === 'sposta' ? (
                 <div className="bg-white p-5 rounded-2xl border border-gray-200 shadow-xs space-y-4">
+                  <p className="text-xs text-gray-500">Sposta tutte le righe di un bancale da un magazzino all&apos;altro (opzionale: nuova locazione).</p>
                   <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                     <div className="space-y-1">
                       <label className="block text-[10px] font-bold text-gray-500 uppercase">Bancale da spostare</label>
@@ -4393,6 +4505,96 @@ export default function App() {
                     </button>
                     {moveBancaleSrc && (
                       <button onClick={() => { setMoveBancaleSrc(''); setMoveBancaleLocazione(''); }}
+                        className="text-xs text-gray-400 hover:text-gray-600 cursor-pointer px-2 py-2">Annulla</button>
+                    )}
+                  </div>
+                </div>
+              ) : (
+                <div className="bg-white p-5 rounded-2xl border border-gray-200 shadow-xs space-y-4">
+                  <p className="text-xs text-gray-500">Unisci due bancali in uno solo: scegli un nuovo nome oppure riusa uno dei due bancali selezionati.</p>
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                    <div className="space-y-1">
+                      <label className="block text-[10px] font-bold text-gray-500 uppercase">Bancale 1</label>
+                      <select value={mergeBancaleA} onChange={e => setMergeBancaleA(e.target.value)}
+                        className="w-full bg-gray-50 border border-gray-300 rounded-xl p-2.5 text-xs focus:outline-hidden">
+                        <option value="">Seleziona bancale...</option>
+                        {bancali.map(b => (
+                          <option key={b} value={b}>{b} ({stockItems.filter(s => s.numero_bancale === b)[0]?.magazzino})</option>
+                        ))}
+                      </select>
+                    </div>
+                    <div className="space-y-1">
+                      <label className="block text-[10px] font-bold text-gray-500 uppercase">Bancale 2</label>
+                      <select value={mergeBancaleB} onChange={e => setMergeBancaleB(e.target.value)}
+                        className="w-full bg-gray-50 border border-gray-300 rounded-xl p-2.5 text-xs focus:outline-hidden">
+                        <option value="">Seleziona bancale...</option>
+                        {bancali.map(b => (
+                          <option key={b} value={b}>{b} ({stockItems.filter(s => s.numero_bancale === b)[0]?.magazzino})</option>
+                        ))}
+                      </select>
+                    </div>
+                  </div>
+
+                  {mergeBancaleA && mergeBancaleB && (
+                    <div className="text-[11px] text-gray-500 bg-gray-50 rounded-xl px-3 py-2 border border-gray-100 space-y-0.5">
+                      <div>Bancale 1: <strong>{mergeBancaleA}</strong> · {righeA.length} righe · {pezziA} pezzi</div>
+                      <div>Bancale 2: <strong>{mergeBancaleB}</strong> · {righeB.length} righe · {pezziB} pezzi</div>
+                    </div>
+                  )}
+
+                  <div className="space-y-2">
+                    <label className="block text-[10px] font-bold text-gray-500 uppercase">Unisci su</label>
+                    <div className="flex flex-wrap gap-2">
+                      <label className={`flex items-center gap-2 text-xs px-3 py-2 rounded-xl border cursor-pointer transition ${mergeBancaleDestMode === 'new' ? 'bg-blue-50 border-blue-300 text-blue-700' : 'bg-gray-50 border-gray-200 text-gray-600 hover:bg-gray-100'}`}>
+                        <input type="radio" name="mergeDestMode" className="cursor-pointer" checked={mergeBancaleDestMode === 'new'} onChange={() => setMergeBancaleDestMode('new')} />
+                        Nuovo bancale
+                      </label>
+                      <label className={`flex items-center gap-2 text-xs px-3 py-2 rounded-xl border cursor-pointer transition ${mergeBancaleDestMode === 'a' ? 'bg-blue-50 border-blue-300 text-blue-700' : 'bg-gray-50 border-gray-200 text-gray-600 hover:bg-gray-100'} ${!mergeBancaleA ? 'opacity-50 pointer-events-none' : ''}`}>
+                        <input type="radio" name="mergeDestMode" className="cursor-pointer" checked={mergeBancaleDestMode === 'a'} onChange={() => setMergeBancaleDestMode('a')} disabled={!mergeBancaleA} />
+                        Usa {mergeBancaleA || 'Bancale 1'}
+                      </label>
+                      <label className={`flex items-center gap-2 text-xs px-3 py-2 rounded-xl border cursor-pointer transition ${mergeBancaleDestMode === 'b' ? 'bg-blue-50 border-blue-300 text-blue-700' : 'bg-gray-50 border-gray-200 text-gray-600 hover:bg-gray-100'} ${!mergeBancaleB ? 'opacity-50 pointer-events-none' : ''}`}>
+                        <input type="radio" name="mergeDestMode" className="cursor-pointer" checked={mergeBancaleDestMode === 'b'} onChange={() => setMergeBancaleDestMode('b')} disabled={!mergeBancaleB} />
+                        Usa {mergeBancaleB || 'Bancale 2'}
+                      </label>
+                    </div>
+                    {mergeBancaleDestMode === 'new' && (
+                      <input value={mergeBancaleNewName} onChange={e => setMergeBancaleNewName(e.target.value)}
+                        placeholder="Nome nuovo bancale"
+                        className="w-full bg-gray-50 border border-gray-300 rounded-xl p-2.5 text-xs focus:outline-hidden" />
+                    )}
+                  </div>
+
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                    <div className="space-y-1">
+                      <label className="block text-[10px] font-bold text-gray-500 uppercase">Magazzino destinazione</label>
+                      <select value={mergeBancaleMagazzino} onChange={e => setMergeBancaleMagazzino(e.target.value)}
+                        className="w-full bg-gray-50 border border-gray-300 rounded-xl p-2.5 text-xs focus:outline-hidden">
+                        <option value="GESSATE">GESSATE</option>
+                        <option value="ESPRINET">ESPRINET</option>
+                      </select>
+                    </div>
+                    <div className="space-y-1">
+                      <label className="block text-[10px] font-bold text-gray-500 uppercase">Locazione destinazione <span className="text-gray-400 normal-case font-normal">(opzionale)</span></label>
+                      <input value={mergeBancaleLocazione} onChange={e => setMergeBancaleLocazione(e.target.value)}
+                        placeholder="Es. SCAFFALE-A3"
+                        className="w-full bg-gray-50 border border-gray-300 rounded-xl p-2.5 text-xs focus:outline-hidden" />
+                    </div>
+                  </div>
+
+                  {mergeReady && (
+                    <div className="text-[11px] text-gray-500 bg-gray-50 rounded-xl px-3 py-2 border border-gray-100">
+                      {righeA.length + righeB.length} righe · {pezziA + pezziB} pezzi → bancale <strong>{mergeDestName.trim()}</strong> · magazzino <strong>{mergeBancaleMagazzino}</strong>{mergeBancaleLocazione.trim() ? <> · locazione <strong>{mergeBancaleLocazione.trim()}</strong></> : null}
+                    </div>
+                  )}
+
+                  <div className="flex items-center gap-2">
+                    <button onClick={mergeBancali} disabled={!mergeReady}
+                      className="bg-blue-600 hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed text-white text-sm font-bold px-5 py-2.5 rounded-xl cursor-pointer transition shadow-xs">
+                      ⇄ Unisci bancali
+                    </button>
+                    {(mergeBancaleA || mergeBancaleB) && (
+                      <button onClick={() => { setMergeBancaleA(''); setMergeBancaleB(''); setMergeBancaleNewName(''); setMergeBancaleLocazione(''); setMergeBancaleDestMode('new'); }}
                         className="text-xs text-gray-400 hover:text-gray-600 cursor-pointer px-2 py-2">Annulla</button>
                     )}
                   </div>
@@ -4690,7 +4892,12 @@ export default function App() {
             arrivoByCodice[cod] = (arrivoByCodice[cod] || 0) + (l.qty_expected || 0);
           });
 
-          // Vista ACC: accessori (fonte='accessori'), niente TYPE/PNIT — solo codice + descrizione + stock
+          // Anagrafica articoli (Hardware) per codice (= PNIT): gruppo specificato manualmente
+          const anagByCodice = {};
+          anagrafica.forEach(a => { anagByCodice[String(a.codice || '').trim()] = a; });
+          const gruppoDesc = (a) => a ? String(a.gruppo || '').trim() : '';
+
+          // Vista ACC: accessori (fonte='accessori'), niente TYPE/PNIT — solo codice + descrizione + stock + CL
           const accByCodice = {};
           stockItems.forEach(s => {
             if (s.fonte !== 'accessori' || !(s.stock > 0)) return;
@@ -4699,16 +4906,16 @@ export default function App() {
           });
           const qAcc = riepSearch.trim().toLowerCase();
           const accList = Object.values(accByCodice)
-            .map(a => ({ ...a, descrizione: descByCodice[a.codice] || '', inArrivo: arrivoByCodice[a.codice] || 0 }))
+            .map(a => ({
+              ...a,
+              descrizione: descByCodice[a.codice] || '',
+              inArrivo: arrivoByCodice[a.codice] || 0,
+              cl: String(anagByCodice[a.codice]?.conto_lavoro || '').trim().toLowerCase() === 'yes',
+            }))
             .filter(a => !qAcc || `${a.codice} ${a.descrizione}`.toLowerCase().includes(qAcc))
             .sort((a, b) => b.stock - a.stock);
           const accTotale = accList.reduce((s, a) => s + a.stock, 0);
           const accArrivo = accList.reduce((s, a) => s + a.inArrivo, 0);
-
-          // Anagrafica articoli (Hardware) per codice (= PNIT): gruppo specificato manualmente
-          const anagByCodice = {};
-          anagrafica.forEach(a => { anagByCodice[String(a.codice || '').trim()] = a; });
-          const gruppoDesc = (a) => a ? String(a.gruppo || '').trim() : '';
 
           // Info per pn dal DB spare parts
           const pnInfo = {};
@@ -4875,6 +5082,7 @@ export default function App() {
                         <tr>
                           <th className="px-3 py-3">Codice</th>
                           <th className="px-3 py-3">Descrizione</th>
+                          <th className="px-3 py-3 text-center">CL</th>
                           <th className="px-3 py-3 text-right">Stock</th>
                           <th className="px-3 py-3 text-right text-emerald-600">In arrivo</th>
                           <th className="px-3 py-3 w-28"></th>
@@ -4885,6 +5093,9 @@ export default function App() {
                           <tr key={a.codice} className="hover:bg-blue-50/50 transition">
                             <td className="px-3 py-2.5 font-mono font-bold text-blue-700">{a.codice}</td>
                             <td className="px-3 py-2.5 text-gray-600">{a.descrizione || '—'}</td>
+                            <td className="px-3 py-2.5 text-center">
+                              {a.cl && <span className="px-1 py-px rounded font-black text-[9px] border bg-amber-50 text-amber-700 border-amber-100" title="Conto Lavoro">CL</span>}
+                            </td>
                             <td className="px-3 py-2.5 text-right font-mono font-black">{a.stock}</td>
                             <td className="px-3 py-2.5 text-right font-mono text-emerald-600">{a.inArrivo || ''}</td>
                             <td className="px-3 py-2.5">
