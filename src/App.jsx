@@ -380,6 +380,7 @@ export default function App() {
   const [missioniLoading, setMissioniLoading] = useState(false);
   const [missioneDetail, setMissioneDetail] = useState(null); // { testata, righe }
   const [missioneEsecuzione, setMissioneEsecuzione] = useState(null); // missione in corso di evasione da 'new', con le sue righe originarie
+  const [prelievoDraft, setPrelievoDraft] = useState(null); // { id, id_prelievo } bozza di prelievo "a chiamata" salvata progressivamente, non ancora registrata
   const [missioniPanelOpen, setMissioniPanelOpen] = useState(false); // pannello "Missioni attive" richiamabile da Stock Spare Parts
   const [missioniPanelDetail, setMissioniPanelDetail] = useState(null); // { testata, righe } drill-down dentro il pannello
 
@@ -407,6 +408,7 @@ export default function App() {
   const [riepFilterPnit, setRiepFilterPnit] = useState('');
   const [riepFilterRef, setRiepFilterRef] = useState(false);
   const [riepFilterRplus, setRiepFilterRplus] = useState(false);
+  const [riepMostraZeroStock, setRiepMostraZeroStock] = useState(false); // include anche combinazioni SPARE/PNIT senza stock
   const [riepExpanded, setRiepExpanded] = useState(new Set());
   const [riepView, setRiepView] = useState('stock'); // 'stock' | 'missioni' — schede di primo livello del modulo
   const [riepGroupMode, setRiepGroupMode] = useState('type'); // 'type' = TYPE→Gruppo, 'gruppo' = Gruppo→TYPE
@@ -2226,7 +2228,10 @@ export default function App() {
   }
 
   async function deleteMissione(missione) {
-    if (!window.confirm(`Eliminare la missione ${missione.id_missione}? Non è ancora stata evasa.`)) return;
+    const { count } = await supabase.from('prelievi_righe')
+      .select('*', { count: 'exact', head: true }).eq('prelievo_id', missione.id).not('stock_id', 'is', null);
+    const avviso = count > 0 ? `\n\nAttenzione: risultano già ${count} articoli scansionati in una sessione di prelievo non completata — verranno persi.` : '';
+    if (!window.confirm(`Eliminare la missione ${missione.id_missione}? Non è ancora stata evasa.${avviso}`)) return;
     await supabase.from('prelievi_righe').delete().eq('prelievo_id', missione.id);
     const { error } = await supabase.from('prelievi').delete().eq('id', missione.id);
     if (error) { alert('Errore eliminazione missione: ' + error.message); return; }
@@ -2245,13 +2250,75 @@ export default function App() {
 
     // Nessuna compilazione automatica: l'operatore vede la richiesta come riferimento
     // e preleva lui stesso codici, ubicazioni e quantità tramite scanner/inserimento manuale.
-    setPrelievoRighe([]);
-    setMissioneEsecuzione({ ...missione, righeOriginali: righe.map(r => ({ ...r, descrizione: descByCodice[r.codice] || '' })) });
+    // Le righe-richiesta (senza ubicazione) sono il riferimento; le righe già con un'ubicazione sono
+    // prelievi salvati in una sessione precedente (missione interrotta prima di "Registra"): si ricostruisce
+    // lo stato del prelievo da lì, invece di ripartire da zero.
+    const righeRichiesta = righe.filter(r => r.stock_id == null);
+    const righePrelevate = righe.filter(r => r.stock_id != null);
+    const prelievoRigheRicostruite = righePrelevate.map(r => {
+      const stockRow = stockItems.find(s => s.id === r.stock_id);
+      return {
+        stockId: r.stock_id,
+        idCartone: r.id_cartone,
+        codice: r.codice,
+        numero_bancale: r.numero_bancale,
+        magazzino: r.magazzino,
+        quantita: r.quantita,
+        qtaDisponibile: stockRow ? stockRow.stock : r.quantita,
+        rigaId: r.id,
+      };
+    });
+
+    setPrelievoRighe(prelievoRigheRicostruite);
+    setMissioneEsecuzione({ ...missione, righeOriginali: righeRichiesta.map(r => ({ ...r, descrizione: descByCodice[r.codice] || '' })) });
     // Destinazione già decisa dal richiedente in fase di creazione missione
     setPrelievoDest(missione.destinazione || ''); setPrelievoWO('');
     setPrelievoManuale({ codice: '', stockId: '', quantita: '' });
-    setPrelievoFeedback({ text: '', type: '' });
+    setPrelievoFeedback(prelievoRigheRicostruite.length > 0
+      ? { text: `Ripresa missione: ${prelievoRigheRicostruite.length} righe già prelevate in una sessione precedente.`, type: 'success' }
+      : { text: '', type: '' });
     setPrelievoView('new');
+  }
+
+  // Ricostruisce un prelievo "a chiamata" (non missione) da una bozza salvata in una sessione precedente
+  async function riprendiPrelievoDraft(draft) {
+    const { data: righe, error } = await supabase.from('prelievi_righe')
+      .select('*').eq('prelievo_id', draft.id).order('id', { ascending: true });
+    if (error) { alert('Errore caricamento righe prelievo: ' + error.message); return; }
+    const ricostruite = (righe || []).map(r => {
+      const stockRow = stockItems.find(s => s.id === r.stock_id);
+      return {
+        stockId: r.stock_id, idCartone: r.id_cartone, codice: r.codice,
+        numero_bancale: r.numero_bancale, magazzino: r.magazzino, quantita: r.quantita,
+        qtaDisponibile: stockRow ? stockRow.stock : r.quantita, rigaId: r.id,
+      };
+    });
+    setPrelievoRighe(ricostruite);
+    setMissioneEsecuzione(null);
+    setPrelievoDraft({ id: draft.id, id_prelievo: draft.id_prelievo });
+    setPrelievoDest(draft.destinazione || ''); setPrelievoWO('');
+    setPrelievoUtente(draft.utente || '');
+    setPrelievoManuale({ codice: '', stockId: '', quantita: '' });
+    setPrelievoFeedback({ text: `Ripreso prelievo ${draft.id_prelievo}: ${ricostruite.length} righe già scansionate in una sessione precedente.`, type: 'success' });
+    setPrelievoView('new');
+  }
+
+  // Punto d'ingresso di "+ Nuovo prelievo": se esiste già una bozza a chiamata non completata, propone di riprenderla
+  async function apriNuovoPrelievo() {
+    const { data: bozze, error } = await supabase.from('prelievi')
+      .select('*').eq('stato', 'aperta').eq('origine', 'manuale').order('richiesta_at', { ascending: false });
+    if (error) { alert('Errore verifica bozze: ' + error.message); return; }
+    if (bozze && bozze.length > 0) {
+      const bozza = bozze[0];
+      const { count } = await supabase.from('prelievi_righe').select('*', { count: 'exact', head: true }).eq('prelievo_id', bozza.id);
+      const riprendi = window.confirm(`Hai un prelievo non completato (${bozza.id_prelievo}) con ${count || 0} righe già scansionate.\n\nOK per riprenderlo da dove l'hai lasciato.\nAnnulla per abbandonarlo e iniziarne uno nuovo (verrà eliminato).`);
+      if (riprendi) { await riprendiPrelievoDraft(bozza); return; }
+      await supabase.from('prelievi_righe').delete().eq('prelievo_id', bozza.id);
+      await supabase.from('prelievi').delete().eq('id', bozza.id);
+    }
+    setPrelievoView('new'); setPrelievoRighe([]); setMissioneEsecuzione(null); setPrelievoDraft(null);
+    setPrelievoDest(''); setPrelievoWO(''); setPrelievoFeedback({ text: '', type: '' });
+    setTimeout(() => prelievoScannerRef.current?.focus(), 100);
   }
 
   async function openMissioniPanelDetail(missione) {
@@ -2420,7 +2487,7 @@ export default function App() {
     setPrelieviLoading(false);
   }
 
-  function addPrelievoRiga(stockRow, quantita) {
+  async function addPrelievoRiga(stockRow, quantita) {
     if (prelievoRighe.some(r => r.stockId === stockRow.id)) {
       setPrelievoFeedback({ text: 'Questa riga di stock è già nel prelievo.', type: 'error' });
       sounds.error(); triggerVibration([300]);
@@ -2433,7 +2500,7 @@ export default function App() {
       sounds.error(); triggerVibration([300]);
       return false;
     }
-    setPrelievoRighe(prev => [{
+    const nuovaRiga = {
       stockId: stockRow.id,
       idCartone: (stockRow.carton_ids && stockRow.carton_ids[0]) || null,
       codice: stockRow.codice,
@@ -2441,7 +2508,40 @@ export default function App() {
       magazzino: stockRow.magazzino,
       quantita: qta,
       qtaDisponibile: stockRow.stock,
-    }, ...prev]);
+      rigaId: null,
+    };
+    // La riga si salva subito (missione o prelievo a chiamata): se il prelievo viene interrotto prima
+    // di "Registra", alla ripresa la riga è già lì e non va rifatta (vedi eseguiMissione / riprendiPrelievoDraft).
+    let prelievoIdBozza = missioneEsecuzione?.id;
+    if (!prelievoIdBozza) {
+      // Prelievo a chiamata: crea la bozza alla primissima riga, poi riusa lo stesso id per le successive
+      if (prelievoDraft) {
+        prelievoIdBozza = prelievoDraft.id;
+      } else {
+        const idBozza = await generaIdPrelievo();
+        const { data: testata, error: errT } = await supabase.from('prelievi')
+          .insert({ id_prelievo: idBozza, origine: 'manuale', stato: 'aperta', richiesta_at: new Date().toISOString(), data_prelievo: null, utente: prelievoUtente.trim() || currentUser || null })
+          .select('id').single();
+        if (errT) {
+          setPrelievoFeedback({ text: 'Errore creazione prelievo: ' + errT.message, type: 'error' });
+          sounds.error(); triggerVibration([300]);
+          return false;
+        }
+        prelievoIdBozza = testata.id;
+        setPrelievoDraft({ id: testata.id, id_prelievo: idBozza });
+      }
+    }
+    const { data, error } = await supabase.from('prelievi_righe').insert({
+      prelievo_id: prelievoIdBozza, stock_id: nuovaRiga.stockId, id_cartone: nuovaRiga.idCartone,
+      codice: nuovaRiga.codice, numero_bancale: nuovaRiga.numero_bancale, magazzino: nuovaRiga.magazzino, quantita: qta,
+    }).select('id').single();
+    if (error) {
+      setPrelievoFeedback({ text: 'Errore salvataggio riga: ' + error.message, type: 'error' });
+      sounds.error(); triggerVibration([300]);
+      return false;
+    }
+    nuovaRiga.rigaId = data.id;
+    setPrelievoRighe(prev => [nuovaRiga, ...prev]);
     return true;
   }
 
@@ -2465,24 +2565,37 @@ export default function App() {
     sounds.error(); triggerVibration([300]);
   }
 
-  function addPrelievoManuale() {
+  async function addPrelievoManuale() {
     const { stockId, quantita } = prelievoManuale;
     if (!stockId) { alert('Seleziona la riga di stock (bancale).'); return; }
     const stockRow = stockItems.find(s => String(s.id) === String(stockId));
     if (!stockRow) { alert('Riga di stock non trovata.'); return; }
-    if (addPrelievoRiga(stockRow, quantita || stockRow.stock)) {
+    if (await addPrelievoRiga(stockRow, quantita || stockRow.stock)) {
       setPrelievoManuale({ codice: '', stockId: '', quantita: '' });
       setPrelievoFeedback({ text: `Aggiunto: ${stockRow.codice} — qtà ${quantita || stockRow.stock}`, type: 'success' });
       sounds.ok(); triggerVibration([150]);
     }
   }
 
-  function removePrelievoRiga(stockId) {
+  async function removePrelievoRiga(stockId) {
+    const riga = prelievoRighe.find(r => r.stockId === stockId);
+    if (riga?.rigaId) {
+      const { error } = await supabase.from('prelievi_righe').delete().eq('id', riga.rigaId);
+      if (error) { alert('Errore rimozione riga: ' + error.message); return; }
+    }
     setPrelievoRighe(prev => prev.filter(r => r.stockId !== stockId));
   }
 
   function updatePrelievoQta(stockId, value) {
     setPrelievoRighe(prev => prev.map(r => r.stockId === stockId ? { ...r, quantita: value } : r));
+  }
+
+  async function syncPrelievoRigaQta(riga) {
+    if (!riga.rigaId) return; // ad-hoc, non ancora salvata in DB (prelievo non legato a una missione)
+    const q = parseFloat(riga.quantita);
+    if (!q || q <= 0) return; // valori non validi vengono comunque bloccati alla registrazione
+    const { error } = await supabase.from('prelievi_righe').update({ quantita: q }).eq('id', riga.rigaId);
+    if (error) console.error('Errore sincronizzazione quantità riga:', error.message);
   }
 
   async function registraPrelievo() {
@@ -2512,6 +2625,7 @@ export default function App() {
       user = name;
     }
     const evadeMissione = missioneEsecuzione;
+    const draftAdHoc = !evadeMissione ? prelievoDraft : null;
     if (!window.confirm(evadeMissione
       ? `Registrare l'evasione della missione ${evadeMissione.id_missione} (${prelievoRighe.length} righe)?\n\nLe giacenze verranno decurtate dall'inventario.`
       : `Registrare il prelievo di ${prelievoRighe.length} righe?\n\nLe giacenze verranno decurtate dall'inventario.`)) return;
@@ -2533,9 +2647,19 @@ export default function App() {
           .update({ utente: user, destinazione: destFinale || null, stato: null, data_prelievo: new Date().toISOString() })
           .eq('id', prelievoId);
         if (errU) { alert('Errore aggiornamento missione: ' + errU.message); return; }
-        // Rimuove le righe-richiesta (placeholder, senza ubicazione) prima di inserire quelle effettivamente prelevate
-        await supabase.from('prelievi_righe').delete().eq('prelievo_id', prelievoId);
+        // Le righe-richiesta (placeholder, senza ubicazione) restano: insieme alle righe prelevate danno
+        // il confronto richiesto/prelevato per codice nel dettaglio. Le righe prelevate sono già state
+        // salvate progressivamente durante lo scan/inserimento manuale (vedi addPrelievoRiga).
+      } else if (draftAdHoc) {
+        // Prelievo a chiamata: la bozza esiste già (creata alla prima riga scansionata), la si finalizza sul posto.
+        idPrelievo = draftAdHoc.id_prelievo;
+        prelievoId = draftAdHoc.id;
+        const { error: errU } = await supabase.from('prelievi')
+          .update({ utente: user, destinazione: destFinale || null, stato: null, data_prelievo: new Date().toISOString() })
+          .eq('id', prelievoId);
+        if (errU) { alert('Errore aggiornamento prelievo: ' + errU.message); return; }
       } else {
+        // Nessuna bozza (non dovrebbe succedere se ci sono righe: fallback difensivo)
         idPrelievo = await generaIdPrelievo();
         const { data: testata, error: errT } = await supabase.from('prelievi')
           .insert({ id_prelievo: idPrelievo, utente: user, destinazione: destFinale || null })
@@ -2545,23 +2669,17 @@ export default function App() {
       }
 
       // Righe + decurtazione stock
-      // Se evasione missione: riporta la quantità richiesta sulla prima riga di ciascun codice (per il confronto
-      // richiesto/prelevato nel dettaglio), senza duplicarla se lo stesso codice è stato prelevato da più bancali.
-      const richiestaByCodice = {};
-      if (evadeMissione) (evadeMissione.righeOriginali || []).forEach(r => { richiestaByCodice[r.codice] = r.quantita_richiesta; });
-      const codiceGiaAttribuito = new Set();
       for (const r of prelievoRighe) {
         const q = parseFloat(r.quantita);
-        let quantitaRichiesta = null;
-        if (evadeMissione && richiestaByCodice[r.codice] != null && !codiceGiaAttribuito.has(r.codice)) {
-          quantitaRichiesta = richiestaByCodice[r.codice];
-          codiceGiaAttribuito.add(r.codice);
+        if (r.rigaId) {
+          // Riga già salvata durante il prelievo: conferma la quantità finale
+          await supabase.from('prelievi_righe').update({ quantita: q }).eq('id', r.rigaId);
+        } else {
+          await supabase.from('prelievi_righe').insert({
+            prelievo_id: prelievoId, stock_id: r.stockId, id_cartone: r.idCartone,
+            codice: r.codice, numero_bancale: r.numero_bancale, magazzino: r.magazzino, quantita: q,
+          });
         }
-        await supabase.from('prelievi_righe').insert({
-          prelievo_id: prelievoId, stock_id: r.stockId, id_cartone: r.idCartone,
-          codice: r.codice, numero_bancale: r.numero_bancale, magazzino: r.magazzino, quantita: q,
-          quantita_richiesta: quantitaRichiesta,
-        });
         const nuovoStock = r.qtaDisponibile - q;
         if (nuovoStock <= 0) {
           const { error } = await supabase.from('stock_inventory').delete().eq('id', r.stockId);
@@ -2579,6 +2697,7 @@ export default function App() {
       setPrelievoWO('');
       setPrelievoFeedback({ text: '', type: '' });
       setMissioneEsecuzione(null);
+      setPrelievoDraft(null);
       setPrelievoView('list');
       if (evadeMissione) setPrelievoTab('missioni');
       await fetchStock();
@@ -4986,6 +5105,16 @@ export default function App() {
           const accTotale = accList.reduce((s, a) => s + a.stock, 0);
           const accArrivo = accList.reduce((s, a) => s + a.inArrivo, 0);
 
+          // REF / R+ "ufficiali": ereditati da Distinte Base (Elenco SPARE + eventuali override per PNIT+SPARE),
+          // stessa logica di Compatibilità e MRP — non più il valore grezzo di Compatibilità.
+          const typeFlagsByType = {};
+          dbaseTipi.forEach(t => { typeFlagsByType[t.type] = { ref: !!t.ref, rplus: !!t.rplus }; });
+          const overrideByPnitType = {};
+          distinteBase.forEach(r => {
+            const key = `${(r.pnit || '').trim()}||${(r.type || '').trim()}`;
+            overrideByPnitType[key] = { ref: !!r.ref_override, rplus: !!r.rplus_override };
+          });
+
           // Info per pn dal DB spare parts
           const pnInfo = {};
           spareParts.forEach(p => {
@@ -4994,11 +5123,14 @@ export default function App() {
             const inf = pnInfo[p.pn];
             if (mod) inf.models.add(mod);
             if (!inf.type && p.type) inf.type = p.type;
-            if (!inf.ref && p.ref) inf.ref = p.ref;
-            if (!inf.rplus && p.rplus) inf.rplus = p.rplus;
+            const pnit = (p.pnit || '').trim();
+            const type = (p.type || '').trim();
+            const typeFlags = typeFlagsByType[type];
+            const override = overrideByPnitType[`${pnit}||${type}`];
+            if (typeFlags?.ref || override?.ref) inf.ref = 'X';
+            if (typeFlags?.rplus || override?.rplus) inf.rplus = 'X';
             if (!inf.eol && p.eol) inf.eol = p.eol;
             if (!inf.descrizione && (p.descrizione || p.english_name)) inf.descrizione = p.descrizione || p.english_name;
-            const pnit = (p.pnit || '').trim();
             if (pnit) {
               inf.pnits.add(pnit);
               const g = gruppoDesc(anagByCodice[pnit]);
@@ -5023,8 +5155,12 @@ export default function App() {
           const pnitList = [...tuttiPnit].sort();
 
           const q = riepSearch.trim().toLowerCase();
+          // Base codici: solo quelli con stock, oppure anche i codici noti in Compatibilità ma a stock zero
+          const codiciBase = riepMostraZeroStock
+            ? new Set([...Object.keys(stockByCodice), ...Object.keys(pnInfo)])
+            : new Set(Object.keys(stockByCodice));
           // Costruisci elenco codici con stock, applicando filtri
-          const codici = Object.keys(stockByCodice).filter(c => {
+          const codici = [...codiciBase].filter(c => {
             const inf = pnInfo[c] || { models: new Set(), gruppi: new Set(), type: '', ref: '', rplus: '', descrizione: '', pnits: new Set() };
             if (riepFilterRef && inf.ref !== 'X') return false;
             if (riepFilterRplus && inf.rplus !== 'X') return false;
@@ -5043,7 +5179,7 @@ export default function App() {
           const groups = {};
           codici.forEach(c => {
             const inf = pnInfo[c] || { models: new Set(), gruppi: new Set(), pnits: new Set(), type: '', ref: '', rplus: '', descrizione: '' };
-            const stock = stockByCodice[c];
+            const stock = stockByCodice[c] || 0;
             const type = inf.type || '—';
             const pnitsList = inf.pnits.size > 0 ? [...inf.pnits] : ['—'];
             const pnitKey = pnitsList.join(', ');
@@ -5124,6 +5260,10 @@ export default function App() {
                       <label className="flex items-center gap-2 cursor-pointer">
                         <input type="checkbox" checked={riepFilterRplus} onChange={e => setRiepFilterRplus(e.target.checked)} className="w-4 h-4 accent-blue-600 cursor-pointer" />
                         <span className="text-xs font-semibold text-gray-700">Solo R+</span>
+                      </label>
+                      <label className="flex items-center gap-2 cursor-pointer">
+                        <input type="checkbox" checked={riepMostraZeroStock} onChange={e => { setRiepMostraZeroStock(e.target.checked); setRiepExpanded(new Set()); }} className="w-4 h-4 accent-blue-600 cursor-pointer" />
+                        <span className="text-xs font-semibold text-gray-700">Mostra anche senza stock</span>
                       </label>
                     </>
                   )}
@@ -6124,7 +6264,7 @@ export default function App() {
                     📥 Esporta Work Order (da definire)
                   </button>
                 )}
-                <button onClick={() => { setPrelievoView('new'); setPrelievoRighe([]); setMissioneEsecuzione(null); setPrelievoFeedback({ text: '', type: '' }); setTimeout(() => prelievoScannerRef.current?.focus(), 100); }}
+                <button onClick={apriNuovoPrelievo}
                   className="bg-blue-600 hover:bg-blue-700 text-white text-sm font-bold px-4 py-2.5 rounded-xl cursor-pointer transition shadow-xs">
                   + Nuovo prelievo
                 </button>
@@ -6417,15 +6557,17 @@ export default function App() {
           const spDescMap = {};
           for (const p of spareParts) { if (!spDescMap[p.pn]) spDescMap[p.pn] = p.descrizione || p.english_name || ''; }
           for (const a of anagrafica) { const c = String(a.codice || '').trim(); if (c && a.descrizione) spDescMap[c] = a.descrizione; }
+          // Bancali già aggiunti al prelievo corrente: si tolgono dai suggerimenti, riprenderli è comunque bloccato
+          const stagedStockIds = new Set(prelievoRighe.map(r => r.stockId));
           // Codici in stock, filtrati sul testo digitato (max 50 suggerimenti)
-          const allStockCodici = [...new Set(stockItems.filter(s => s.stock > 0).map(s => s.codice).filter(Boolean))].sort();
+          const allStockCodici = [...new Set(stockItems.filter(s => s.stock > 0 && !stagedStockIds.has(s.id)).map(s => s.codice).filter(Boolean))].sort();
           const q = prelievoManuale.codice.trim().toLowerCase();
           const stockCodici = q.length >= 2
             ? allStockCodici.filter(c => c.toLowerCase().includes(q) || (spDescMap[c] || '').toLowerCase().includes(q)).slice(0, 50)
             : [];
-          // Righe stock per il codice selezionato
+          // Righe stock per il codice selezionato (esclude i bancali già presi in questo prelievo)
           const righeCodice = prelievoManuale.codice
-            ? stockItems.filter(s => s.codice === prelievoManuale.codice.trim() && s.stock > 0
+            ? stockItems.filter(s => s.codice === prelievoManuale.codice.trim() && s.stock > 0 && !stagedStockIds.has(s.id)
                 && (prelievoShowEsprinet || s.magazzino === 'GESSATE'))
             : [];
           const totalePezzi = prelievoRighe.reduce((sum, r) => sum + (parseFloat(r.quantita) || 0), 0);
@@ -6442,7 +6584,22 @@ export default function App() {
                     </p>
                   )}
                 </div>
-                <button onClick={() => { if (prelievoRighe.length === 0 || window.confirm('Uscire? Le righe non registrate andranno perse.')) { const eraMissione = !!missioneEsecuzione; setPrelievoView('list'); setPrelievoRighe([]); setMissioneEsecuzione(null); if (eraMissione) setPrelievoTab('missioni'); } }}
+                <button onClick={() => {
+                  const eraMissione = !!missioneEsecuzione;
+                  const eraDraft = !!(missioneEsecuzione || prelievoDraft);
+                  const procedi = () => {
+                    setPrelievoView('list'); setPrelievoRighe([]);
+                    setMissioneEsecuzione(null); setPrelievoDraft(null);
+                    if (eraMissione) { setPrelievoTab('missioni'); fetchMissioni(); }
+                  };
+                  if (prelievoRighe.length === 0) { procedi(); return; }
+                  const messaggio = eraDraft
+                    ? eraMissione
+                      ? 'Interrompere il prelievo? Le righe già scansionate restano salvate: potrai riprenderlo in qualsiasi momento da "Missioni". Si elimina solo con il pulsante Elimina.'
+                      : 'Interrompere il prelievo? Le righe già scansionate restano salvate: la prossima volta che clicchi "+ Nuovo prelievo" ti verrà proposto di riprenderlo.'
+                    : 'Uscire? Le righe non registrate andranno perse.';
+                  if (window.confirm(messaggio)) procedi();
+                }}
                   className="bg-gray-100 hover:bg-gray-200 text-gray-700 text-xs font-bold px-4 py-2.5 rounded-xl cursor-pointer transition">
                   ← Torna alla lista
                 </button>
@@ -6607,6 +6764,7 @@ export default function App() {
                           <td className="px-3 py-2 text-right">
                             <input type="number" value={r.quantita}
                               onChange={e => updatePrelievoQta(r.stockId, e.target.value)}
+                              onBlur={() => syncPrelievoRigaQta(r)}
                               className={`w-20 text-right border rounded px-1 py-0.5 text-xs font-black focus:outline-none ${parseFloat(r.quantita) > r.qtaDisponibile || !parseFloat(r.quantita) ? 'border-red-400 bg-red-50 text-red-700' : 'border-gray-300'}`} />
                           </td>
                           <td className="px-3 py-2 text-center">
