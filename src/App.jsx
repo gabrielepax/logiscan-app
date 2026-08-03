@@ -7113,7 +7113,7 @@ export default function App() {
                             <input type="file" accept=".xls,.xlsx" className="absolute inset-0 w-full h-full opacity-0 cursor-pointer" onChange={(e) => handleSNUpload(e, group.invoice)} />
                           </div>
                         )}
-                        {group.snRequired && group.lines.some(l => l.is_user_confirmed) && (
+                        {group.snRequired && group.lines.every(l => l.is_user_confirmed) && (
                           <button onClick={() => downloadInvoiceSerialCSV(group.invoice, group.lines)}
                             className="shrink-0 bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-bold px-3.5 py-2 rounded-xl transition cursor-pointer shadow-xs whitespace-nowrap"
                             title="Scarica in un unico file tutte le righe serializzate di questo arrivo, ognuna col proprio Line ID">
