@@ -2123,11 +2123,12 @@ export default function App() {
     const [{ data: testate, error }, { data: righe }] = await Promise.all([
       // Esclude le missioni ancora aperte (non evase): vivono nella stessa tabella ma non sono prelievi reali finché non evase
       supabase.from('prelievi').select('*').or('stato.is.null,stato.neq.aperta').order('data_prelievo', { ascending: false }),
-      supabase.from('prelievi_righe').select('prelievo_id, quantita')
+      supabase.from('prelievi_righe').select('prelievo_id, stock_id, quantita')
     ]);
     if (error) { alert('Errore caricamento prelievi: ' + error.message); setPrelieviLoading(false); return; }
     const agg = {};
     (righe || []).forEach(r => {
+      if (r.stock_id == null) return; // riga-richiesta di una missione (placeholder), non un prelievo fisico
       if (!agg[r.prelievo_id]) agg[r.prelievo_id] = { righe: 0, pezzi: 0 };
       agg[r.prelievo_id].righe += 1;
       agg[r.prelievo_id].pezzi += (r.quantita || 0);
@@ -2142,14 +2143,20 @@ export default function App() {
     setMissioniLoading(true);
     const [{ data: testate, error }, { data: righe }] = await Promise.all([
       supabase.from('prelievi').select('*').eq('origine', 'missione').eq('stato', 'aperta').order('richiesta_at', { ascending: false }),
-      supabase.from('prelievi_righe').select('prelievo_id, quantita_richiesta')
+      supabase.from('prelievi_righe').select('prelievo_id, stock_id, quantita_richiesta, quantita')
     ]);
     if (error) { alert('Errore caricamento missioni: ' + error.message); setMissioniLoading(false); return; }
     const agg = {};
     (righe || []).forEach(r => {
-      if (!agg[r.prelievo_id]) agg[r.prelievo_id] = { righe: 0, richiesti: 0 };
-      agg[r.prelievo_id].righe += 1;
-      agg[r.prelievo_id].richiesti += (r.quantita_richiesta || 0);
+      if (!agg[r.prelievo_id]) agg[r.prelievo_id] = { righe: 0, richiesti: 0, prelevati: 0 };
+      if (r.stock_id == null) {
+        // riga-richiesta (placeholder): un articolo distinto richiesto
+        agg[r.prelievo_id].righe += 1;
+        agg[r.prelievo_id].richiesti += (r.quantita_richiesta || 0);
+      } else {
+        // riga già prelevata in una sessione precedente (missione ripresa dopo interruzione)
+        agg[r.prelievo_id].prelevati += (r.quantita || 0);
+      }
     });
     setMissioniList((testate || []).map(t => ({
       id: t.id,
@@ -2160,6 +2167,7 @@ export default function App() {
       created_at: t.richiesta_at,
       n_righe: agg[t.id]?.righe || 0,
       tot_richiesti: agg[t.id]?.richiesti || 0,
+      tot_prelevati: agg[t.id]?.prelevati || 0,
     })));
     setMissioniLoading(false);
   }
@@ -2223,7 +2231,10 @@ export default function App() {
       .select('*').eq('prelievo_id', missione.id).order('id', { ascending: true });
     setMissioniLoading(false);
     if (error) { alert('Errore caricamento righe missione: ' + error.message); return; }
-    setMissioneDetail({ testata: missione, righe: (righe || []).map(r => ({ ...r, descrizione: descByCodice[r.codice] || '' })) });
+    // Solo le righe-richiesta (placeholder, senza ubicazione): questa vista mostra cosa è stato chiesto,
+    // le eventuali righe già prelevate in una sessione precedente non ci vanno (righe fisiche, non richieste).
+    const righeRichiesta = (righe || []).filter(r => r.stock_id == null);
+    setMissioneDetail({ testata: missione, righe: righeRichiesta.map(r => ({ ...r, descrizione: descByCodice[r.codice] || '' })) });
     setPrelievoView('missione-detail');
   }
 
@@ -2325,7 +2336,9 @@ export default function App() {
     const { data: righe, error } = await supabase.from('prelievi_righe')
       .select('*').eq('prelievo_id', missione.id).order('id', { ascending: true });
     if (error) { alert('Errore caricamento righe missione: ' + error.message); return; }
-    setMissioniPanelDetail({ testata: missione, righe: (righe || []).map(r => ({ ...r, descrizione: descByCodice[r.codice] || '' })) });
+    // Solo le righe-richiesta: le eventuali righe già prelevate in una sessione precedente non sono richieste
+    const righeRichiesta = (righe || []).filter(r => r.stock_id == null);
+    setMissioniPanelDetail({ testata: missione, righe: righeRichiesta.map(r => ({ ...r, descrizione: descByCodice[r.codice] || '' })) });
   }
 
   // Storico Missioni: tutte le missioni (aperte + evase), con dettaglio richiesto/prelevato per codice
@@ -6352,6 +6365,7 @@ export default function App() {
                           <th className="px-3 py-3">Destinazione</th>
                           <th className="px-3 py-3 text-right">Articoli</th>
                           <th className="px-3 py-3 text-right">Richiesti</th>
+                          <th className="px-3 py-3 text-right">In corso</th>
                           <th className="px-3 py-3"></th>
                         </tr>
                       </thead>
@@ -6364,6 +6378,9 @@ export default function App() {
                             <td className="px-3 py-2.5 text-gray-600">{m.destinazione || '—'}</td>
                             <td className="px-3 py-2.5 text-right font-mono">{m.n_righe}</td>
                             <td className="px-3 py-2.5 text-right font-mono">{m.tot_richiesti}</td>
+                            <td className="px-3 py-2.5 text-right font-mono">
+                              {m.tot_prelevati > 0 ? <span className="font-black text-amber-600">{m.tot_prelevati}</span> : '—'}
+                            </td>
                             <td className="px-3 py-2.5 text-center" onClick={e => e.stopPropagation()}>
                               <div className="flex gap-1 justify-center">
                                 <button onClick={() => eseguiMissione(m)}
@@ -6550,10 +6567,15 @@ export default function App() {
               );
             })()}
 
+            {(() => {
+              // Le righe-richiesta (placeholder di una missione, senza ubicazione) non sono prelievi fisici:
+              // servono solo al confronto richiesto/prelevato mostrato sopra, non vanno elencate qui.
+              const righeFisiche = prelievoDetail.righe.filter(r => r.stock_id != null);
+              return (
             <div className="bg-white rounded-2xl border border-gray-200 shadow-xs overflow-hidden">
               <div className="flex items-center justify-between px-4 py-3 border-b border-gray-100">
-                <span className="text-xs font-black text-gray-500 uppercase tracking-wider">{prelievoDetail.righe.length} righe</span>
-                <span className="text-sm font-black text-blue-600">Tot. pezzi: {prelievoDetail.righe.reduce((s, r) => s + (r.quantita || 0), 0)}</span>
+                <span className="text-xs font-black text-gray-500 uppercase tracking-wider">{righeFisiche.length} righe</span>
+                <span className="text-sm font-black text-blue-600">Tot. pezzi: {righeFisiche.reduce((s, r) => s + (r.quantita || 0), 0)}</span>
               </div>
               <div className="overflow-x-auto">
               <table className="w-full min-w-[680px] text-left border-collapse text-xs">
@@ -6568,7 +6590,7 @@ export default function App() {
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-gray-100">
-                  {prelievoDetail.righe.map(r => (
+                  {righeFisiche.map(r => (
                     <tr key={r.id} className="hover:bg-gray-50/80">
                       <td className="px-3 py-2.5 font-mono font-bold text-blue-700">{r.codice}</td>
                       <td className="px-3 py-2.5 text-gray-600">{descByCodice[r.codice] || '—'}</td>
@@ -6582,6 +6604,8 @@ export default function App() {
               </table>
               </div>
             </div>
+              );
+            })()}
           </div>
         )}
 
@@ -7960,7 +7984,10 @@ export default function App() {
                     <div key={m.id} className="flex items-center gap-3 bg-gray-50 rounded-xl p-3 cursor-pointer hover:bg-gray-100 transition" onClick={() => openMissioniPanelDetail(m)}>
                       <div className="flex-grow min-w-0">
                         <p className="text-sm font-bold text-blue-700 font-mono">{m.id_missione}</p>
-                        <p className="text-xs text-gray-500">Richiedente: {m.richiedente || '—'} · Dest: {m.destinazione || '—'} · {m.n_righe} articoli · {m.tot_richiesti} pz</p>
+                        <p className="text-xs text-gray-500">
+                          Richiedente: {m.richiedente || '—'} · Dest: {m.destinazione || '—'} · {m.n_righe} articoli · {m.tot_richiesti} pz
+                          {m.tot_prelevati > 0 ? <span className="text-amber-600 font-bold"> · {m.tot_prelevati} pz già prelevati</span> : null}
+                        </p>
                       </div>
                       <button onClick={e => { e.stopPropagation(); deleteMissione(m); }}
                         className="text-xs text-gray-400 hover:text-red-600 bg-white hover:bg-red-50 border border-gray-200 hover:border-red-300 px-2 py-2 rounded-xl cursor-pointer transition">
