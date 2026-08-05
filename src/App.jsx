@@ -392,7 +392,7 @@ export default function App() {
   // Carrello Stock Spare Parts (solo sessione corrente, si svuota al refresh)
   const [cartItems, setCartItems] = useState([]); // { codice, descrizione, quantita, disponibile }
   const [cartOpen, setCartOpen] = useState(false);
-  const [cartDest, setCartDest] = useState(''); // destinazione richiesta per la missione: Secure Room | Repair | Reintegro
+  const [cartDest, setCartDest] = useState(''); // destinazione richiesta per la missione: Secure Room | Repair | Reintegro1 | Reintegro4
   const [riepQtyDraft, setRiepQtyDraft] = useState({}); // codice -> quantità digitata in linea prima di aggiungere al carrello
 
   // Anagrafica Terminali (tipoterminale.xlsx → foglio "famiglie", chiave CODICE = PNIT del DB spare parts)
@@ -2177,7 +2177,7 @@ export default function App() {
 
   async function creaMissionePrelievo() {
     if (cartItems.length === 0) return;
-    if (!cartDest) { alert('Seleziona la destinazione dei materiali (Secure Room, Repair o Reintegro).'); setCartOpen(true); return; }
+    if (!cartDest) { alert('Seleziona la destinazione dei materiali (Secure Room, Repair, Reintegro1 o Reintegro4).'); setCartOpen(true); return; }
     const invalido = cartItems.find(i => !(parseFloat(i.quantita) > 0));
     if (invalido) { alert(`Quantità non valida per ${invalido.codice}: correggila nel carrello prima di creare la missione.`); setCartOpen(true); return; }
     const destFinale = cartDest.trim();
@@ -5267,6 +5267,41 @@ export default function App() {
                       </label>
                     </>
                   )}
+                  <button onClick={() => {
+                    if (riepGroupMode === 'acc') {
+                      const rows = accList.map(a => ({
+                        'Codice': a.codice, 'Descrizione': a.descrizione, 'CL': a.cl ? 'X' : '',
+                        'Stock': a.stock, 'In arrivo': a.inArrivo,
+                      }));
+                      const ws = XLSX.utils.json_to_sheet(rows);
+                      const wb = XLSX.utils.book_new();
+                      XLSX.utils.book_append_sheet(wb, ws, 'ACC');
+                      XLSX.writeFile(wb, `stock_spare_parts_acc_${rows.length}.xlsx`);
+                    } else {
+                      const rows = codici.map(c => {
+                        const inf = pnInfo[c] || { type: '', pnits: new Set(), descrizione: '', ref: '', rplus: '', eol: '' };
+                        return {
+                          'SPARE': inf.type || '—',
+                          'PNIT': [...inf.pnits].join(', ') || '—',
+                          'Codice': c,
+                          'Descrizione': inf.descrizione || '',
+                          'EOL': inf.eol || '',
+                          'REF': inf.ref === 'X' ? 'X' : '',
+                          'R+': inf.rplus === 'X' ? 'X' : '',
+                          'Stock': stockByCodice[c] || 0,
+                          'In arrivo': arrivoByCodice[c] || 0,
+                          'In ordine': ordini[c]?.in_ordine || 0,
+                        };
+                      });
+                      const ws = XLSX.utils.json_to_sheet(rows);
+                      const wb = XLSX.utils.book_new();
+                      XLSX.utils.book_append_sheet(wb, ws, 'Stock Spare Parts');
+                      XLSX.writeFile(wb, `stock_spare_parts_${rows.length}.xlsx`);
+                    }
+                  }}
+                    className="text-xs font-bold px-3 py-2 rounded-xl bg-blue-50 hover:bg-blue-100 text-blue-700 border border-blue-200 cursor-pointer transition">
+                    📥 Esporta XLS ({riepGroupMode === 'acc' ? accList.length : codici.length})
+                  </button>
                   <button onClick={() => { setMissioniPanelOpen(true); fetchMissioni(); }}
                     className="ml-auto text-xs font-bold px-3 py-2 rounded-xl bg-amber-50 hover:bg-amber-100 text-amber-700 border border-amber-200 cursor-pointer transition">
                     🛒 Missioni attive ({missioniList.length})
@@ -6655,7 +6690,8 @@ export default function App() {
                       <option value="Secure Room">Secure Room</option>
                       <option value="Repair">Repair</option>
                       <option value="Work Order">Work Order</option>
-                      <option value="Reintegro">Reintegro</option>
+                      <option value="Reintegro1">Reintegro1</option>
+                      <option value="Reintegro4">Reintegro4</option>
                     </select>
                   </div>
                   {prelievoDest === 'Work Order' && (
@@ -7811,7 +7847,8 @@ export default function App() {
               <option value="">Destinazione...</option>
               <option value="Secure Room">Secure Room</option>
               <option value="Repair">Repair</option>
-              <option value="Reintegro">Reintegro</option>
+              <option value="Reintegro1">Reintegro1</option>
+              <option value="Reintegro4">Reintegro4</option>
             </select>
             <button onClick={creaMissionePrelievo} disabled={!cartDest}
               className="text-sm font-bold px-4 py-2 rounded-xl bg-blue-600 hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed text-white cursor-pointer transition shadow-xs">
@@ -7837,7 +7874,8 @@ export default function App() {
                 <option value="">Seleziona destinazione...</option>
                 <option value="Secure Room">Secure Room</option>
                 <option value="Repair">Repair</option>
-                <option value="Reintegro">Reintegro</option>
+                <option value="Reintegro1">Reintegro1</option>
+                <option value="Reintegro4">Reintegro4</option>
               </select>
             </div>
             <div className="flex-grow overflow-y-auto p-4 space-y-2">
