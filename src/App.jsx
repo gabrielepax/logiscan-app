@@ -362,6 +362,7 @@ export default function App() {
   const [prelievoScanner, setPrelievoScanner] = useState('');
   const [prelievoFeedback, setPrelievoFeedback] = useState({ text: '', type: '' });
   const [prelievoManuale, setPrelievoManuale] = useState({ codice: '', stockId: '', quantita: '' });
+  const [prelDetAggiungi, setPrelDetAggiungi] = useState({ codice: '', stockId: '', quantita: '' }); // aggiunta riga su un prelievo attivo già aperto (dettaglio)
   const [prelievoShowEsprinet, setPrelievoShowEsprinet] = useState(false);
   const prelievoScannerRef = useRef(null);
   const registraLockRef = useRef(false); // guard anti doppio-submit prelievo
@@ -2498,6 +2499,89 @@ export default function App() {
     await fetchPrelievi();
     await fetchStock();
     setPrelieviLoading(false);
+  }
+
+  // Rimuove una singola riga da un prelievo già registrato ma non ancora "registrato" (esportato/bloccato),
+  // ripristinando lo stock alle coordinate (codice, magazzino, bancale) — stessa logica di deletePrelievo.
+  async function removeRigaPrelievoAttivo(riga, prelievo) {
+    if (prelievo.stato === 'registrato') { alert('Prelievo registrato: non può essere modificato.'); return; }
+    if (!window.confirm(`Rimuovere la riga ${riga.codice} (qtà ${riga.quantita}) e ripristinare lo stock?`)) return;
+    const { data: existing, error: errSel } = await supabase.from('stock_inventory')
+      .select('id, stock').eq('codice', riga.codice).eq('magazzino', riga.magazzino).eq('numero_bancale', riga.numero_bancale).limit(1);
+    if (errSel) { alert('Errore: ' + errSel.message); return; }
+    if (existing && existing.length > 0) {
+      const { error } = await supabase.from('stock_inventory').update({ stock: (existing[0].stock || 0) + (riga.quantita || 0) }).eq('id', existing[0].id);
+      if (error) { alert('Errore ripristino stock: ' + error.message); return; }
+    } else {
+      const { error } = await supabase.from('stock_inventory').insert({
+        codice: riga.codice, stock: riga.quantita, numero_bancale: riga.numero_bancale, magazzino: riga.magazzino, locazione: '',
+      });
+      if (error) { alert('Errore ripristino stock: ' + error.message); return; }
+    }
+    const { error: errDel } = await supabase.from('prelievi_righe').delete().eq('id', riga.id);
+    if (errDel) { alert('Errore rimozione riga: ' + errDel.message); return; }
+    await openPrelievoDetail(prelievo);
+    await fetchStock();
+    await fetchPrelievi();
+  }
+
+  // Modifica la quantità di una riga di un prelievo attivo non ancora "registrato", aggiustando lo stock
+  // per la differenza (in più scala altro stock, in meno lo restituisce).
+  async function updateRigaPrelievoAttivo(riga, nuovaQtaStr, prelievo) {
+    if (prelievo.stato === 'registrato') { alert('Prelievo registrato: non può essere modificato.'); return; }
+    const nuovaQta = parseFloat(nuovaQtaStr);
+    if (!nuovaQta || nuovaQta <= 0) { alert('Quantità non valida.'); return; }
+    if (nuovaQta === riga.quantita) return;
+    const delta = nuovaQta - riga.quantita;
+    const { data: existing, error: errSel } = await supabase.from('stock_inventory')
+      .select('id, stock').eq('codice', riga.codice).eq('magazzino', riga.magazzino).eq('numero_bancale', riga.numero_bancale).limit(1);
+    if (errSel) { alert('Errore: ' + errSel.message); return; }
+    const stockAttuale = existing?.[0]?.stock || 0;
+    if (delta > 0 && delta > stockAttuale) {
+      alert(`Disponibilità insufficiente: puoi aumentare al massimo di ${stockAttuale} pezzi (bancale ${riga.numero_bancale || '—'}).`);
+      return;
+    }
+    const nuovoStock = stockAttuale - delta;
+    if (existing && existing.length > 0) {
+      if (nuovoStock <= 0) {
+        const { error } = await supabase.from('stock_inventory').delete().eq('id', existing[0].id);
+        if (error) { alert('Errore aggiornamento stock: ' + error.message); return; }
+      } else {
+        const { error } = await supabase.from('stock_inventory').update({ stock: nuovoStock }).eq('id', existing[0].id);
+        if (error) { alert('Errore aggiornamento stock: ' + error.message); return; }
+      }
+    } else if (delta < 0) {
+      const { error } = await supabase.from('stock_inventory').insert({
+        codice: riga.codice, stock: -delta, numero_bancale: riga.numero_bancale, magazzino: riga.magazzino, locazione: '',
+      });
+      if (error) { alert('Errore aggiornamento stock: ' + error.message); return; }
+    }
+    const { error: errUpd } = await supabase.from('prelievi_righe').update({ quantita: nuovaQta }).eq('id', riga.id);
+    if (errUpd) { alert('Errore aggiornamento riga: ' + errUpd.message); return; }
+    await openPrelievoDetail(prelievo);
+    await fetchStock();
+    await fetchPrelievi();
+  }
+
+  // Aggiunge una nuova riga a un prelievo attivo già registrato (non ancora "registrato"/esportato):
+  // permette di "riaprirlo" per evadere codici dimenticati, senza doverne creare uno nuovo.
+  async function addRigaPrelievoAttivo(prelievo, stockRow, quantita) {
+    if (prelievo.stato === 'registrato') { alert('Prelievo registrato: non può essere modificato.'); return; }
+    const qta = parseFloat(quantita);
+    if (!qta || qta <= 0) { alert('Quantità non valida.'); return; }
+    if (qta > stockRow.stock) { alert(`Quantità ${qta} superiore alla disponibilità (${stockRow.stock}).`); return; }
+    const { error: errIns } = await supabase.from('prelievi_righe').insert({
+      prelievo_id: prelievo.id, stock_id: stockRow.id, id_cartone: (stockRow.carton_ids && stockRow.carton_ids[0]) || null,
+      codice: stockRow.codice, numero_bancale: stockRow.numero_bancale, magazzino: stockRow.magazzino, quantita: qta,
+    });
+    if (errIns) { alert('Errore aggiunta riga: ' + errIns.message); return; }
+    const nuovoStock = stockRow.stock - qta;
+    if (nuovoStock <= 0) await supabase.from('stock_inventory').delete().eq('id', stockRow.id);
+    else await supabase.from('stock_inventory').update({ stock: nuovoStock }).eq('id', stockRow.id);
+    setPrelDetAggiungi({ codice: '', stockId: '', quantita: '' });
+    await openPrelievoDetail(prelievo);
+    await fetchStock();
+    await fetchPrelievi();
   }
 
   async function addPrelievoRiga(stockRow, quantita) {
@@ -6587,6 +6671,7 @@ export default function App() {
                     <th className="px-3 py-3">Magazzino</th>
                     <th className="px-3 py-3">Bancale</th>
                     <th className="px-3 py-3 text-right">Quantità</th>
+                    {prelievoDetail.testata.stato !== 'registrato' && <th className="px-3 py-3"></th>}
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-gray-100">
@@ -6597,13 +6682,91 @@ export default function App() {
                       <td className="px-3 py-2.5 font-mono text-[10px] text-gray-500">{r.id_cartone || '—'}</td>
                       <td className="px-3 py-2.5 text-gray-600">{r.magazzino}</td>
                       <td className="px-3 py-2.5 text-gray-600">{r.numero_bancale || '—'}</td>
-                      <td className="px-3 py-2.5 text-right font-mono font-black">{r.quantita}</td>
+                      <td className="px-3 py-2.5 text-right font-mono font-black">
+                        {prelievoDetail.testata.stato === 'registrato' ? r.quantita : (
+                          <input type="number" defaultValue={r.quantita} min="1"
+                            onBlur={e => { const v = e.target.value; if (v && parseFloat(v) !== r.quantita) updateRigaPrelievoAttivo(r, v, prelievoDetail.testata); else e.target.value = r.quantita; }}
+                            onKeyDown={e => { if (e.key === 'Enter') e.target.blur(); }}
+                            className="w-20 text-right border border-gray-300 rounded px-1 py-0.5 text-xs font-black focus:outline-none focus:border-blue-400" />
+                        )}
+                      </td>
+                      {prelievoDetail.testata.stato !== 'registrato' && (
+                        <td className="px-3 py-2.5 text-center">
+                          <button onClick={() => removeRigaPrelievoAttivo(r, prelievoDetail.testata)}
+                            className="text-[10px] text-gray-400 hover:text-red-600 bg-gray-50 hover:bg-red-50 border border-gray-200 hover:border-red-300 px-2 py-1 rounded-lg cursor-pointer transition">✕</button>
+                        </td>
+                      )}
                     </tr>
                   ))}
                 </tbody>
               </table>
+              {prelievoDetail.testata.stato !== 'registrato' && (
+                <p className="px-4 py-2.5 text-[11px] text-gray-400 border-t border-gray-100">
+                  Puoi correggere quantità o rimuovere righe finché il prelievo non viene esportato/registrato: lo stock si aggiusta automaticamente.
+                </p>
+              )}
               </div>
             </div>
+              );
+            })()}
+
+            {prelievoDetail.testata.stato !== 'registrato' && (() => {
+              const spDescMap = {};
+              for (const p of spareParts) { if (!spDescMap[p.pn]) spDescMap[p.pn] = p.descrizione || p.english_name || ''; }
+              for (const a of anagrafica) { const c = String(a.codice || '').trim(); if (c && a.descrizione) spDescMap[c] = a.descrizione; }
+              const allStockCodici = [...new Set(stockItems.filter(s => s.stock > 0).map(s => s.codice).filter(Boolean))].sort();
+              const q = prelDetAggiungi.codice.trim().toLowerCase();
+              const stockCodici = q.length >= 2
+                ? allStockCodici.filter(c => c.toLowerCase().includes(q) || (spDescMap[c] || '').toLowerCase().includes(q)).slice(0, 50)
+                : [];
+              const righeCodice = prelDetAggiungi.codice
+                ? stockItems.filter(s => s.codice === prelDetAggiungi.codice.trim() && s.stock > 0)
+                : [];
+              return (
+                <div className="bg-white p-4 rounded-2xl border border-gray-200 shadow-xs space-y-3">
+                  <span className="text-[10px] font-black text-gray-400 uppercase tracking-wider block">Aggiungi riga dimenticata a questo prelievo</span>
+                  <div className="grid grid-cols-1 sm:grid-cols-12 gap-3 items-end">
+                    <div className="sm:col-span-4 space-y-1">
+                      <label className="block text-xs font-bold text-gray-500">Codice articolo</label>
+                      <input list="prel-det-codici" value={prelDetAggiungi.codice}
+                        onChange={e => setPrelDetAggiungi(v => ({ ...v, codice: e.target.value, stockId: '' }))}
+                        placeholder="Cerca codice..."
+                        className="w-full bg-gray-50 border border-gray-300 rounded-xl p-2.5 text-xs font-mono focus:outline-hidden" />
+                      <datalist id="prel-det-codici">
+                        {stockCodici.map(c => <option key={c} value={c}>{spDescMap[c] || ''}</option>)}
+                      </datalist>
+                    </div>
+                    <div className="sm:col-span-5 space-y-1">
+                      <label className="block text-xs font-bold text-gray-500">Ubicazione (bancale / riga)</label>
+                      <select value={prelDetAggiungi.stockId}
+                        onChange={e => { const sid = e.target.value; const row = stockItems.find(s => String(s.id) === sid); setPrelDetAggiungi(v => ({ ...v, stockId: sid, quantita: row ? row.stock : '' })); }}
+                        disabled={!prelDetAggiungi.codice}
+                        className="w-full bg-gray-50 border border-gray-300 rounded-xl p-2.5 text-xs focus:outline-hidden disabled:opacity-50">
+                        <option value="">{prelDetAggiungi.codice ? `Seleziona (${righeCodice.length})` : 'Prima scegli un codice'}</option>
+                        {righeCodice.map(s => (
+                          <option key={s.id} value={s.id}>
+                            {s.magazzino} / {s.numero_bancale || '—'} — disp. {s.stock}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                    <div className="sm:col-span-2 space-y-1">
+                      <label className="block text-xs font-bold text-gray-500">Qtà</label>
+                      <input type="number" value={prelDetAggiungi.quantita}
+                        onChange={e => setPrelDetAggiungi(v => ({ ...v, quantita: e.target.value }))}
+                        className="w-full bg-gray-50 border border-gray-300 rounded-xl p-2.5 text-xs focus:outline-hidden" />
+                    </div>
+                    <div className="sm:col-span-1">
+                      <button onClick={() => {
+                        if (!prelDetAggiungi.stockId) { alert('Seleziona la riga di stock (bancale).'); return; }
+                        const stockRow = stockItems.find(s => String(s.id) === String(prelDetAggiungi.stockId));
+                        if (!stockRow) { alert('Riga di stock non trovata.'); return; }
+                        addRigaPrelievoAttivo(prelievoDetail.testata, stockRow, prelDetAggiungi.quantita || stockRow.stock);
+                      }}
+                        className="w-full bg-amber-600 hover:bg-amber-700 text-white text-xs font-bold px-3 py-2.5 rounded-xl cursor-pointer transition shadow-xs">+</button>
+                    </div>
+                  </div>
+                </div>
               );
             })()}
           </div>
