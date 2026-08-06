@@ -353,11 +353,12 @@ export default function App() {
   const [prelieviList, setPrelieviList] = useState([]);
   const [prelievoDetail, setPrelievoDetail] = useState(null); // { testata, righe }
   const [prelievoTab, setPrelievoTab] = useState('missioni'); // 'missioni' | 'attivi' | 'registrati'
-  const [prelievoTipo, setPrelievoTipo] = useState('chiamata'); // 'chiamata' | 'workorder'
+  const [prelievoTipo, setPrelievoTipo] = useState('chiamata'); // 'chiamata' | 'workorder' | 'spedizione'
   const [prelieviLoading, setPrelieviLoading] = useState(false);
   const [prelievoUtente, setPrelievoUtente] = useState('');
   const [prelievoDest, setPrelievoDest] = useState('');
   const [prelievoWO, setPrelievoWO] = useState(''); // codice Work Order rilevato (WO + numero)
+  const [prelievoSO, setPrelievoSO] = useState(''); // codice Sales Order per destinazione Spedizione (SO + numero)
   const [prelievoRighe, setPrelievoRighe] = useState([]); // { stockId, idCartone, codice, numero_bancale, magazzino, quantita, qtaDisponibile }
   const [prelievoScanner, setPrelievoScanner] = useState('');
   const [prelievoFeedback, setPrelievoFeedback] = useState({ text: '', type: '' });
@@ -366,14 +367,24 @@ export default function App() {
   const [prelievoShowEsprinet, setPrelievoShowEsprinet] = useState(false);
   const prelievoScannerRef = useRef(null);
   const registraLockRef = useRef(false); // guard anti doppio-submit prelievo
-  // Tipologia prelievo: Work Order (trasferimento a produzione) vs "chiamata" (Secure Room / Repair)
+  // Tipologia prelievo: Work Order (trasferimento a produzione), Spedizione (verso cliente) vs "chiamata" (Secure Room / Repair)
   // Work Order: in DB la destinazione è salvata come "Work Order #WO1403"
+  // Spedizione: in DB la destinazione è salvata come "Spedizione #SO4038" — non selezionabile per le missioni, solo da prelievo libero
   const WO_RE = /^WO\s*\d+$/i; // formato del codice rilevato (WO1454)
+  const SO_RE = /^SO\s*\d+$/i; // formato del Sales Order (SO4038)
   const isWorkOrder = (p) => {
     const d = String(p?.destinazione || '').trim();
     return /^work order/i.test(d) || WO_RE.test(d);
   };
-  const matchTipo = (p) => prelievoTipo === 'workorder' ? isWorkOrder(p) : !isWorkOrder(p);
+  const isSpedizione = (p) => {
+    const d = String(p?.destinazione || '').trim();
+    return /^spedizione/i.test(d) || SO_RE.test(d);
+  };
+  const matchTipo = (p) => {
+    if (prelievoTipo === 'workorder') return isWorkOrder(p);
+    if (prelievoTipo === 'spedizione') return isSpedizione(p);
+    return !isWorkOrder(p) && !isSpedizione(p);
+  };
 
   // Missioni di Prelievo: richiesta persistente (codice+quantità) creata da un utente dal carrello,
   // evasa in un secondo momento da un altro utente (o dallo stesso) dal modulo Prelievi.
@@ -2284,7 +2295,7 @@ export default function App() {
     setPrelievoRighe(prelievoRigheRicostruite);
     setMissioneEsecuzione({ ...missione, righeOriginali: righeRichiesta.map(r => ({ ...r, descrizione: descByCodice[r.codice] || '' })) });
     // Destinazione già decisa dal richiedente in fase di creazione missione
-    setPrelievoDest(missione.destinazione || ''); setPrelievoWO('');
+    setPrelievoDest(missione.destinazione || ''); setPrelievoWO(''); setPrelievoSO('');
     setPrelievoManuale({ codice: '', stockId: '', quantita: '' });
     setPrelievoFeedback(prelievoRigheRicostruite.length > 0
       ? { text: `Ripresa missione: ${prelievoRigheRicostruite.length} righe già prelevate in una sessione precedente.`, type: 'success' }
@@ -2308,7 +2319,7 @@ export default function App() {
     setPrelievoRighe(ricostruite);
     setMissioneEsecuzione(null);
     setPrelievoDraft({ id: draft.id, id_prelievo: draft.id_prelievo });
-    setPrelievoDest(draft.destinazione || ''); setPrelievoWO('');
+    setPrelievoDest(draft.destinazione || ''); setPrelievoWO(''); setPrelievoSO('');
     setPrelievoUtente(draft.utente || '');
     setPrelievoManuale({ codice: '', stockId: '', quantita: '' });
     setPrelievoFeedback({ text: `Ripreso prelievo ${draft.id_prelievo}: ${ricostruite.length} righe già scansionate in una sessione precedente.`, type: 'success' });
@@ -2329,7 +2340,7 @@ export default function App() {
       await supabase.from('prelievi').delete().eq('id', bozza.id);
     }
     setPrelievoView('new'); setPrelievoRighe([]); setMissioneEsecuzione(null); setPrelievoDraft(null);
-    setPrelievoDest(''); setPrelievoWO(''); setPrelievoFeedback({ text: '', type: '' });
+    setPrelievoDest(''); setPrelievoWO(''); setPrelievoSO(''); setPrelievoFeedback({ text: '', type: '' });
     setTimeout(() => prelievoScannerRef.current?.focus(), 100);
   }
 
@@ -2337,9 +2348,30 @@ export default function App() {
     const { data: righe, error } = await supabase.from('prelievi_righe')
       .select('*').eq('prelievo_id', missione.id).order('id', { ascending: true });
     if (error) { alert('Errore caricamento righe missione: ' + error.message); return; }
-    // Solo le righe-richiesta: le eventuali righe già prelevate in una sessione precedente non sono richieste
+    // Righe-richiesta (da mostrare/modificare) + quanto già prelevato fisicamente per codice in una sessione
+    // precedente (missione interrotta): serve come soglia minima, non riducibile, per la modifica richiesta.
     const righeRichiesta = (righe || []).filter(r => r.stock_id == null);
-    setMissioniPanelDetail({ testata: missione, righe: righeRichiesta.map(r => ({ ...r, descrizione: descByCodice[r.codice] || '' })) });
+    const prelevatoByCodice = {};
+    (righe || []).forEach(r => { if (r.stock_id != null) prelevatoByCodice[r.codice] = (prelevatoByCodice[r.codice] || 0) + (r.quantita || 0); });
+    setMissioniPanelDetail({
+      testata: missione,
+      righe: righeRichiesta.map(r => ({ ...r, descrizione: descByCodice[r.codice] || '', giaPrelevato: prelevatoByCodice[r.codice] || 0 })),
+    });
+  }
+
+  // Il richiedente corregge la quantità richiesta di una missione ancora aperta (es. accordo telefonico sul
+  // taglio reale dei cartoni a magazzino): non si può scendere sotto quanto già fisicamente prelevato.
+  async function updateQuantitaRichiestaMissione(riga, nuovoValoreStr, missione) {
+    const nuovoValore = parseFloat(nuovoValoreStr);
+    if (!nuovoValore || nuovoValore <= 0) { alert('Quantità non valida.'); return; }
+    if (nuovoValore < (riga.giaPrelevato || 0)) {
+      alert(`Non puoi scendere sotto ${riga.giaPrelevato} pz: risultano già fisicamente prelevati per questo codice in questa missione (non ancora restituiti allo stock).`);
+      return;
+    }
+    const { error } = await supabase.from('prelievi_righe').update({ quantita_richiesta: nuovoValore }).eq('id', riga.id);
+    if (error) { alert('Errore aggiornamento richiesta: ' + error.message); return; }
+    await openMissioniPanelDetail(missione);
+    await fetchMissioni();
   }
 
   // Storico Missioni: tutte le missioni (aperte + evase), con dettaglio richiesto/prelevato per codice
@@ -2697,14 +2729,20 @@ export default function App() {
 
   async function registraPrelievo() {
     if (prelievoRighe.length === 0) { alert('Nessuna riga da prelevare.'); return; }
-    if (!prelievoDest) { alert('Seleziona la destinazione (Secure Room, Repair o Work Order).'); return; }
-    // Per i Work Order la destinazione salvata è il codice WO rilevato (es. WO1454)
+    if (!prelievoDest) { alert('Seleziona la destinazione (Secure Room, Repair, Work Order o Spedizione).'); return; }
+    // Per i Work Order/Spedizione la destinazione salvata include il riferimento (es. WO1454, SO4038)
     let destFinale = prelievoDest.trim();
     if (prelievoDest === 'Work Order') {
       const wo = prelievoWO.trim().toUpperCase().replace(/\s+/g, '');
       if (!wo) { alert('Il Work Order è obbligatorio: rilevalo o digitalo (es. WO1454).'); return; }
       if (!WO_RE.test(wo)) { alert('Work Order non valido: atteso WO seguito dal numero (es. WO1454).'); return; }
       destFinale = `Work Order #${wo}`;
+    }
+    if (prelievoDest === 'Spedizione') {
+      const so = prelievoSO.trim().toUpperCase().replace(/\s+/g, '');
+      if (!so) { alert('Il Sales Order è obbligatorio: rilevalo o digitalo (es. SO4038).'); return; }
+      if (!SO_RE.test(so)) { alert('Sales Order non valido: atteso SO seguito dal numero (es. SO4038).'); return; }
+      destFinale = `Spedizione #${so}`;
     }
     // Valida quantità
     for (const r of prelievoRighe) {
@@ -2792,6 +2830,7 @@ export default function App() {
       setPrelievoRighe([]);
       setPrelievoDest('');
       setPrelievoWO('');
+      setPrelievoSO('');
       setPrelievoFeedback({ text: '', type: '' });
       setMissioneEsecuzione(null);
       setPrelievoDraft(null);
@@ -6371,7 +6410,7 @@ export default function App() {
                 <div className="flex items-center gap-2">
                   <h2 className="text-lg font-black text-gray-800">📤 Prelievi effettuati</h2>
                   {missioniList.length > 0 && (
-                    <button onClick={() => setPrelievoTab('missioni')} title="Missioni in attesa di evasione"
+                    <button onClick={() => { setPrelievoTipo('chiamata'); setPrelievoTab('missioni'); }} title="Missioni in attesa di evasione (nessuna ha destinazione Work Order)"
                       className="text-[10px] font-black text-white bg-amber-500 hover:bg-amber-600 px-2 py-1 rounded-full cursor-pointer">
                       🛒 {missioniList.length} da evadere
                     </button>
@@ -6384,7 +6423,7 @@ export default function App() {
                   className="bg-gray-100 hover:bg-gray-200 text-gray-600 text-sm font-bold px-3 py-2.5 rounded-xl cursor-pointer transition" title="Aggiorna">
                   ↻
                 </button>
-                {prelievoTipo === 'chiamata' && prelieviList.some(p => !isWorkOrder(p) && p.stato !== 'registrato') && (
+                {prelievoTipo === 'chiamata' && prelieviList.some(p => !isWorkOrder(p) && !isSpedizione(p) && p.stato !== 'registrato') && (
                   <button onClick={exportPrelieviRettifica}
                     className="bg-green-50 hover:bg-green-100 text-green-700 border border-green-200 text-sm font-bold px-4 py-2.5 rounded-xl cursor-pointer transition">
                     📥 Esporta rettifica
@@ -6396,6 +6435,12 @@ export default function App() {
                     📥 Esporta Work Order (da definire)
                   </button>
                 )}
+                {prelievoTipo === 'spedizione' && (
+                  <button disabled title="Formato file da definire"
+                    className="bg-gray-100 text-gray-400 border border-gray-200 text-sm font-bold px-4 py-2.5 rounded-xl cursor-not-allowed">
+                    📥 Esporta Spedizioni (da definire)
+                  </button>
+                )}
                 <button onClick={apriNuovoPrelievo}
                   className="bg-blue-600 hover:bg-blue-700 text-white text-sm font-bold px-4 py-2.5 rounded-xl cursor-pointer transition shadow-xs">
                   + Nuovo prelievo
@@ -6403,23 +6448,24 @@ export default function App() {
               </div>
             </div>
 
-            {/* Tipologia: prelievo "chiamata" (Secure Room / Repair) vs "Work Order" (trasferimento a produzione) */}
+            {/* Tipologia: prelievo "chiamata" (Secure Room / Repair) vs "Work Order" (trasferimento a produzione) vs "Spedizione" (verso cliente) */}
             <div className="flex gap-1 bg-indigo-50 p-1 rounded-xl w-fit border border-indigo-100">
               {[
-                { id: 'chiamata', label: '📞 Chiamata', n: prelieviList.filter(p => !isWorkOrder(p)).length },
-                { id: 'workorder', label: '🏭 Work Order', n: prelieviList.filter(p => isWorkOrder(p)).length },
+                { id: 'chiamata', label: '📞 Chiamata', n: prelieviList.filter(p => !isWorkOrder(p) && !isSpedizione(p)).length },
+                { id: 'workorder', label: '🏭 Work Order', n: prelieviList.filter(isWorkOrder).length },
+                { id: 'spedizione', label: '📦 Spedizioni', n: prelieviList.filter(isSpedizione).length },
               ].map(t => (
-                <button key={t.id} onClick={() => setPrelievoTipo(t.id)}
+                <button key={t.id} onClick={() => { setPrelievoTipo(t.id); if (t.id !== 'chiamata' && prelievoTab === 'missioni') setPrelievoTab('attivi'); }}
                   className={`text-xs font-bold px-4 py-2 rounded-lg cursor-pointer transition ${prelievoTipo === t.id ? 'bg-white text-indigo-800 shadow-xs' : 'text-indigo-400 hover:text-indigo-600'}`}>
                   {t.label} <span className="ml-1 text-[10px] opacity-70">({t.n})</span>
                 </button>
               ))}
             </div>
 
-            {/* Sotto-schede: Missioni (prima) / Attivi / Registrati (nella tipologia selezionata) */}
+            {/* Sotto-schede: Missioni (solo per Chiamata, non esistono missioni Work Order) / Attivi / Registrati */}
             <div className="flex gap-1 bg-gray-100 p-1 rounded-xl w-fit">
               {[
-                { id: 'missioni', label: '🛒 Missioni', n: missioniList.length },
+                ...(prelievoTipo === 'chiamata' ? [{ id: 'missioni', label: '🛒 Missioni', n: missioniList.filter(matchTipo).length }] : []),
                 { id: 'attivi', label: 'Attivi', n: prelieviList.filter(p => matchTipo(p) && p.stato !== 'registrato').length },
                 { id: 'registrati', label: 'Registrati', n: prelieviList.filter(p => matchTipo(p) && p.stato === 'registrato').length },
               ].map(t => (
@@ -6430,15 +6476,21 @@ export default function App() {
               ))}
             </div>
 
-            {prelievoTab === 'missioni' ? (
+            {prelievoTab === 'missioni' ? (() => {
+              // Le missioni non hanno mai destinazione Work Order (non selezionabile alla creazione):
+              // nella tab Work Order quindi non ne compare mai nessuna, per design.
+              const missioniFiltrate = missioniList.filter(matchTipo);
+              return (
               <>
                 {missioniLoading && <div className="text-center py-4 text-xs font-bold text-amber-600 animate-pulse">Caricamento...</div>}
-                {!missioniLoading && missioniList.length === 0 && (
+                {!missioniLoading && missioniFiltrate.length === 0 && (
                   <div className="text-center py-16 text-gray-400 text-sm">
-                    Nessuna missione di prelievo. Si creano dal carrello in Stock Spare Parts.
+                    {prelievoTipo === 'workorder'
+                      ? 'Nessuna missione con destinazione Work Order (le missioni non possono averla).'
+                      : 'Nessuna missione di prelievo. Si creano dal carrello in Stock Spare Parts.'}
                   </div>
                 )}
-                {!missioniLoading && missioniList.length > 0 && (
+                {!missioniLoading && missioniFiltrate.length > 0 && (
                   <div className="bg-white rounded-2xl border border-gray-200 shadow-xs overflow-x-auto">
                     <table className="w-full min-w-[720px] text-left border-collapse text-xs">
                       <thead className="bg-gray-50 border-b border-gray-200 text-[10px] font-black text-gray-500 uppercase tracking-wider">
@@ -6454,7 +6506,7 @@ export default function App() {
                         </tr>
                       </thead>
                       <tbody className="divide-y divide-gray-100">
-                        {missioniList.map(m => (
+                        {missioniFiltrate.map(m => (
                           <tr key={m.id} className="hover:bg-blue-50/50 transition cursor-pointer" onClick={() => openMissioneDetail(m)}>
                             <td className="px-3 py-2.5 font-mono font-bold text-blue-700 underline">{m.id_missione}</td>
                             <td className="px-3 py-2.5 text-gray-600">{m.created_at ? new Date(m.created_at).toLocaleString('it-IT') : '—'}</td>
@@ -6480,7 +6532,8 @@ export default function App() {
                   </div>
                 )}
               </>
-            ) : (
+              );
+            })() : (
             <>
             {prelieviLoading && <div className="text-center py-4 text-xs font-bold text-amber-600 animate-pulse">Caricamento...</div>}
 
@@ -6871,12 +6924,13 @@ export default function App() {
                   </div>
                   <div className="space-y-1">
                     <label className="block text-xs font-bold text-gray-500">Destinazione</label>
-                    <select value={prelievoDest} onChange={e => { setPrelievoDest(e.target.value); if (e.target.value !== 'Work Order') setPrelievoWO(''); }}
+                    <select value={prelievoDest} onChange={e => { setPrelievoDest(e.target.value); if (e.target.value !== 'Work Order') setPrelievoWO(''); if (e.target.value !== 'Spedizione') setPrelievoSO(''); }}
                       className="w-full bg-gray-50 border border-gray-300 rounded-xl p-2.5 text-sm focus:outline-hidden">
                       <option value="">Seleziona destinazione...</option>
                       <option value="Secure Room">Secure Room</option>
                       <option value="Repair">Repair</option>
                       <option value="Work Order">Work Order</option>
+                      <option value="Spedizione">Spedizione</option>
                       <option value="Reintegro1">Reintegro1</option>
                       <option value="Reintegro4">Reintegro4</option>
                     </select>
@@ -6889,6 +6943,16 @@ export default function App() {
                         className={`w-full bg-gray-50 border rounded-xl p-2.5 text-sm font-mono font-bold focus:outline-hidden ${prelievoWO && !WO_RE.test(prelievoWO) ? 'border-red-400 text-red-600' : 'border-gray-300'}`} />
                       {!prelievoWO && <p className="text-[11px] font-bold text-red-600">Obbligatorio per i prelievi Work Order.</p>}
                       {prelievoWO && !WO_RE.test(prelievoWO) && <p className="text-[11px] font-bold text-red-600">Formato non valido: atteso WO seguito dal numero (es. WO1454).</p>}
+                    </div>
+                  )}
+                  {prelievoDest === 'Spedizione' && (
+                    <div className="space-y-1">
+                      <label className="block text-xs font-bold text-gray-500">Sales Order <span className="text-red-500">*</span> <span className="text-gray-400 font-normal">(rileva o digita)</span></label>
+                      <input value={prelievoSO} onChange={e => setPrelievoSO(e.target.value.toUpperCase().replace(/\s+/g, ''))}
+                        placeholder="Es. SO4038" autoComplete="off"
+                        className={`w-full bg-gray-50 border rounded-xl p-2.5 text-sm font-mono font-bold focus:outline-hidden ${prelievoSO && !SO_RE.test(prelievoSO) ? 'border-red-400 text-red-600' : 'border-gray-300'}`} />
+                      {!prelievoSO && <p className="text-[11px] font-bold text-red-600">Obbligatorio per i prelievi Spedizione.</p>}
+                      {prelievoSO && !SO_RE.test(prelievoSO) && <p className="text-[11px] font-bold text-red-600">Formato non valido: atteso SO seguito dal numero (es. SO4038).</p>}
                     </div>
                   )}
                 </div>
@@ -7000,10 +7064,11 @@ export default function App() {
                   </table>
                   </div>
                   <div className="p-4 border-t border-gray-100">
-                    <button onClick={registraPrelievo} disabled={loading || (prelievoDest === 'Work Order' && !WO_RE.test(prelievoWO.trim()))}
+                    <button onClick={registraPrelievo} disabled={loading || (prelievoDest === 'Work Order' && !WO_RE.test(prelievoWO.trim())) || (prelievoDest === 'Spedizione' && !SO_RE.test(prelievoSO.trim()))}
                       className="w-full bg-green-600 hover:bg-green-700 disabled:opacity-50 disabled:cursor-not-allowed text-white font-black p-4 rounded-xl text-base shadow-md transition cursor-pointer flex items-center justify-center gap-2">
                       {loading ? 'Registrazione in corso…'
                         : (prelievoDest === 'Work Order' && !WO_RE.test(prelievoWO.trim())) ? 'Inserisci il Work Order per registrare'
+                        : (prelievoDest === 'Spedizione' && !SO_RE.test(prelievoSO.trim())) ? 'Inserisci il Sales Order per registrare'
                         : `✓ Registra prelievo (${prelievoRighe.length} righe — ${totalePezzi} pz)`}
                     </button>
                   </div>
@@ -8129,12 +8194,19 @@ export default function App() {
                       🗑 Elimina
                     </button>
                   </div>
+                  <p className="text-[11px] text-gray-400">Puoi correggere la quantità richiesta (es. accordo telefonico con chi preleva sul taglio reale dei cartoni a magazzino).</p>
                   <div className="divide-y divide-gray-100 border border-gray-100 rounded-xl overflow-hidden">
                     {missioniPanelDetail.righe.map(r => (
                       <div key={r.id} className="flex items-center gap-3 px-3 py-2 text-xs">
-                        <span className="font-mono font-bold text-blue-700 flex-grow">{r.codice}</span>
-                        <span className="text-gray-500 truncate max-w-[200px]">{r.descrizione || '—'}</span>
-                        <span className="font-mono font-black">{r.quantita_richiesta}</span>
+                        <div className="flex-grow min-w-0">
+                          <p className="font-mono font-bold text-blue-700">{r.codice}</p>
+                          <p className="text-gray-500 truncate">{r.descrizione || '—'}</p>
+                          {r.giaPrelevato > 0 && <p className="text-[10px] text-amber-600 font-bold">Già prelevati: {r.giaPrelevato} (min. modificabile)</p>}
+                        </div>
+                        <input type="number" defaultValue={r.quantita_richiesta} min={r.giaPrelevato || 1}
+                          onBlur={e => { const v = e.target.value; if (v && parseFloat(v) !== r.quantita_richiesta) updateQuantitaRichiestaMissione(r, v, missioniPanelDetail.testata); else e.target.value = r.quantita_richiesta; }}
+                          onKeyDown={e => { if (e.key === 'Enter') e.target.blur(); }}
+                          className="w-20 text-right border border-gray-300 rounded px-1 py-0.5 text-xs font-black focus:outline-none focus:border-blue-400" />
                       </div>
                     ))}
                   </div>
