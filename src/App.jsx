@@ -452,9 +452,14 @@ export default function App() {
   const [dbaseSoloAmbigui, setDbaseSoloAmbigui] = useState(false);
   const [dbaseNascondiNA, setDbaseNascondiNA] = useState(true);
   const [dbaseSoloOrfane, setDbaseSoloOrfane] = useState(false);
+  const [dbasePnitFilter, setDbasePnitFilter] = useState('');
   const [dbaseGenerating, setDbaseGenerating] = useState(false);
   const [dbasePage, setDbasePage] = useState(0);
-  const [dbaseTab, setDbaseTab] = useState('assegnazioni'); // 'assegnazioni' | 'tipi'
+  const [dbaseTab, setDbaseTab] = useState('assegnazioni'); // 'assegnazioni' | 'per-pnit' | 'tipi'
+  const [dbasePnitSummarySearch, setDbasePnitSummarySearch] = useState('');
+  const [dbasePnitSummarySoloDaSistemare, setDbasePnitSummarySoloDaSistemare] = useState(false);
+  const [dbasePnitSummaryStatusFilter, setDbasePnitSummaryStatusFilter] = useState('AVAILABLE');
+  const [dbasePnitDetail, setDbasePnitDetail] = useState(null); // PNIT aperto nell'overlay di dettaglio assegnazioni
 
   // Elenco TYPE (distinte_base_tipi): lista curata dei componenti validi, sostituisce i TYPE dedotti dal DB spare parts
   const [dbaseTipi, setDbaseTipi] = useState([]);
@@ -732,8 +737,15 @@ export default function App() {
         return;
       }
 
-      if (rows.length === 0 || !Object.hasOwn(rows[0], 'PN')) {
-        alert("Formato non valido: colonna 'PN' non trovata.");
+      if (rows.length === 0) {
+        alert("Formato non valido: il foglio 'Elenco spare parts' non contiene righe.");
+        setSpLoading(false);
+        return;
+      }
+      const requiredCols = ['PN', 'Terminal PN', 'PNIT', 'TYPE'];
+      const missingCols = requiredCols.filter(c => !Object.hasOwn(rows[0], c));
+      if (missingCols.length > 0) {
+        alert(`Formato non valido: colonne mancanti nel file (${missingCols.join(', ')}). Import annullato, nessun dato è stato modificato.`);
         setSpLoading(false);
         return;
       }
@@ -789,6 +801,29 @@ export default function App() {
     setSpStaleImportRows(remaining);
     if (remaining.length === 0) setSpFilterStale(false);
     setSpLoading(false);
+  }
+
+  async function removeAllStaleSpareParts() {
+    if (myRole !== 'admin') return;
+    if (spStaleImportRows.length === 0) return;
+    if (!window.confirm(`Eliminare definitivamente tutte le ${spStaleImportRows.length} righe rimaste orfane dall'ultimo import?`)) return;
+    setSpLoading(true);
+    const errors = [];
+    // Cancellazioni in parallelo a lotti (una per riga, ma non più in sequenza):
+    // con migliaia di righe, un giro sequenziale (una richiesta alla volta) può richiedere minuti.
+    const CONCURRENCY = 25;
+    for (let i = 0; i < spStaleImportRows.length; i += CONCURRENCY) {
+      const batch = spStaleImportRows.slice(i, i + CONCURRENCY);
+      const results = await Promise.all(batch.map(r =>
+        supabase.from('spare_parts').delete().eq('pn', r.pn).eq('terminal_pn', r.terminal_pn)
+      ));
+      results.forEach(({ error }) => { if (error) errors.push(error.message); });
+    }
+    await fetchSpareParts();
+    setSpStaleImportRows([]);
+    setSpFilterStale(false);
+    setSpLoading(false);
+    if (errors.length) alert('Errori:\n' + [...new Set(errors)].join('\n'));
   }
 
   function setSpFieldChange(rowKey, field, value) {
@@ -1648,6 +1683,14 @@ export default function App() {
     if (isNewRow) payload.n_a = false; // colonna NOT NULL: va specificata esplicitamente in inserimento
     const { error } = await supabase.from('distinte_base').upsert(payload, { onConflict: 'pnit,type' });
     if (error) { alert('Errore salvataggio: ' + error.message); fetchDistinteBase(); }
+  }
+
+  // Elimina tutte le righe di distinte_base per un PNIT che non esiste (più) come Hardware in Anagrafica.
+  async function eliminaDistinteBasePnit(pnit) {
+    if (!window.confirm(`Il PNIT "${pnit}" non risulta come Hardware in Anagrafica.\n\nEliminare tutte le sue righe dalla Distinta Base? L'operazione non è reversibile.`)) return;
+    const { error } = await supabase.from('distinte_base').delete().eq('pnit', pnit);
+    if (error) { alert('Errore eliminazione: ' + error.message); return; }
+    setDistinteBase(prev => prev.filter(r => r.pnit !== pnit));
   }
 
   function setStockFieldChange(id, field, value) {
@@ -4058,12 +4101,20 @@ export default function App() {
                   )}
                   {spStaleImportRows.length > 0 && (
                     <div className="space-y-1.5">
-                      <button
-                        onClick={() => { setSpFilterStale(v => !v); setSpPage(0); }}
-                        className={`w-full text-left text-xs font-bold px-3 py-2 rounded-xl border transition cursor-pointer ${spFilterStale ? 'bg-amber-500 text-white border-amber-600' : 'bg-amber-50 text-amber-700 border-amber-200 hover:bg-amber-100'}`}>
-                        ⚠ {spStaleImportRows.length} righe non più nell&apos;ultimo file importato (probabile PN rinominato)
-                        {spFilterStale ? ' — clicca per mostrare tutti' : ' — clicca per filtrare'}
-                      </button>
+                      <div className="flex items-center gap-2">
+                        <button
+                          onClick={() => { setSpFilterStale(v => !v); setSpPage(0); }}
+                          className={`flex-grow text-left text-xs font-bold px-3 py-2 rounded-xl border transition cursor-pointer ${spFilterStale ? 'bg-amber-500 text-white border-amber-600' : 'bg-amber-50 text-amber-700 border-amber-200 hover:bg-amber-100'}`}>
+                          ⚠ {spStaleImportRows.length} righe non più nell&apos;ultimo file importato (probabile PN rinominato)
+                          {spFilterStale ? ' — clicca per mostrare tutti' : ' — clicca per filtrare'}
+                        </button>
+                        {isAdmin && (
+                          <button onClick={removeAllStaleSpareParts}
+                            className="shrink-0 text-xs font-bold px-3 py-2 rounded-xl border transition cursor-pointer bg-red-50 text-red-600 border-red-200 hover:bg-red-100">
+                            🗑 Rimuovi tutte
+                          </button>
+                        )}
+                      </div>
                       <div className="max-h-40 overflow-y-auto space-y-1 bg-amber-50 border border-amber-200 rounded-xl p-2">
                         {spStaleImportRows.map((r, i) => (
                           <div key={i} className="flex items-center justify-between gap-2 text-[11px] text-amber-700">
@@ -5993,11 +6044,44 @@ export default function App() {
 
         {/* ==================== MODULO DISTINTE BASE ==================== */}
         {activeModule === 'distinte-base' && (() => {
+          const dbasePnitOptions = [...new Set(dbaseRows.map(r => r.pnit))].sort();
+
+          // Stato PAX (EOL, TESTING, AVAILABLE...) dell'hardware per PNIT: dall'Anagrafica
+          const paxStatusByPnit = {};
+          anagrafica.forEach(a => {
+            if ((a.cluster || '').trim().toLowerCase() !== 'hardware') return;
+            const codice = String(a.codice || '').trim();
+            if (codice) paxStatusByPnit[codice] = (a.pax_status || '').trim();
+          });
+
+          const pnitSummaryByPnit = {};
+          dbaseRows.forEach(r => {
+            if (!pnitSummaryByPnit[r.pnit]) pnitSummaryByPnit[r.pnit] = { pnit: r.pnit, hwStatus: paxStatusByPnit[r.pnit] || '', esisteHardware: Object.prototype.hasOwnProperty.call(paxStatusByPnit, r.pnit), totale: 0, assegnati: 0, na: 0, daSistemare: 0, orfane: 0 };
+            const s = pnitSummaryByPnit[r.pnit];
+            s.totale++;
+            if (r.stato === 'assegnato') s.assegnati++;
+            else if (r.stato === 'na') s.na++;
+            else if (r.stato === 'orfano') { s.orfane++; s.daSistemare++; }
+            else s.daSistemare++; // ambiguo, non_assegnato, non_valido
+          });
+          const dbaseHwStatusOptions = [...new Set(Object.values(pnitSummaryByPnit).map(s => s.hwStatus).filter(Boolean))].sort();
+          let pnitSummaryRows = Object.values(pnitSummaryByPnit);
+          const pqSummary = dbasePnitSummarySearch.trim().toLowerCase();
+          if (pqSummary) pnitSummaryRows = pnitSummaryRows.filter(s => s.pnit.toLowerCase().includes(pqSummary));
+          if (dbasePnitSummaryStatusFilter) pnitSummaryRows = pnitSummaryRows.filter(s => s.hwStatus.toUpperCase() === dbasePnitSummaryStatusFilter.toUpperCase());
+          if (dbasePnitSummarySoloDaSistemare) pnitSummaryRows = pnitSummaryRows.filter(s => s.daSistemare > 0);
+          pnitSummaryRows = pnitSummaryRows.sort((a, b) => b.daSistemare - a.daSistemare || a.pnit.localeCompare(b.pnit));
+          const nPnitDaSistemare = Object.values(pnitSummaryByPnit).filter(s => s.daSistemare > 0).length;
+
+          const dettaglioPnitRows = dbasePnitDetail ? dbaseRows.filter(r => r.pnit === dbasePnitDetail).sort((a, b) => a.type.localeCompare(b.type)) : [];
+          const dettaglioPnitSummary = dbasePnitDetail ? pnitSummaryByPnit[dbasePnitDetail] : null;
+
           let rows = dbaseRows;
           const q = dbaseSearch.trim().toLowerCase();
           if (q) rows = rows.filter(r => `${r.pnit} ${r.type}`.toLowerCase().includes(q));
           const q2 = dbaseSearch2.trim().toLowerCase();
           if (q2) rows = rows.filter(r => `${r.pnit} ${r.type}`.toLowerCase().includes(q2));
+          if (dbasePnitFilter) rows = rows.filter(r => r.pnit === dbasePnitFilter);
           if (dbaseSoloDaAssegnare) rows = rows.filter(r => r.stato === 'ambiguo' || r.stato === 'non_assegnato');
           if (dbaseSoloAmbigui) rows = rows.filter(r => r.stato === 'ambiguo');
           if (dbaseNascondiNA) rows = rows.filter(r => !r.isNA);
@@ -6036,6 +6120,7 @@ export default function App() {
 
               <div className="flex gap-1 bg-indigo-50 p-1 rounded-xl w-fit border border-indigo-100">
                 {[
+                  { id: 'per-pnit', label: '🗂️ Stato PNIT' },
                   { id: 'assegnazioni', label: '📋 Assegnazioni' },
                   { id: 'tipi', label: `🏷️ Elenco SPARE (${dbaseTipi.length})` },
                 ].map(t => (
@@ -6084,6 +6169,11 @@ export default function App() {
                     <input value={dbaseSearch2} onChange={e => { setDbaseSearch2(e.target.value); setDbasePage(0); }}
                       placeholder="Secondo filtro (AND)..."
                       className="min-w-[220px] bg-gray-50 border border-gray-300 rounded-xl p-2.5 text-xs focus:outline-hidden" />
+                    <select value={dbasePnitFilter} onChange={e => { setDbasePnitFilter(e.target.value); setDbasePage(0); }}
+                      className="min-w-[160px] bg-gray-50 border border-gray-300 rounded-xl p-2.5 text-xs focus:outline-hidden">
+                      <option value="">Tutti i PNIT</option>
+                      {dbasePnitOptions.map(p => <option key={p} value={p}>{p}</option>)}
+                    </select>
                     <label className="flex items-center gap-2 cursor-pointer">
                       <input type="checkbox" checked={dbaseSoloDaAssegnare} onChange={e => { setDbaseSoloDaAssegnare(e.target.checked); setDbasePage(0); }} className="w-4 h-4 accent-blue-600 cursor-pointer" />
                       <span className="text-xs font-semibold text-gray-700">Solo da assegnare ({nDaAssegnare})</span>
@@ -6141,23 +6231,28 @@ export default function App() {
                               <td className="px-3 py-2.5 font-mono font-bold text-indigo-800">{r.pnit}</td>
                               <td className="px-3 py-2.5 text-gray-700">{r.type}</td>
                               <td className="px-3 py-2.5">
-                                {r.isNA ? (
-                                  <span className="text-gray-300 italic">—</span>
-                                ) : canEdit('distinte-base') ? (
-                                  <select
-                                    value={r.pnUfficiale}
-                                    onChange={e => setDistinteBasePn(r.pnit, r.type, e.target.value)}
-                                    className="bg-gray-50 border border-gray-300 rounded-lg p-1.5 text-[11px] font-mono focus:outline-hidden"
-                                  >
-                                    <option value="">—</option>
-                                    {r.pnUfficiale && !r.candidati.includes(r.pnUfficiale) && (
-                                      <option value={r.pnUfficiale}>{r.pnUfficiale} (non più valido)</option>
-                                    )}
-                                    {r.candidati.map(pn => <option key={pn} value={pn}>{pn}</option>)}
-                                  </select>
-                                ) : (
-                                  <span className="font-mono font-bold text-blue-700">{r.pnUfficiale || '—'}</span>
-                                )}
+                                <div className="flex items-center gap-1.5">
+                                  {r.isNA ? (
+                                    <span className="text-gray-300 italic">—</span>
+                                  ) : canEdit('distinte-base') ? (
+                                    <select
+                                      value={r.pnUfficiale}
+                                      onChange={e => setDistinteBasePn(r.pnit, r.type, e.target.value)}
+                                      className="bg-gray-50 border border-gray-300 rounded-lg p-1.5 text-[11px] font-mono focus:outline-hidden"
+                                    >
+                                      <option value="">—</option>
+                                      {r.pnUfficiale && !r.candidati.includes(r.pnUfficiale) && (
+                                        <option value={r.pnUfficiale}>{r.pnUfficiale} (non più valido)</option>
+                                      )}
+                                      {r.candidati.map(pn => <option key={pn} value={pn}>{pn}</option>)}
+                                    </select>
+                                  ) : (
+                                    <span className="font-mono font-bold text-blue-700">{r.pnUfficiale || '—'}</span>
+                                  )}
+                                  {r.candidati.length > 0 && (
+                                    <span className="text-[10px] font-bold text-gray-400 ml-1" title="PN disponibili per questa combinazione">({r.candidati.length})</span>
+                                  )}
+                                </div>
                               </td>
                               <td className="px-3 py-2.5 text-center">
                                 {r.refFromType ? (
@@ -6197,6 +6292,87 @@ export default function App() {
                   ) : (
                     <div className="text-center py-16 text-gray-400 text-sm">Nessuna combinazione da visualizzare.</div>
                   ))}
+                </div>
+              )}
+
+              {dbaseTab === 'per-pnit' && (
+                <div className="space-y-5">
+                  <p className="text-xs text-gray-500 max-w-2xl">Stato complessivo della distinta base per ciascun Hardware attivo. Clicca su un PNIT per aprirne il dettaglio in "Assegnazioni" e sistemare le combinazioni mancanti.</p>
+
+                  <div className="flex items-center gap-3 flex-wrap">
+                    <input value={dbasePnitSummarySearch} onChange={e => setDbasePnitSummarySearch(e.target.value)}
+                      placeholder="Cerca PNIT..."
+                      className="min-w-[220px] bg-gray-50 border border-gray-300 rounded-xl p-2.5 text-xs focus:outline-hidden" />
+                    <select value={dbasePnitSummaryStatusFilter} onChange={e => setDbasePnitSummaryStatusFilter(e.target.value)}
+                      className="min-w-[160px] bg-gray-50 border border-gray-300 rounded-xl p-2.5 text-xs focus:outline-hidden">
+                      <option value="">Tutti gli status HW</option>
+                      {dbaseHwStatusOptions.map(st => <option key={st} value={st}>{st}</option>)}
+                    </select>
+                    <label className="flex items-center gap-2 cursor-pointer">
+                      <input type="checkbox" checked={dbasePnitSummarySoloDaSistemare} onChange={e => setDbasePnitSummarySoloDaSistemare(e.target.checked)} className="w-4 h-4 accent-amber-600 cursor-pointer" />
+                      <span className="text-xs font-semibold text-gray-700">Solo da sistemare ({nPnitDaSistemare})</span>
+                    </label>
+                    <span className="text-[11px] text-gray-400">{pnitSummaryRows.length} / {dbasePnitOptions.length} PNIT</span>
+                  </div>
+
+                  {pnitSummaryRows.length > 0 ? (
+                    <div className="bg-white rounded-2xl border border-gray-200 shadow-xs overflow-x-auto">
+                      <table className="w-full text-left border-collapse text-[11px]">
+                        <thead className="bg-gray-50 border-b border-gray-200 text-[10px] font-black text-gray-500 uppercase tracking-wider">
+                          <tr>
+                            <th className="px-3 py-3">PNIT</th>
+                            <th className="px-3 py-3">Distinta Base</th>
+                            <th className="px-3 py-3 text-center">Status HW</th>
+                            <th className="px-3 py-3 text-center">Totale SPARE</th>
+                            <th className="px-3 py-3 text-center">✓ Assegnati</th>
+                            <th className="px-3 py-3 text-center">NON SERVE</th>
+                            <th className="px-3 py-3 text-center">👻 Orfane</th>
+                            <th className="px-3 py-3"></th>
+                          </tr>
+                        </thead>
+                        <tbody className="divide-y divide-gray-100">
+                          {pnitSummaryRows.map(s => (
+                            <tr key={s.pnit} onClick={() => setDbasePnitDetail(s.pnit)} className="hover:bg-blue-50/50 transition cursor-pointer">
+                              <td className="px-3 py-2.5 font-mono font-bold text-indigo-800">{s.pnit}</td>
+                              <td className="px-3 py-2.5">
+                                {s.daSistemare > 0 ? (
+                                  <span className="text-[9px] font-black text-amber-700 bg-amber-50 border border-amber-100 px-1.5 py-0.5 rounded">⚑ DA SISTEMARE ({s.daSistemare})</span>
+                                ) : (
+                                  <span className="text-[9px] font-black text-emerald-700 bg-emerald-50 border border-emerald-100 px-1.5 py-0.5 rounded">✓ COMPLETO</span>
+                                )}
+                              </td>
+                              <td className="px-3 py-2.5 text-center">
+                                {!s.esisteHardware ? (
+                                  <span className="text-[9px] font-black text-red-700 bg-red-50 border border-red-100 px-1.5 py-0.5 rounded" title="Nessun articolo Hardware con questo codice in Anagrafica">❌ NON IN ANAGRAFICA</span>
+                                ) : s.hwStatus && (
+                                  <span className={`text-[9px] font-black px-1.5 py-0.5 rounded border ${s.hwStatus.toUpperCase() === 'EOL' ? 'bg-red-50 text-red-700 border-red-100' : s.hwStatus.toUpperCase() === 'AVAILABLE' ? 'bg-emerald-50 text-emerald-700 border-emerald-100' : 'bg-gray-50 text-gray-500 border-gray-200'}`}>
+                                    {s.hwStatus}
+                                  </span>
+                                )}
+                              </td>
+                              <td className="px-3 py-2.5 text-center font-mono text-gray-600">{s.totale}</td>
+                              <td className="px-3 py-2.5 text-center font-mono text-emerald-700">{s.assegnati || ''}</td>
+                              <td className="px-3 py-2.5 text-center font-mono text-gray-400">{s.na || ''}</td>
+                              <td className="px-3 py-2.5 text-center font-mono text-red-600">{s.orfane || ''}</td>
+                              <td className="px-3 py-2.5 text-right">
+                                {!s.esisteHardware && canEdit('distinte-base') ? (
+                                  <button onClick={e => { e.stopPropagation(); eliminaDistinteBasePnit(s.pnit); }}
+                                    title="Elimina tutte le righe di questo PNIT dalla Distinta Base"
+                                    className="text-sm hover:scale-110 transition cursor-pointer">
+                                    🗑️
+                                  </button>
+                                ) : (
+                                  <span className="text-gray-300">→</span>
+                                )}
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  ) : (
+                    <div className="text-center py-16 text-gray-400 text-sm">Nessun PNIT da visualizzare.</div>
+                  )}
                 </div>
               )}
 
@@ -6277,6 +6453,114 @@ export default function App() {
                   ) : (
                     <div className="text-center py-16 text-gray-400 text-sm">Nessuno SPARE in elenco. Usa "Genera da Compatibilità" o aggiungine uno manualmente.</div>
                   ))}
+                </div>
+              )}
+
+              {dbasePnitDetail && (
+                <div className="fixed inset-0 bg-black/40 flex items-center justify-center z-50 p-4" onClick={() => setDbasePnitDetail(null)}>
+                  <div className="bg-white rounded-2xl shadow-xl w-full max-w-3xl max-h-[85vh] flex flex-col" onClick={e => e.stopPropagation()}>
+                    <div className="flex items-center justify-between gap-3 px-5 py-4 border-b border-gray-200 shrink-0">
+                      <div className="flex items-center gap-2 flex-wrap">
+                        <h3 className="text-sm font-black text-indigo-800 font-mono">{dbasePnitDetail}</h3>
+                        {dettaglioPnitSummary && !dettaglioPnitSummary.esisteHardware && (
+                          <span className="text-[9px] font-black text-red-700 bg-red-50 border border-red-100 px-1.5 py-0.5 rounded">❌ NON IN ANAGRAFICA</span>
+                        )}
+                        {dettaglioPnitSummary?.hwStatus && (
+                          <span className={`text-[9px] font-black px-1.5 py-0.5 rounded border ${dettaglioPnitSummary.hwStatus.toUpperCase() === 'EOL' ? 'bg-red-50 text-red-700 border-red-100' : dettaglioPnitSummary.hwStatus.toUpperCase() === 'AVAILABLE' ? 'bg-emerald-50 text-emerald-700 border-emerald-100' : 'bg-gray-50 text-gray-500 border-gray-200'}`}>
+                            {dettaglioPnitSummary.hwStatus}
+                          </span>
+                        )}
+                      </div>
+                      <div className="flex items-center gap-2">
+                        {dettaglioPnitSummary && !dettaglioPnitSummary.esisteHardware && canEdit('distinte-base') && (
+                          <button onClick={() => { eliminaDistinteBasePnit(dbasePnitDetail); setDbasePnitDetail(null); }}
+                            title="Elimina tutte le righe di questo PNIT dalla Distinta Base"
+                            className="text-sm hover:scale-110 transition cursor-pointer">
+                            🗑️
+                          </button>
+                        )}
+                        <button onClick={() => setDbasePnitDetail(null)} className="text-gray-400 hover:text-gray-700 text-lg leading-none cursor-pointer">✕</button>
+                      </div>
+                    </div>
+                    <div className="overflow-y-auto">
+                      <table className="w-full text-left border-collapse text-[11px]">
+                        <thead className="bg-gray-50 border-b border-gray-200 text-[10px] font-black text-gray-500 uppercase tracking-wider sticky top-0">
+                          <tr>
+                            <th className="px-3 py-2.5">SPARE</th>
+                            <th className="px-3 py-2.5">PN Ufficiale</th>
+                            <th className="px-3 py-2.5 text-center">REF</th>
+                            <th className="px-3 py-2.5 text-center">R+</th>
+                            <th className="px-3 py-2.5 text-center">NON SERVE</th>
+                            <th className="px-3 py-2.5 text-center">🔒</th>
+                            <th className="px-3 py-2.5">Stato</th>
+                          </tr>
+                        </thead>
+                        <tbody className="divide-y divide-gray-100">
+                          {dettaglioPnitRows.map(r => (
+                            <tr key={`${r.pnit}||${r.type}`} className={`hover:bg-blue-50/50 transition ${r.isOrphan ? 'bg-red-50/50' : (r.isNA ? 'opacity-50' : '')}`}>
+                              <td className="px-3 py-2 text-gray-700">{r.type}</td>
+                              <td className="px-3 py-2">
+                                <div className="flex items-center gap-1.5">
+                                  {r.isNA ? (
+                                    <span className="text-gray-300 italic">—</span>
+                                  ) : canEdit('distinte-base') ? (
+                                    <select
+                                      value={r.pnUfficiale}
+                                      onChange={e => setDistinteBasePn(r.pnit, r.type, e.target.value)}
+                                      className="bg-gray-50 border border-gray-300 rounded-lg p-1.5 text-[11px] font-mono focus:outline-hidden"
+                                    >
+                                      <option value="">—</option>
+                                      {r.pnUfficiale && !r.candidati.includes(r.pnUfficiale) && (
+                                        <option value={r.pnUfficiale}>{r.pnUfficiale} (non più valido)</option>
+                                      )}
+                                      {r.candidati.map(pn => <option key={pn} value={pn}>{pn}</option>)}
+                                    </select>
+                                  ) : (
+                                    <span className="font-mono font-bold text-blue-700">{r.pnUfficiale || '—'}</span>
+                                  )}
+                                  {r.candidati.length > 0 && (
+                                    <span className="text-[10px] font-bold text-gray-400 ml-1" title="PN disponibili per questa combinazione">({r.candidati.length})</span>
+                                  )}
+                                </div>
+                              </td>
+                              <td className="px-3 py-2 text-center">
+                                {r.refFromType ? (
+                                  <span className="font-black text-blue-600 text-[11px]" title="Ereditato dallo SPARE (Elenco SPARE)">✓</span>
+                                ) : canEdit('distinte-base') ? (
+                                  <input type="checkbox" checked={r.refOverride} onChange={e => setDistinteBaseOverride(r.pnit, r.type, 'ref_override', e.target.checked)} className="w-4 h-4 accent-blue-600 cursor-pointer" title="Flag REF solo per questo PNIT" />
+                                ) : (r.refOverride ? '✓' : '')}
+                              </td>
+                              <td className="px-3 py-2 text-center">
+                                {r.rplusFromType ? (
+                                  <span className="font-black text-purple-600 text-[11px]" title="Ereditato dallo SPARE (Elenco SPARE)">✓</span>
+                                ) : canEdit('distinte-base') ? (
+                                  <input type="checkbox" checked={r.rplusOverride} onChange={e => setDistinteBaseOverride(r.pnit, r.type, 'rplus_override', e.target.checked)} className="w-4 h-4 accent-purple-600 cursor-pointer" title="Flag R+ solo per questo PNIT" />
+                                ) : (r.rplusOverride ? '✓' : '')}
+                              </td>
+                              <td className="px-3 py-2 text-center">
+                                {canEdit('distinte-base') ? (
+                                  <input type="checkbox" checked={r.isNA} onChange={e => setDistinteBaseNA(r.pnit, r.type, e.target.checked)} className="w-4 h-4 accent-gray-500 cursor-pointer" />
+                                ) : (r.isNA ? '✓' : '')}
+                              </td>
+                              <td className="px-3 py-2 text-center">
+                                {canEdit('distinte-base') ? (
+                                  <button onClick={() => setDistinteBaseLocked(r.pnit, r.type, !r.locked)}
+                                    title={r.locked ? 'Sblocca combinazione' : 'Blocca combinazione (azzera Da ordinare in MRP)'}
+                                    className="cursor-pointer text-sm hover:scale-110 transition">
+                                    {r.locked ? '🔒' : '🔓'}
+                                  </button>
+                                ) : (r.locked ? '🔒' : '')}
+                              </td>
+                              <td className="px-3 py-2">{statoBadge(r.stato, r.candidati.length)}</td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                      {dettaglioPnitRows.length === 0 && (
+                        <div className="text-center py-10 text-gray-400 text-sm">Nessuna combinazione per questo PNIT.</div>
+                      )}
+                    </div>
+                  </div>
                 </div>
               )}
             </div>
