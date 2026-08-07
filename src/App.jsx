@@ -668,6 +668,7 @@ export default function App() {
       }
       const g = (r, col) => col ? String(r[col] || '').trim() : '';
       const toNum = v => parseFloat(String(v || '').replace(',', '.').replace(/[^0-9.-]/g, '')) || 0;
+      const isYes = v => ['yes', 'true', 'si', 'sì', '1'].includes(String(v || '').trim().toLowerCase());
 
       // Preserva i "gruppo" già inseriti manualmente (chiave internal_id)
       const gruppoPrev = {};
@@ -677,6 +678,7 @@ export default function App() {
       const toUpsert = rows.filter(r => {
         const id = String(r[cId] || '').trim();
         if (!id || seen.has(id)) return false;
+        if (isYes(r[cInactive])) return false; // esclude i codici marcati Inactive
         seen.add(id);
         return true;
       }).map(r => {
