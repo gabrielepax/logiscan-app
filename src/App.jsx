@@ -2240,6 +2240,23 @@ export default function App() {
     return `${datePrefix}-${(count || 0) + 1}`;
   }
 
+  // L'id_prelievo è calcolato come "conteggio + 1" (non un valore atomico del DB): se due prelievi/missioni
+  // vengono creati quasi in contemporanea possono collidere sullo stesso ID e il vincolo di unicità blocca
+  // il secondo insert. Qui si rigenera l'ID e si riprova invece di far fallire l'operazione.
+  async function inserisciPrelievoConIdUnivoco(payloadSenzaId) {
+    let ultimoErrore = null;
+    for (let tentativo = 0; tentativo < 5; tentativo++) {
+      const idPrelievo = await generaIdPrelievo();
+      const { data, error } = await supabase.from('prelievi')
+        .insert({ ...payloadSenzaId, id_prelievo: idPrelievo })
+        .select('id').single();
+      if (!error) return { data, idPrelievo };
+      if (error.code !== '23505') return { error };
+      ultimoErrore = error;
+    }
+    return { error: ultimoErrore };
+  }
+
   async function creaMissionePrelievo() {
     if (cartItems.length === 0) return;
     if (!cartDest) { alert('Seleziona la destinazione dei materiali (Secure Room, Repair, Reintegro1 o Reintegro4).'); setCartOpen(true); return; }
@@ -2257,11 +2274,9 @@ export default function App() {
     if (!window.confirm(`Creare una missione di prelievo con ${cartItems.length} articoli per "${destFinale}"?\n\nUn operatore potrà evaderla in seguito dal modulo Prelievi.`)) return;
     setLoading(true);
     try {
-      const idMissione = await generaIdPrelievo();
-
-      const { data: testata, error: errT } = await supabase.from('prelievi')
-        .insert({ id_prelievo: idMissione, origine: 'missione', richiedente: user, stato: 'aperta', destinazione: destFinale, richiesta_at: new Date().toISOString(), data_prelievo: null })
-        .select('id').single();
+      const { data: testata, idPrelievo: idMissione, error: errT } = await inserisciPrelievoConIdUnivoco({
+        origine: 'missione', richiedente: user, stato: 'aperta', destinazione: destFinale, richiesta_at: new Date().toISOString(), data_prelievo: null,
+      });
       if (errT) { alert('Errore creazione missione: ' + errT.message); return; }
 
       const righeIns = cartItems.map(i => ({
@@ -2692,10 +2707,9 @@ export default function App() {
       if (prelievoDraft) {
         prelievoIdBozza = prelievoDraft.id;
       } else {
-        const idBozza = await generaIdPrelievo();
-        const { data: testata, error: errT } = await supabase.from('prelievi')
-          .insert({ id_prelievo: idBozza, origine: 'manuale', stato: 'aperta', richiesta_at: new Date().toISOString(), data_prelievo: null, utente: prelievoUtente.trim() || currentUser || null })
-          .select('id').single();
+        const { data: testata, idPrelievo: idBozza, error: errT } = await inserisciPrelievoConIdUnivoco({
+          origine: 'manuale', stato: 'aperta', richiesta_at: new Date().toISOString(), data_prelievo: null, utente: prelievoUtente.trim() || currentUser || null,
+        });
         if (errT) {
           setPrelievoFeedback({ text: 'Errore creazione prelievo: ' + errT.message, type: 'error' });
           sounds.error(); triggerVibration([300]);
@@ -2840,11 +2854,11 @@ export default function App() {
         if (errU) { alert('Errore aggiornamento prelievo: ' + errU.message); return; }
       } else {
         // Nessuna bozza (non dovrebbe succedere se ci sono righe: fallback difensivo)
-        idPrelievo = await generaIdPrelievo();
-        const { data: testata, error: errT } = await supabase.from('prelievi')
-          .insert({ id_prelievo: idPrelievo, utente: user, destinazione: destFinale || null })
-          .select('id').single();
+        const { data: testata, idPrelievo: idGenerato, error: errT } = await inserisciPrelievoConIdUnivoco({
+          utente: user, destinazione: destFinale || null,
+        });
         if (errT) { alert('Errore creazione prelievo: ' + errT.message); return; }
+        idPrelievo = idGenerato;
         prelievoId = testata.id;
       }
 
@@ -5897,6 +5911,21 @@ export default function App() {
                   }}
                     className="bg-green-50 hover:bg-green-100 text-green-700 border border-green-200 text-xs font-bold px-3 py-2.5 rounded-xl cursor-pointer transition">
                     📊 Esporta Excel
+                  </button>
+                  <button onClick={() => {
+                    // CSV compatto: un record per combinazione PNIT+SPARE, ID = concatenato dei due (stessa
+                    // chiave usata per consumi/NoMaterial), con giacenza e quantità già in ordine.
+                    const header = ['ID', 'PNIT', 'SPARE', 'Stock', 'In ordine'].join(';');
+                    const rows = combos.map(c => [`${c.pnit}${c.type}`, c.pnit, c.type, c.stock, c.inOrdine].join(';'));
+                    const csv = [header, ...rows].join('\r\n');
+                    const blob = new Blob(['﻿' + csv], { type: 'text/csv;charset=utf-8;' });
+                    const url = URL.createObjectURL(blob);
+                    const a = document.createElement('a'); a.href = url;
+                    a.download = `mrp_stock_ordine_${new Date().toISOString().slice(0, 10)}.csv`; a.click();
+                    URL.revokeObjectURL(url);
+                  }}
+                    className="bg-blue-50 hover:bg-blue-100 text-blue-700 border border-blue-200 text-xs font-bold px-3 py-2.5 rounded-xl cursor-pointer transition">
+                    📄 CSV Stock/In ordine
                   </button>
                   <input value={matriceSearch} onChange={e => { setMatriceSearch(e.target.value); setMatricePage(0); }}
                     placeholder="Cerca per PNIT o SPARE..."
