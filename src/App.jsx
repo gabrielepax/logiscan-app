@@ -404,7 +404,7 @@ export default function App() {
   // Carrello Stock Spare Parts (solo sessione corrente, si svuota al refresh)
   const [cartItems, setCartItems] = useState([]); // { codice, descrizione, quantita, disponibile }
   const [cartOpen, setCartOpen] = useState(false);
-  const [cartDest, setCartDest] = useState(''); // destinazione richiesta per la missione: Secure Room | Repair | Reintegro1 | Reintegro4
+  const [cartDest, setCartDest] = useState(''); // destinazione richiesta per la missione: Secure Room | Repair | Screening | Reintegro1 | Reintegro4
   const [riepQtyDraft, setRiepQtyDraft] = useState({}); // codice -> quantità digitata in linea prima di aggiungere al carrello
 
   // Anagrafica Terminali (tipoterminale.xlsx → foglio "famiglie", chiave CODICE = PNIT del DB spare parts)
@@ -2259,7 +2259,7 @@ export default function App() {
 
   async function creaMissionePrelievo() {
     if (cartItems.length === 0) return;
-    if (!cartDest) { alert('Seleziona la destinazione dei materiali (Secure Room, Repair, Reintegro1 o Reintegro4).'); setCartOpen(true); return; }
+    if (!cartDest) { alert('Seleziona la destinazione dei materiali (Secure Room, Repair, Screening, Reintegro1 o Reintegro4).'); setCartOpen(true); return; }
     const invalido = cartItems.find(i => !(parseFloat(i.quantita) > 0));
     if (invalido) { alert(`Quantità non valida per ${invalido.codice}: correggila nel carrello prima di creare la missione.`); setCartOpen(true); return; }
     const destFinale = cartDest.trim();
@@ -8414,6 +8414,7 @@ export default function App() {
               <option value="">Destinazione...</option>
               <option value="Secure Room">Secure Room</option>
               <option value="Repair">Repair</option>
+              <option value="Screening">Screening</option>
               <option value="Reintegro1">Reintegro1</option>
               <option value="Reintegro4">Reintegro4</option>
             </select>
@@ -8441,6 +8442,7 @@ export default function App() {
                 <option value="">Seleziona destinazione...</option>
                 <option value="Secure Room">Secure Room</option>
                 <option value="Repair">Repair</option>
+                <option value="Screening">Screening</option>
                 <option value="Reintegro1">Reintegro1</option>
                 <option value="Reintegro4">Reintegro4</option>
               </select>
