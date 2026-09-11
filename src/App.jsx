@@ -15,6 +15,8 @@ const APP_MODULES = [
   { id: 'sposta-bancale', label: 'Sposta Bancale', group: 'Magazzino' },
   { id: 'stock', label: 'Inventario', group: 'Magazzino', upload: true, edit: true },
   { id: 'riepilogo', label: 'Stock Spare Parts', group: 'Magazzino' },
+  { id: 'controlli-inventariali', label: 'Controlli Inventariali', group: 'Magazzino', upload: true },
+  { id: 'missioni-inventario', label: 'Missioni Inventario', group: 'Magazzino' },
   { id: 'spare-parts', label: 'Compatibilità', group: 'Repair', upload: true, edit: true },
   { id: 'distinte-base', label: 'Distinte Base', group: 'Repair', edit: true, genera: true },
   { id: 'matrice', label: 'MRP', group: 'Repair', upload: true },
@@ -41,6 +43,18 @@ const CURRENCY_SYMBOLS = {
 const currencySymbol = (valuta) => {
   const key = String(valuta || '').trim().toLowerCase();
   return CURRENCY_SYMBOLS[key] || valuta || '';
+};
+
+// Controlli Inventariali: il barcode ubicazione ha la stessa costruzione delle locazioni
+// dell'Inventario spare parts (es. H-07-03). Le matricole non contengono trattini, quindi
+// una lettura che rispetta il formato viene sempre interpretata come cambio ubicazione.
+const INV_LOC_RE = /^[A-Z]{1,2}-\d{1,3}-\d{1,3}$/i;
+const invMissioneCode = (id) => `INV-${String(id).padStart(5, '0')}`;
+const INV_STATI = {
+  aperta: { label: 'Da eseguire', cls: 'bg-blue-50 text-blue-700 border-blue-200' },
+  in_corso: { label: 'In corso', cls: 'bg-amber-50 text-amber-700 border-amber-200' },
+  completata: { label: 'Completata', cls: 'bg-green-50 text-green-700 border-green-200' },
+  chiusa: { label: 'Chiusa', cls: 'bg-gray-100 text-gray-500 border-gray-200' },
 };
 
 // Web Audio API — crea il contesto la prima volta che l'utente interagisce
@@ -80,6 +94,15 @@ const sounds = {
   error() {
     playBeep({ frequency: 200, duration: 0.22, type: 'square', volume: 0.3, delay: 0 });
     playBeep({ frequency: 140, duration: 0.32, type: 'square', volume: 0.3, delay: 0.2 });
+  },
+  // Ubicazione acquisita (Missioni Inventario) — due toni ascendenti
+  location() {
+    playBeep({ frequency: 880, duration: 0.09, type: 'sine', volume: 0.35, delay: 0 });
+    playBeep({ frequency: 1320, duration: 0.12, type: 'sine', volume: 0.4, delay: 0.11 });
+  },
+  // Matricola da verificare (non attesa dalla missione) — tre bip medi
+  warn() {
+    [0, 0.15, 0.3].forEach(delay => playBeep({ frequency: 520, duration: 0.1, type: 'triangle', volume: 0.45, delay }));
   },
 };
 
@@ -468,6 +491,32 @@ export default function App() {
   const [dbaseTipiSearch, setDbaseTipiSearch] = useState('');
   const [dbaseNuovoTipo, setDbaseNuovoTipo] = useState('');
 
+  // Controlli Inventariali: giacenza matricolare NS (snapshot CSV) e missioni di verifica per codice su singolo magazzino
+  const [invRiepilogo, setInvRiepilogo] = useState([]); // [{location, item, qty}] aggregato dello snapshot
+  const [invSnapshotLoading, setInvSnapshotLoading] = useState(false);
+  const [invImportProgress, setInvImportProgress] = useState('');
+  const [invTab, setInvTab] = useState('lancia'); // 'lancia' | 'missioni'
+  const [invMagazzino, setInvMagazzino] = useState('');
+  const [invSearch, setInvSearch] = useState('');
+  const [invSelezione, setInvSelezione] = useState(new Set()); // codici selezionati da lanciare sul magazzino corrente
+  const [invMissioni, setInvMissioni] = useState([]);
+  const [invMissioniLoading, setInvMissioniLoading] = useState(false);
+  const [invMissioniFiltro, setInvMissioniFiltro] = useState('da_eseguire'); // 'da_eseguire' | 'completate' | 'chiuse'
+  const [invProgress, setInvProgress] = useState({}); // missione_id -> { ok, daVerificare, ubicazioni } delle missioni in corso
+
+  // Missioni Inventario: esecuzione da parte del magazziniere
+  const [invExec, setInvExec] = useState(null); // testata della missione aperta
+  const [invExecAttese, setInvExecAttese] = useState(new Set()); // matricole attese dalla missione
+  const [invExecRilevazioni, setInvExecRilevazioni] = useState([]); // più recenti in cima
+  const [invExecUbicazioni, setInvExecUbicazioni] = useState(new Set());
+  const [invExecUbicazione, setInvExecUbicazione] = useState(''); // ubicazione corrente
+  const [invExecScanner, setInvExecScanner] = useState('');
+  const [invExecFeedback, setInvExecFeedback] = useState({ text: '', type: '', sub: '' });
+  const [invExecLoading, setInvExecLoading] = useState(false);
+  const invExecSetRef = useRef(new Map()); // matricola -> ubicazione: guardia sincrona anti-duplicati
+  const invExecUbicazioneRef = useRef(''); // ubicazione corrente letta dallo scanner (non attende il render)
+  const invExecScannerRef = useRef(null);
+
   const scannerInputRef = useRef(null);
 
   useEffect(() => {
@@ -504,6 +553,28 @@ export default function App() {
     window.addEventListener('click', handleGlobalClick);
     return () => window.removeEventListener('click', handleGlobalClick);
   }, [currentView]);
+
+  // Controlli Inventariali / Missioni Inventario: dati caricati all'apertura del modulo
+  useEffect(() => {
+    if (activeModule === 'controlli-inventariali') {
+      fetchInvRiepilogo();
+      fetchInvMissioni();
+    }
+    if (activeModule === 'missioni-inventario') fetchInvMissioni();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeModule]);
+
+  // Missione inventario in esecuzione: lo scanner resta sempre a fuoco
+  useEffect(() => {
+    if (!invExec) return;
+    invExecScannerRef.current?.focus();
+    const refocus = (ev) => {
+      if (ev.target?.closest?.('input, select, textarea')) return;
+      invExecScannerRef.current?.focus();
+    };
+    window.addEventListener('click', refocus);
+    return () => window.removeEventListener('click', refocus);
+  }, [invExec]);
 
   // Helper: carica TUTTE le righe di una tabella superando il limite di 1000
   async function fetchAllRows(table, cols) {
@@ -3711,6 +3782,492 @@ export default function App() {
     invoiceGroups[groupKey].lines.push(line);
   });
 
+  // ==================== CONTROLLI INVENTARIALI / MISSIONI INVENTARIO ====================
+  // La giacenza matricolare NS (CSV: Internal ID, Number, Item, Location, Available, Memo, Date Created)
+  // è uno snapshot in inv_snapshot. Al lancio ogni missione (codice + magazzino) congela le proprie
+  // matricole attese in inv_missioni_attese: un nuovo caricamento del CSV non altera le missioni già lanciate.
+  // Al download del dettaglio la missione passa a 'chiusa' e il dettaglio viene eliminato: resta la testata con gli esiti.
+
+  // Carica tutte le righe di una query filtrata superando il limite di 1000 (ordinamento stabile per la paginazione)
+  async function invFetchAll(table, cols, applyFilter, orderCols) {
+    const pageSize = 1000;
+    let all = [];
+    for (let from = 0; ; from += pageSize) {
+      let q = applyFilter(supabase.from(table).select(cols));
+      orderCols.forEach(c => { q = q.order(c, { ascending: true }); });
+      const { data, error } = await q.range(from, from + pageSize - 1);
+      if (error) throw error;
+      all = all.concat(data || []);
+      if (!data || data.length < pageSize) break;
+    }
+    return all;
+  }
+
+  async function fetchInvRiepilogo() {
+    setInvSnapshotLoading(true);
+    try {
+      setInvRiepilogo(await invFetchAll('inv_snapshot_riepilogo', '*', q => q, ['location', 'item']));
+    } catch (err) { alert('Errore caricamento giacenza NS: ' + err.message); }
+    setInvSnapshotLoading(false);
+  }
+
+  async function fetchInvMissioni() {
+    setInvMissioniLoading(true);
+    const { data, error } = await supabase.from('inv_missioni').select('*').order('created_at', { ascending: false }).limit(1000);
+    if (error) { alert('Errore caricamento missioni inventario: ' + error.message); setInvMissioniLoading(false); return; }
+    setInvMissioni(data || []);
+    // Avanzamento live delle missioni in corso (le completate hanno già gli esiti in testata)
+    const prog = {};
+    await Promise.all((data || []).filter(m => m.stato === 'in_corso').map(async m => {
+      const [ok, dv, ub] = await Promise.all([
+        supabase.from('inv_missioni_rilevazioni').select('id', { count: 'exact', head: true }).eq('missione_id', m.id).eq('esito', 'ok'),
+        supabase.from('inv_missioni_rilevazioni').select('id', { count: 'exact', head: true }).eq('missione_id', m.id).eq('esito', 'da_verificare'),
+        supabase.from('inv_missioni_ubicazioni').select('ubicazione', { count: 'exact', head: true }).eq('missione_id', m.id),
+      ]);
+      prog[m.id] = { ok: ok.count || 0, daVerificare: dv.count || 0, ubicazioni: ub.count || 0 };
+    }));
+    setInvProgress(prog);
+    setInvMissioniLoading(false);
+  }
+
+  // Parser CSV testuale: SheetJS convertirebbe le matricole numeriche perdendo gli zeri iniziali (0800050107)
+  function parseInvCsv(text) {
+    const lines = (text.charCodeAt(0) === 0xFEFF ? text.slice(1) : text).split(/\r?\n/).filter(l => l.trim());
+    if (lines.length < 2) return { error: 'File vuoto.' };
+    const sep = (lines[0].match(/;/g) || []).length > (lines[0].match(/,/g) || []).length ? ';' : ',';
+    const splitLine = (line) => {
+      const out = [];
+      let cur = '';
+      let quoted = false;
+      for (let i = 0; i < line.length; i++) {
+        const ch = line[i];
+        if (quoted) {
+          if (ch === '"' && line[i + 1] === '"') { cur += '"'; i++; }
+          else if (ch === '"') quoted = false;
+          else cur += ch;
+        } else if (ch === '"') quoted = true;
+        else if (ch === sep) { out.push(cur.trim()); cur = ''; }
+        else cur += ch;
+      }
+      out.push(cur.trim());
+      return out;
+    };
+    const norm = s => s.toLowerCase().replace(/[^a-z0-9]/g, '');
+    const headers = splitLine(lines[0]).map(norm);
+    const col = (...cands) => headers.findIndex(h => cands.includes(h));
+    const iId = col('internalid');
+    const iNum = col('number', 'serialnumber', 'matricola');
+    const iItem = col('item', 'codice');
+    const iLoc = col('location', 'magazzino');
+    const iMemo = col('memo');
+    const iDate = col('datecreated');
+    if (iNum < 0 || iItem < 0 || iLoc < 0) return { error: "Colonne mancanti: servono almeno 'Number', 'Item' e 'Location'." };
+    const byNumero = new Map();
+    let duplicati = 0;
+    lines.slice(1).forEach(line => {
+      const c = splitLine(line);
+      const numero = (c[iNum] || '').toUpperCase();
+      const item = c[iItem] || '';
+      const location = c[iLoc] || '';
+      if (!numero || !item || !location) return;
+      if (byNumero.has(numero)) duplicati++;
+      byNumero.set(numero, {
+        numero, item, location,
+        internal_id: iId >= 0 ? c[iId] || null : null,
+        memo: iMemo >= 0 ? c[iMemo] || null : null,
+        date_created: iDate >= 0 ? c[iDate] || null : null,
+      });
+    });
+    return { rows: [...byNumero.values()], duplicati };
+  }
+
+  async function handleInvSnapshotUpload(event) {
+    const file = event.target.files[0];
+    if (!file) return;
+    event.target.value = '';
+    const parsed = parseInvCsv(await file.text());
+    if (parsed.error) { alert(parsed.error); return; }
+    const { rows, duplicati } = parsed;
+    if (rows.length === 0) { alert('Nessuna matricola valida nel file.'); return; }
+    const dataFile = new Date(file.lastModified);
+    if (!window.confirm(
+      `Caricare la giacenza NS: ${rows.length.toLocaleString('it-IT')} matricole (file del ${dataFile.toLocaleString('it-IT')})?\n\n` +
+      `La giacenza attuale verrà SOSTITUITA. Le missioni già lanciate non cambiano: conservano le matricole attese al momento del lancio.` +
+      (duplicati ? `\n\n${duplicati} matricole ripetute nel file: viene tenuta l'ultima occorrenza.` : '')
+    )) return;
+
+    const agg = new Map();
+    rows.forEach(r => {
+      const k = `${r.location}__${r.item}`;
+      const a = agg.get(k) || { location: r.location, item: r.item, qty: 0 };
+      a.qty++;
+      agg.set(k, a);
+    });
+
+    setInvSnapshotLoading(true);
+    try {
+      const { error: resetErr } = await supabase.rpc('inv_snapshot_reset');
+      if (resetErr) throw resetErr;
+      const chunks = [];
+      for (let i = 0; i < rows.length; i += 1000) chunks.push(rows.slice(i, i + 1000));
+      let done = 0;
+      for (let i = 0; i < chunks.length; i += 4) {
+        const batch = chunks.slice(i, i + 4);
+        const res = await Promise.all(batch.map(c => supabase.from('inv_snapshot').insert(c)));
+        const err = res.find(r => r.error)?.error;
+        if (err) throw err;
+        done += batch.reduce((s, c) => s + c.length, 0);
+        setInvImportProgress(`${done.toLocaleString('it-IT')}/${rows.length.toLocaleString('it-IT')}`);
+      }
+      const riep = [...agg.values()];
+      for (let i = 0; i < riep.length; i += 1000) {
+        const { error } = await supabase.from('inv_snapshot_riepilogo').insert(riep.slice(i, i + 1000));
+        if (error) throw error;
+      }
+      await recordImportMeta('inv_snapshot');
+      // Data della giacenza = data del file esportato da NS
+      await supabase.from('import_meta').upsert({ chiave: 'inv_snapshot_file', updated_at: dataFile.toISOString(), updated_by: currentUser || 'import' }, { onConflict: 'chiave' });
+      setImportMeta(prev => ({ ...prev, inv_snapshot_file: dataFile.toISOString() }));
+      alert(`Giacenza NS caricata: ${rows.length.toLocaleString('it-IT')} matricole, ${riep.length} combinazioni codice/magazzino.`);
+    } catch (err) {
+      alert('Errore caricamento giacenza NS: ' + err.message + '\n\nLa giacenza potrebbe essere incompleta: ricarica il file.');
+    }
+    setInvImportProgress('');
+    setInvSnapshotLoading(false);
+    setInvSelezione(new Set());
+    await fetchInvRiepilogo();
+  }
+
+  async function lanciaInvMissioni() {
+    const attivaGia = (item) => invMissioni.some(m => m.magazzino === invMagazzino && m.codice === item && (m.stato === 'aperta' || m.stato === 'in_corso'));
+    const items = [...invSelezione].filter(it => !attivaGia(it));
+    if (!invMagazzino || items.length === 0) return;
+    if (!window.confirm(
+      `Lanciare ${items.length} ${items.length === 1 ? 'missione' : 'missioni'} di verifica su ${invMagazzino}?\n\n` +
+      items.slice(0, 15).join(', ') + (items.length > 15 ? ` e altri ${items.length - 15}` : '')
+    )) return;
+    setInvMissioniLoading(true);
+    const snapshotAt = importMeta.inv_snapshot_file || importMeta.inv_snapshot || null;
+    let lanciate = 0;
+    try {
+      for (const item of items) {
+        const attese = await invFetchAll('inv_snapshot', 'numero', q => q.eq('location', invMagazzino).eq('item', item), ['numero']);
+        const { data: t, error } = await supabase.from('inv_missioni').insert({
+          codice: item, magazzino: invMagazzino, stato: 'aperta', snapshot_at: snapshotAt,
+          qty_attese: attese.length, creata_da: currentUser || null,
+        }).select().single();
+        if (error) throw error;
+        for (let i = 0; i < attese.length; i += 1000) {
+          const { error: e } = await supabase.from('inv_missioni_attese')
+            .insert(attese.slice(i, i + 1000).map(a => ({ missione_id: t.id, matricola: a.numero })));
+          if (e) { await supabase.from('inv_missioni').delete().eq('id', t.id); throw e; }
+        }
+        lanciate++;
+      }
+    } catch (err) {
+      alert(`Errore durante il lancio (${lanciate} missioni lanciate): ${err.message}`);
+    }
+    setInvSelezione(new Set());
+    await fetchInvMissioni();
+    if (lanciate > 0) { setInvTab('missioni'); setInvMissioniFiltro('da_eseguire'); }
+  }
+
+  async function annullaInvMissione(m) {
+    const avviso = m.stato === 'in_corso' ? '\n\nATTENZIONE: la missione è in corso, le rilevazioni già effettuate verranno eliminate.' : '';
+    if (!window.confirm(`Annullare la missione ${invMissioneCode(m.id)} (${m.codice} su ${m.magazzino})?${avviso}`)) return;
+    const { error } = await supabase.from('inv_missioni').delete().eq('id', m.id); // il dettaglio si elimina in cascata
+    if (error) { alert('Errore: ' + error.message); return; }
+    await fetchInvMissioni();
+  }
+
+  async function scaricaChiudiInvMissione(m) {
+    const code = invMissioneCode(m.id);
+    if (!window.confirm(
+      `Scaricare il dettaglio della missione ${code}?\n\n` +
+      `Dopo il download la missione viene CHIUSA e il dettaglio (matricole, ubicazioni) eliminato dal database: resteranno solo gli esiti di testata.`
+    )) return;
+    setInvMissioniLoading(true);
+    try {
+      const [ril, att, ubi] = await Promise.all([
+        invFetchAll('inv_missioni_rilevazioni', '*', q => q.eq('missione_id', m.id), ['id']),
+        invFetchAll('inv_missioni_attese', 'matricola', q => q.eq('missione_id', m.id), ['matricola']),
+        invFetchAll('inv_missioni_ubicazioni', '*', q => q.eq('missione_id', m.id), ['ubicazione']),
+      ]);
+      const fmtD = iso => iso ? new Date(iso).toLocaleDateString('it-IT') : '';
+      const fmtT = iso => iso ? new Date(iso).toLocaleTimeString('it-IT') : '';
+      const fmtDT = iso => iso ? new Date(iso).toLocaleString('it-IT') : '';
+      const trovate = new Set(ril.filter(r => r.esito === 'ok').map(r => r.matricola));
+      const nDaVerificare = ril.filter(r => r.esito === 'da_verificare').length;
+      const perUbi = {};
+      ril.forEach(r => {
+        const u = perUbi[r.ubicazione] || (perUbi[r.ubicazione] = { ok: 0, dv: 0 });
+        if (r.esito === 'ok') u.ok++; else u.dv++;
+      });
+      const nUbicazioni = new Set([...ubi.map(u => u.ubicazione), ...Object.keys(perUbi)]).size;
+      const esiti = { qty_trovate: trovate.size, qty_mancanti: Math.max(att.length - trovate.size, 0), n_da_verificare: nDaVerificare, n_ubicazioni: nUbicazioni };
+
+      const rowsRil = ril.map(r => ({
+        Data: fmtD(r.rilevata_at), Ora: fmtT(r.rilevata_at), Operatore: r.operatore || '',
+        Ubicazione: r.ubicazione, Matricola: r.matricola, Codice: m.codice, Magazzino: m.magazzino,
+        Esito: r.esito === 'ok' ? 'OK' : 'DA VERIFICARE', Lettura: r.fonte === 'qr' ? 'QR cartone' : 'Singola', Nota: r.nota || '',
+      }));
+      const rowsNonTrovate = att.filter(a => !trovate.has(a.matricola))
+        .map(a => ({ Matricola: a.matricola, Codice: m.codice, Magazzino: m.magazzino }));
+      const rowsUbi = ubi.map(u => ({
+        Ubicazione: u.ubicazione, 'Sparata da': u.operatore || '', Data: fmtD(u.sparata_at), Ora: fmtT(u.sparata_at),
+        'Matricole OK': perUbi[u.ubicazione]?.ok || 0, 'Da verificare': perUbi[u.ubicazione]?.dv || 0,
+      }));
+      const riepilogo = [
+        ['Missione', code], ['Codice', m.codice], ['Magazzino', m.magazzino],
+        ['Giacenza NS del', fmtDT(m.snapshot_at)], ['Lanciata il', fmtDT(m.created_at)], ['Lanciata da', m.creata_da || ''],
+        ['Operatore', m.operatore || ''], ['Iniziata il', fmtDT(m.iniziata_at)], ['Completata il', fmtDT(m.completata_at)],
+        [],
+        ['Matricole attese', att.length], ['Matricole trovate', esiti.qty_trovate], ['Matricole non trovate', esiti.qty_mancanti],
+        ['Matricole da verificare', esiti.n_da_verificare], ['Ubicazioni sparate', esiti.n_ubicazioni],
+        [],
+        ['Scaricato da', currentUser || ''], ['Scaricato il', new Date().toLocaleString('it-IT')],
+      ];
+      const colsRil = ['Data', 'Ora', 'Operatore', 'Ubicazione', 'Matricola', 'Codice', 'Magazzino', 'Esito', 'Lettura', 'Nota'];
+      const wb = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(riepilogo), 'Riepilogo');
+      XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(rowsRil, { header: colsRil }), 'Rilevazioni');
+      XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(rowsRil.filter(r => r.Esito !== 'OK'), { header: colsRil }), 'Da verificare');
+      XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(rowsNonTrovate, { header: ['Matricola', 'Codice', 'Magazzino'] }), 'Non trovate');
+      XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(rowsUbi, { header: ['Ubicazione', 'Sparata da', 'Data', 'Ora', 'Matricole OK', 'Da verificare'] }), 'Ubicazioni');
+      const safe = s => String(s).replace(/[^\w.-]+/g, '_');
+      XLSX.writeFile(wb, `controllo_inventariale_${code}_${safe(m.codice)}_${new Date().toISOString().slice(0, 10)}.xlsx`);
+
+      // Chiusura: prima la testata con gli esiti ricalcolati dal dettaglio, poi l'eliminazione del dettaglio
+      const { error: upErr } = await supabase.from('inv_missioni')
+        .update({ ...esiti, stato: 'chiusa', scaricata_da: currentUser || null, scaricata_at: new Date().toISOString() })
+        .eq('id', m.id);
+      if (upErr) throw upErr;
+      const dels = await Promise.all(['inv_missioni_rilevazioni', 'inv_missioni_attese', 'inv_missioni_ubicazioni']
+        .map(t => supabase.from(t).delete().eq('missione_id', m.id)));
+      const delErr = dels.find(r => r.error)?.error;
+      if (delErr) alert('Missione chiusa, ma errore nella pulizia del dettaglio: ' + delErr.message);
+    } catch (err) {
+      alert('Errore: ' + err.message);
+    }
+    await fetchInvMissioni();
+  }
+
+  function esportaInvEsiti(list) {
+    const fmt = iso => iso ? new Date(iso).toLocaleString('it-IT') : '';
+    const rows = list.map(m => ({
+      Missione: invMissioneCode(m.id), Codice: m.codice, Magazzino: m.magazzino, Stato: INV_STATI[m.stato]?.label || m.stato,
+      'Giacenza NS del': fmt(m.snapshot_at), 'Lanciata il': fmt(m.created_at), 'Lanciata da': m.creata_da || '',
+      Operatore: m.operatore || '', 'Completata il': fmt(m.completata_at),
+      Attese: m.qty_attese, Trovate: m.qty_trovate ?? '', 'Non trovate': m.qty_mancanti ?? '',
+      'Da verificare': m.n_da_verificare ?? '', Ubicazioni: m.n_ubicazioni ?? '',
+      'Scaricata il': fmt(m.scaricata_at), 'Scaricata da': m.scaricata_da || '',
+    }));
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(rows), 'Esiti');
+    XLSX.writeFile(wb, `controlli_inventariali_esiti_${new Date().toISOString().slice(0, 10)}.xlsx`);
+  }
+
+  async function apriInvMissione(m) {
+    setInvExecLoading(true);
+    try {
+      // Rilegge la testata: la missione potrebbe essere stata annullata o completata nel frattempo
+      const { data: cur, error: curErr } = await supabase.from('inv_missioni').select('*').eq('id', m.id).maybeSingle();
+      if (curErr) throw curErr;
+      if (!cur || (cur.stato !== 'aperta' && cur.stato !== 'in_corso')) {
+        alert(`La missione ${invMissioneCode(m.id)} non è più disponibile (annullata o già completata).`);
+        setInvExecLoading(false);
+        await fetchInvMissioni();
+        return;
+      }
+      let testata = cur;
+      if (cur.stato === 'aperta') {
+        const { data: upd, error: updErr } = await supabase.from('inv_missioni')
+          .update({ stato: 'in_corso', operatore: currentUser || null, iniziata_at: new Date().toISOString() })
+          .eq('id', m.id).eq('stato', 'aperta').select();
+        if (updErr) throw updErr;
+        testata = upd?.[0] || { ...cur, stato: 'in_corso' }; // già avviata da un altro operatore: si prosegue insieme
+      }
+      const [att, ril, ubi] = await Promise.all([
+        invFetchAll('inv_missioni_attese', 'matricola', q => q.eq('missione_id', m.id), ['matricola']),
+        invFetchAll('inv_missioni_rilevazioni', '*', q => q.eq('missione_id', m.id), ['id']),
+        invFetchAll('inv_missioni_ubicazioni', 'ubicazione', q => q.eq('missione_id', m.id), ['ubicazione']),
+      ]);
+      invExecSetRef.current = new Map(ril.map(r => [r.matricola, r.ubicazione]));
+      invExecUbicazioneRef.current = '';
+      setInvExecAttese(new Set(att.map(a => a.matricola)));
+      setInvExecRilevazioni([...ril].reverse());
+      setInvExecUbicazioni(new Set(ubi.map(u => u.ubicazione)));
+      setInvExecUbicazione('');
+      setInvExecScanner('');
+      setInvExecFeedback(ril.length
+        ? { text: `Missione ripresa: ${ril.length} matricole già rilevate. Spara l'ubicazione per continuare.`, type: 'info', sub: '' }
+        : { text: "Spara il barcode dell'ubicazione per iniziare.", type: 'info', sub: '' });
+      setInvExec(testata);
+    } catch (err) {
+      alert('Errore apertura missione: ' + err.message);
+    }
+    setInvExecLoading(false);
+  }
+
+  async function handleInvScan(e) {
+    e.preventDefault();
+    const raw = (invExecScannerRef.current?.value || invExecScanner).trim();
+    setInvExecScanner('');
+    if (invExecScannerRef.current) invExecScannerRef.current.value = '';
+    if (!raw || !invExec) return;
+    const missioneId = invExec.id;
+
+    // 1) Barcode ubicazione: diventa l'ubicazione corrente (anche se vuota conta come ubicazione sparata)
+    if (INV_LOC_RE.test(raw)) {
+      const ubi = raw.toUpperCase();
+      invExecUbicazioneRef.current = ubi;
+      setInvExecUbicazione(ubi);
+      setInvExecUbicazioni(prev => new Set(prev).add(ubi));
+      triggerVibration([80, 60, 80]); sounds.location();
+      setInvExecFeedback({ text: `📍 Ubicazione ${ubi}: spara le matricole.`, type: 'info', sub: '' });
+      const { error } = await supabase.from('inv_missioni_ubicazioni')
+        .upsert({ missione_id: missioneId, ubicazione: ubi, operatore: currentUser || null }, { onConflict: 'missione_id,ubicazione', ignoreDuplicates: true });
+      if (error) setInvExecFeedback({ text: 'Errore salvataggio ubicazione: ' + error.message, type: 'error', sub: '' });
+      return;
+    }
+
+    const ubicazione = invExecUbicazioneRef.current;
+    if (!ubicazione) {
+      triggerVibration([300]); sounds.error();
+      setInvExecFeedback({ text: "Spara prima il barcode dell'ubicazione.", type: 'error', sub: raw });
+      return;
+    }
+
+    // 2) Matricole: QR master del cartone (più matricole) oppure matricola singola
+    const isQr = isMasterQRCode(raw);
+    let serials = [raw];
+    if (isQr) {
+      const qr = parseMasterQRCode(raw);
+      if (!qr) {
+        triggerVibration([300]); sounds.error();
+        setInvExecFeedback({ text: 'Formato QR non interpretabile.', type: 'error', sub: '' });
+        return;
+      }
+      serials = qr.serials;
+    }
+    serials = [...new Set(serials.map(s => s.trim().toUpperCase()).filter(Boolean))];
+
+    const nuove = [];
+    const duplicati = [];
+    serials.forEach(s => {
+      if (invExecSetRef.current.has(s)) { duplicati.push(s); return; }
+      invExecSetRef.current.set(s, ubicazione); // guardia sincrona: scansioni rapide non creano doppi
+      nuove.push(s);
+    });
+    if (nuove.length === 0) {
+      triggerVibration([300]); sounds.error();
+      setInvExecFeedback(serials.length === 1
+        ? { text: `Duplicato! Matricola ${serials[0]} già rilevata.`, type: 'error', sub: `Ubicazione: ${invExecSetRef.current.get(serials[0])}` }
+        : { text: `QR scartato: ${duplicati.length} matricole già rilevate.`, type: 'error', sub: '' });
+      return;
+    }
+
+    // Per le matricole non attese si cerca dove risultano nella giacenza NS (informazione utile alla verifica)
+    const nonAttese = nuove.filter(s => !invExecAttese.has(s));
+    const nsInfo = {};
+    for (let i = 0; i < nonAttese.length; i += 100) {
+      const { data } = await supabase.from('inv_snapshot').select('numero, item, location').in('numero', nonAttese.slice(i, i + 100));
+      (data || []).forEach(d => { nsInfo[d.numero] = d; });
+    }
+    const nowIso = new Date().toISOString();
+    const records = nuove.map(s => {
+      const ok = invExecAttese.has(s);
+      const ns = nsInfo[s];
+      return {
+        missione_id: missioneId, matricola: s, ubicazione, esito: ok ? 'ok' : 'da_verificare',
+        fonte: isQr ? 'qr' : 'singola', operatore: currentUser || null, rilevata_at: nowIso,
+        nota: ok ? null : ns ? `In giacenza NS come ${ns.item} su ${ns.location}` : 'Non presente nella giacenza NS',
+      };
+    });
+    // ignoreDuplicates: una matricola già letta da un altro operatore sulla stessa missione non blocca il resto del QR
+    const { data: saved, error } = await supabase.from('inv_missioni_rilevazioni')
+      .upsert(records, { onConflict: 'missione_id,matricola', ignoreDuplicates: true }).select('matricola');
+    if (error) {
+      nuove.forEach(s => invExecSetRef.current.delete(s));
+      triggerVibration([300]); sounds.error();
+      setInvExecFeedback({ text: 'Errore salvataggio: ' + error.message, type: 'error', sub: 'Rispara la lettura.' });
+      return;
+    }
+    const salvate = new Set((saved || []).map(d => d.matricola));
+    const inserite = records.filter(r => salvate.has(r.matricola));
+    const giaLetteAltrove = records.length - inserite.length;
+    setInvExecRilevazioni(prev => [...inserite, ...prev]);
+
+    const okN = inserite.filter(r => r.esito === 'ok').length;
+    const dv = inserite.filter(r => r.esito === 'da_verificare');
+    const extra = [
+      isQr && okN > 0 && `+${okN} OK`,
+      duplicati.length + giaLetteAltrove > 0 && `${duplicati.length + giaLetteAltrove} già rilevate`,
+    ].filter(Boolean).join(' · ');
+    if (dv.length > 0) {
+      triggerVibration([200, 100, 200, 100, 200]); sounds.warn();
+      setInvExecFeedback({
+        text: `${dv.map(r => r.matricola).join(', ')} da verificare`,
+        type: 'warning',
+        sub: [dv.length === 1 ? dv[0].nota : `${dv.length} matricole non attese`, extra].filter(Boolean).join(' · '),
+      });
+    } else if (okN > 0) {
+      triggerVibration(isQr ? [150, 100, 150] : [150]);
+      if (isQr) sounds.carton(); else sounds.ok();
+      setInvExecFeedback(isQr
+        ? { text: `QR cartone: +${okN} matricole OK`, type: 'success', sub: extra }
+        : { text: `OK: ${inserite[0].matricola}`, type: 'success', sub: `Ubicazione ${ubicazione}` });
+    } else {
+      triggerVibration([300]); sounds.error();
+      setInvExecFeedback({ text: 'Matricole già rilevate da un altro operatore.', type: 'error', sub: '' });
+    }
+  }
+
+  async function eliminaInvRilevazione(r) {
+    if (!invExec || !window.confirm(`Eliminare la rilevazione della matricola ${r.matricola} (${r.ubicazione})?`)) return;
+    const { error } = await supabase.from('inv_missioni_rilevazioni').delete().eq('missione_id', invExec.id).eq('matricola', r.matricola);
+    if (error) { alert('Errore: ' + error.message); return; }
+    invExecSetRef.current.delete(r.matricola);
+    setInvExecRilevazioni(prev => prev.filter(x => x.matricola !== r.matricola));
+  }
+
+  async function terminaInvMissione() {
+    if (!invExec) return;
+    setInvExecLoading(true);
+    // Conteggi dal DB: includono anche le letture di altri operatori sulla stessa missione
+    const [ok, dv, ub] = await Promise.all([
+      supabase.from('inv_missioni_rilevazioni').select('id', { count: 'exact', head: true }).eq('missione_id', invExec.id).eq('esito', 'ok'),
+      supabase.from('inv_missioni_rilevazioni').select('id', { count: 'exact', head: true }).eq('missione_id', invExec.id).eq('esito', 'da_verificare'),
+      supabase.from('inv_missioni_ubicazioni').select('ubicazione', { count: 'exact', head: true }).eq('missione_id', invExec.id),
+    ]);
+    setInvExecLoading(false);
+    const err = ok.error || dv.error || ub.error;
+    if (err) { alert('Errore: ' + err.message); return; }
+    const attese = invExecAttese.size;
+    const esiti = { qty_trovate: ok.count || 0, qty_mancanti: Math.max(attese - (ok.count || 0), 0), n_da_verificare: dv.count || 0, n_ubicazioni: ub.count || 0 };
+    if (!window.confirm(
+      `Terminare la missione ${invMissioneCode(invExec.id)}?\n\n` +
+      `Matricole attese: ${attese}\nTrovate: ${esiti.qty_trovate}\nNon trovate: ${esiti.qty_mancanti}\n` +
+      `Da verificare: ${esiti.n_da_verificare}\nUbicazioni sparate: ${esiti.n_ubicazioni}\n\n` +
+      `Dopo la chiusura non sarà più possibile rilevare matricole su questa missione.`
+    )) return;
+    setInvExecLoading(true);
+    const { error } = await supabase.from('inv_missioni')
+      .update({ ...esiti, stato: 'completata', completata_at: new Date().toISOString() })
+      .eq('id', invExec.id);
+    setInvExecLoading(false);
+    if (error) { alert('Errore: ' + error.message); return; }
+    triggerVibration([100, 50, 100, 50, 200]);
+    esciInvMissione();
+  }
+
+  function esciInvMissione() {
+    setInvExec(null);
+    setInvExecFeedback({ text: '', type: '', sub: '' });
+    invExecUbicazioneRef.current = '';
+    fetchInvMissioni();
+  }
+
   // ==================== PERMESSI DI RUOLO ====================
   const myRole = (authUser?.ruolo || '').toLowerCase();
   const isAdmin = myRole === 'admin';
@@ -3823,6 +4380,8 @@ export default function App() {
                   { id: 'sposta-bancale', label: 'Sposta Bancale', icon: '🏭' },
                   { id: 'stock', label: 'Inventario', icon: '🗄️' },
                   { id: 'riepilogo', label: 'Stock Spare Parts', icon: '📊' },
+                  { id: 'controlli-inventariali', label: 'Controlli Inventariali', icon: '🔎' },
+                  { id: 'missioni-inventario', label: 'Missioni Inventario', icon: '📱' },
                 ]},
                 { group: 'Repair', modules: [
                   { id: 'spare-parts', label: 'Compatibilità', icon: '🔧' },
@@ -3898,6 +4457,8 @@ export default function App() {
                 {activeModule === 'anagrafica' && 'Anagrafica'}
                 {activeModule === 'utenti' && 'Utenti / Ruoli'}
                 {activeModule === 'moduli' && 'Moduli sperimentali'}
+                {activeModule === 'controlli-inventariali' && 'Controlli Inventariali'}
+                {activeModule === 'missioni-inventario' && 'Missioni Inventario'}
               </span>
               {isSper(activeModule) && (
                 <span className="text-[10px] font-black bg-amber-100 text-amber-700 px-2 py-0.5 rounded-md tracking-normal" title="Modulo sperimentale">SP</span>
@@ -5267,6 +5828,436 @@ export default function App() {
             <p className="text-[11px] text-gray-400">Nota: in ambiente di sviluppo locale i moduli SP restano comunque visibili (per poterli testare); in produzione vengono nascosti.</p>
           </div>
         )}
+
+        {/* ==================== MODULO CONTROLLI INVENTARIALI ==================== */}
+        {activeModule === 'controlli-inventariali' && (() => {
+          const magazzini = [...new Set(invRiepilogo.map(r => r.location))].sort();
+          const totMatricole = invRiepilogo.reduce((s, r) => s + (r.qty || 0), 0);
+          const nCodici = new Set(invRiepilogo.map(r => r.item)).size;
+          const attivaPer = (loc, item) => invMissioni.find(m => m.magazzino === loc && m.codice === item && (m.stato === 'aperta' || m.stato === 'in_corso'));
+          const ultimoEsito = (loc, item) => invMissioni.find(m => m.magazzino === loc && m.codice === item && (m.stato === 'completata' || m.stato === 'chiusa'));
+          const q = invSearch.trim().toLowerCase();
+          const righe = invRiepilogo.filter(r => r.location === invMagazzino && (!q || r.item.toLowerCase().includes(q)));
+          const selezionabili = righe.filter(r => !attivaPer(r.location, r.item));
+          const tuttiSelezionati = selezionabili.length > 0 && selezionabili.every(r => invSelezione.has(r.item));
+          const filtri = [
+            { id: 'da_eseguire', label: 'Da eseguire', match: m => m.stato === 'aperta' || m.stato === 'in_corso' },
+            { id: 'completate', label: 'Completate — da scaricare', match: m => m.stato === 'completata' },
+            { id: 'chiuse', label: 'Chiuse', match: m => m.stato === 'chiusa' },
+          ];
+          const filtroAttivo = filtri.find(f => f.id === invMissioniFiltro) || filtri[0];
+          const missioniVis = invMissioni.filter(filtroAttivo.match);
+          const fmt = iso => iso ? new Date(iso).toLocaleString('it-IT') : '—';
+          const fmtD = iso => iso ? new Date(iso).toLocaleDateString('it-IT') : '—';
+          return (
+            <div className="space-y-5">
+              <div className="flex items-start justify-between flex-wrap gap-3">
+                <div>
+                  <h2 className="text-lg font-black text-gray-800">🔎 Controlli Inventariali</h2>
+                  <p className="text-xs text-gray-500">
+                    Giacenza matricolare NetSuite: <strong>{totMatricole.toLocaleString('it-IT')}</strong> matricole · {nCodici} codici · {magazzini.length} magazzini
+                  </p>
+                  {importMeta.inv_snapshot_file && (
+                    <p className="text-[11px] text-gray-400">
+                      Giacenza NS del {fmt(importMeta.inv_snapshot_file)}{importMeta.inv_snapshot ? ` · caricata il ${fmt(importMeta.inv_snapshot)}` : ''}
+                    </p>
+                  )}
+                </div>
+                <div className="flex gap-2 flex-wrap">
+                  <button onClick={() => { fetchInvRiepilogo(); fetchInvMissioni(); }}
+                    className="bg-gray-100 hover:bg-gray-200 text-gray-600 text-sm font-bold px-3 py-2.5 rounded-xl cursor-pointer transition" title="Aggiorna">
+                    ↻
+                  </button>
+                  {canUpload('controlli-inventariali') && (
+                    <label className={`bg-blue-600 hover:bg-blue-700 text-white text-sm font-bold px-4 py-2.5 rounded-xl cursor-pointer transition shadow-xs ${invSnapshotLoading ? 'opacity-50 pointer-events-none' : ''}`}>
+                      {invImportProgress ? `Caricamento ${invImportProgress}…` : '📂 Carica giacenza NS (CSV)'}
+                      <input type="file" accept=".csv,text/csv" className="hidden" onChange={handleInvSnapshotUpload} />
+                    </label>
+                  )}
+                </div>
+              </div>
+
+              <div className="flex gap-1 bg-gray-100 p-1 rounded-xl w-fit">
+                {[
+                  { id: 'lancia', label: '🚀 Lancia missioni' },
+                  { id: 'missioni', label: '📋 Missioni', n: invMissioni.filter(m => m.stato !== 'chiusa').length },
+                ].map(t => (
+                  <button key={t.id} onClick={() => setInvTab(t.id)}
+                    className={`text-xs font-bold px-4 py-2 rounded-lg cursor-pointer transition ${invTab === t.id ? 'bg-white text-gray-800 shadow-xs' : 'text-gray-500 hover:text-gray-700'}`}>
+                    {t.label}{t.n != null && <span className="ml-1 text-[10px] opacity-70">({t.n})</span>}
+                  </button>
+                ))}
+              </div>
+
+              {invTab === 'lancia' && (invRiepilogo.length === 0 ? (
+                <div className="text-center py-16 text-gray-400 text-sm">
+                  {invSnapshotLoading ? 'Caricamento…' : 'Nessuna giacenza NS caricata. Carica il CSV per lanciare le missioni.'}
+                </div>
+              ) : (
+                <div className="bg-white p-4 rounded-2xl border border-gray-200 shadow-xs space-y-3">
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <select value={invMagazzino} onChange={e => { setInvMagazzino(e.target.value); setInvSelezione(new Set()); }}
+                      className="bg-gray-50 border border-gray-300 rounded-xl p-2.5 text-xs focus:outline-hidden">
+                      <option value="">Seleziona magazzino...</option>
+                      {magazzini.map(l => (
+                        <option key={l} value={l}>{l} ({invRiepilogo.filter(r => r.location === l).reduce((s, r) => s + r.qty, 0).toLocaleString('it-IT')})</option>
+                      ))}
+                    </select>
+                    {invMagazzino && (
+                      <input value={invSearch} onChange={e => setInvSearch(e.target.value)} placeholder="Cerca codice..."
+                        className="bg-gray-50 border border-gray-300 rounded-xl p-2.5 text-xs focus:outline-hidden w-48" />
+                    )}
+                    <button onClick={lanciaInvMissioni} disabled={invSelezione.size === 0 || invMissioniLoading}
+                      className="ml-auto bg-blue-600 hover:bg-blue-700 text-white text-sm font-bold px-4 py-2.5 rounded-xl cursor-pointer transition shadow-xs disabled:opacity-40 disabled:cursor-not-allowed">
+                      🚀 Lancia {invSelezione.size > 0 ? `${invSelezione.size} ` : ''}{invSelezione.size === 1 ? 'missione' : 'missioni'}
+                    </button>
+                  </div>
+                  {!invMagazzino ? (
+                    <p className="text-center py-10 text-gray-400 text-sm">Seleziona il magazzino: le missioni si lanciano per codice su un singolo magazzino.</p>
+                  ) : (
+                    <div className="border border-gray-100 rounded-xl overflow-x-auto max-h-[60vh] overflow-y-auto">
+                      <table className="w-full min-w-[640px] text-left border-collapse text-xs">
+                        <thead className="bg-gray-50 border-b border-gray-200 text-[10px] font-black text-gray-500 uppercase tracking-wider sticky top-0">
+                          <tr>
+                            <th className="px-3 py-3 w-8">
+                              <input type="checkbox" checked={tuttiSelezionati} disabled={selezionabili.length === 0}
+                                onChange={e => setInvSelezione(e.target.checked ? new Set(selezionabili.map(r => r.item)) : new Set())}
+                                className="w-4 h-4 accent-blue-600 cursor-pointer" title="Seleziona tutti i codici senza missione attiva" />
+                            </th>
+                            <th className="px-3 py-3">Codice</th>
+                            <th className="px-3 py-3 text-right">Matricole NS</th>
+                            <th className="px-3 py-3">Missione attiva</th>
+                            <th className="px-3 py-3">Ultimo controllo</th>
+                          </tr>
+                        </thead>
+                        <tbody className="divide-y divide-gray-100">
+                          {righe.map(r => {
+                            const att = attivaPer(r.location, r.item);
+                            const last = ultimoEsito(r.location, r.item);
+                            const sel = invSelezione.has(r.item);
+                            return (
+                              <tr key={r.item} className={`hover:bg-gray-50/60 ${sel ? 'bg-blue-50/60' : ''}`}>
+                                <td className="px-3 py-2">
+                                  <input type="checkbox" checked={sel} disabled={!!att}
+                                    onChange={e => setInvSelezione(prev => { const n = new Set(prev); if (e.target.checked) n.add(r.item); else n.delete(r.item); return n; })}
+                                    className="w-4 h-4 accent-blue-600 cursor-pointer disabled:opacity-30" />
+                                </td>
+                                <td className="px-3 py-2 font-mono font-bold text-gray-800">{r.item}</td>
+                                <td className="px-3 py-2 text-right font-mono">{r.qty.toLocaleString('it-IT')}</td>
+                                <td className="px-3 py-2">
+                                  {att ? (
+                                    <span className={`text-[10px] font-black px-2 py-0.5 rounded-full border ${INV_STATI[att.stato].cls}`}>
+                                      {invMissioneCode(att.id)} · {INV_STATI[att.stato].label}
+                                    </span>
+                                  ) : <span className="text-gray-300">—</span>}
+                                </td>
+                                <td className="px-3 py-2 text-gray-500">
+                                  {last ? (
+                                    <>
+                                      {fmtD(last.completata_at)} · {last.qty_trovate ?? '—'}/{last.qty_attese}
+                                      {last.n_da_verificare > 0 && <span className="text-amber-600 font-bold"> · {last.n_da_verificare} da verificare</span>}
+                                    </>
+                                  ) : '—'}
+                                </td>
+                              </tr>
+                            );
+                          })}
+                          {righe.length === 0 && (
+                            <tr><td colSpan={5} className="px-3 py-8 text-center text-gray-400">Nessun codice.</td></tr>
+                          )}
+                        </tbody>
+                      </table>
+                    </div>
+                  )}
+                </div>
+              ))}
+
+              {invTab === 'missioni' && (
+                <div className="space-y-3">
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <div className="flex gap-1 bg-indigo-50 p-1 rounded-xl w-fit border border-indigo-100">
+                      {filtri.map(f => (
+                        <button key={f.id} onClick={() => setInvMissioniFiltro(f.id)}
+                          className={`text-xs font-bold px-4 py-2 rounded-lg cursor-pointer transition ${invMissioniFiltro === f.id ? 'bg-white text-indigo-800 shadow-xs' : 'text-indigo-400 hover:text-indigo-600'}`}>
+                          {f.label} <span className="ml-1 text-[10px] opacity-70">({invMissioni.filter(f.match).length})</span>
+                        </button>
+                      ))}
+                    </div>
+                    {missioniVis.length > 0 && (
+                      <button onClick={() => esportaInvEsiti(missioniVis)}
+                        className="ml-auto bg-green-50 hover:bg-green-100 text-green-700 border border-green-200 text-sm font-bold px-4 py-2.5 rounded-xl cursor-pointer transition">
+                        📥 Esporta esiti
+                      </button>
+                    )}
+                  </div>
+                  {invMissioniLoading && <div className="text-center py-4 text-xs font-bold text-amber-600 animate-pulse">Caricamento...</div>}
+                  {!invMissioniLoading && missioniVis.length === 0 && (
+                    <div className="text-center py-16 text-gray-400 text-sm">Nessuna missione.</div>
+                  )}
+                  {missioniVis.length > 0 && (
+                    <div className="bg-white rounded-2xl border border-gray-200 shadow-xs overflow-x-auto">
+                      <table className="w-full min-w-[1000px] text-left border-collapse text-xs">
+                        <thead className="bg-gray-50 border-b border-gray-200 text-[10px] font-black text-gray-500 uppercase tracking-wider">
+                          <tr>
+                            <th className="px-3 py-3">Missione</th>
+                            <th className="px-3 py-3">Lanciata</th>
+                            <th className="px-3 py-3">Codice</th>
+                            <th className="px-3 py-3">Magazzino</th>
+                            <th className="px-3 py-3">Stato</th>
+                            <th className="px-3 py-3">Operatore</th>
+                            <th className="px-3 py-3 text-right">Attese</th>
+                            <th className="px-3 py-3 text-right">Trovate</th>
+                            <th className="px-3 py-3 text-right">Non trovate</th>
+                            <th className="px-3 py-3 text-right">Da verificare</th>
+                            <th className="px-3 py-3 text-right">Ubicazioni</th>
+                            <th className="px-3 py-3"></th>
+                          </tr>
+                        </thead>
+                        <tbody className="divide-y divide-gray-100">
+                          {missioniVis.map(m => {
+                            const p = m.stato === 'in_corso' ? invProgress[m.id] : null;
+                            const trovate = p ? p.ok : m.qty_trovate;
+                            const mancanti = p ? Math.max(m.qty_attese - p.ok, 0) : m.qty_mancanti;
+                            const dv = p ? p.daVerificare : m.n_da_verificare;
+                            const ub = p ? p.ubicazioni : m.n_ubicazioni;
+                            const st = INV_STATI[m.stato] || INV_STATI.aperta;
+                            return (
+                              <tr key={m.id} className="hover:bg-gray-50/60">
+                                <td className="px-3 py-2.5 font-mono font-bold text-blue-700">{invMissioneCode(m.id)}</td>
+                                <td className="px-3 py-2.5 text-gray-600">
+                                  {fmt(m.created_at)}
+                                  {m.creata_da && <div className="text-[10px] text-gray-400">{m.creata_da}</div>}
+                                </td>
+                                <td className="px-3 py-2.5 font-mono font-bold text-gray-800">{m.codice}</td>
+                                <td className="px-3 py-2.5 text-gray-600">{m.magazzino}</td>
+                                <td className="px-3 py-2.5">
+                                  <span className={`text-[10px] font-black px-2 py-0.5 rounded-full border whitespace-nowrap ${st.cls}`}>{st.label}</span>
+                                </td>
+                                <td className="px-3 py-2.5 text-gray-700">
+                                  {m.operatore || '—'}
+                                  {m.completata_at && <div className="text-[10px] text-gray-400">{fmt(m.completata_at)}</div>}
+                                </td>
+                                <td className="px-3 py-2.5 text-right font-mono">{m.qty_attese}</td>
+                                <td className="px-3 py-2.5 text-right font-mono font-bold text-green-700">{trovate ?? '—'}</td>
+                                <td className={`px-3 py-2.5 text-right font-mono font-bold ${mancanti > 0 ? 'text-red-600' : 'text-gray-400'}`}>{mancanti ?? '—'}</td>
+                                <td className={`px-3 py-2.5 text-right font-mono font-bold ${dv > 0 ? 'text-amber-600' : 'text-gray-400'}`}>{dv ?? '—'}</td>
+                                <td className="px-3 py-2.5 text-right font-mono">{ub ?? '—'}</td>
+                                <td className="px-3 py-2.5 text-right whitespace-nowrap">
+                                  {m.stato === 'completata' && (
+                                    <button onClick={() => scaricaChiudiInvMissione(m)} disabled={invMissioniLoading}
+                                      className="bg-green-600 hover:bg-green-700 text-white text-[11px] font-bold px-3 py-1.5 rounded-lg cursor-pointer transition disabled:opacity-50">
+                                      📥 Scarica dettaglio
+                                    </button>
+                                  )}
+                                  {(m.stato === 'aperta' || m.stato === 'in_corso') && (
+                                    <button onClick={() => annullaInvMissione(m)}
+                                      className="text-[11px] font-bold text-red-500 hover:text-red-700 hover:bg-red-50 border border-red-200 px-2.5 py-1 rounded-lg transition cursor-pointer">
+                                      Annulla
+                                    </button>
+                                  )}
+                                  {m.stato === 'chiusa' && (
+                                    <span className="text-[10px] text-gray-400">Scaricata {fmt(m.scaricata_at)}{m.scaricata_da ? ` · ${m.scaricata_da}` : ''}</span>
+                                  )}
+                                </td>
+                              </tr>
+                            );
+                          })}
+                        </tbody>
+                      </table>
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+          );
+        })()}
+
+        {/* ==================== MODULO MISSIONI INVENTARIO (magazziniere) ==================== */}
+        {activeModule === 'missioni-inventario' && !invExec && (() => {
+          const daFare = invMissioni
+            .filter(m => m.stato === 'aperta' || m.stato === 'in_corso')
+            .sort((a, b) => (b.stato === 'in_corso') - (a.stato === 'in_corso') || new Date(a.created_at) - new Date(b.created_at));
+          return (
+            <div className="space-y-5 max-w-3xl mx-auto">
+              <div className="flex items-center justify-between gap-3">
+                <div>
+                  <h2 className="text-lg font-black text-gray-800">📱 Missioni Inventario</h2>
+                  <p className="text-xs text-gray-500">{daFare.length} {daFare.length === 1 ? 'missione' : 'missioni'} da eseguire. Apri una missione, spara l&apos;ubicazione e poi le matricole che trovi.</p>
+                </div>
+                <button onClick={fetchInvMissioni}
+                  className="bg-gray-100 hover:bg-gray-200 text-gray-600 text-sm font-bold px-3 py-2.5 rounded-xl cursor-pointer transition" title="Aggiorna">
+                  ↻
+                </button>
+              </div>
+              {(invMissioniLoading || invExecLoading) && <div className="text-center py-4 text-xs font-bold text-amber-600 animate-pulse">Caricamento...</div>}
+              {!invMissioniLoading && daFare.length === 0 && (
+                <div className="text-center py-16 text-gray-400 text-sm">Nessuna missione da eseguire. Le missioni si lanciano da Controlli Inventariali.</div>
+              )}
+              <div className="grid grid-cols-1 gap-3">
+                {daFare.map(m => {
+                  const st = INV_STATI[m.stato];
+                  return (
+                    <button key={m.id} onClick={() => apriInvMissione(m)} disabled={invExecLoading}
+                      className="text-left bg-white p-4 rounded-2xl border border-gray-200 shadow-xs hover:border-blue-400 hover:shadow-md transition cursor-pointer flex items-center gap-4 disabled:opacity-50">
+                      <div className="flex-grow min-w-0">
+                        <div className="flex items-center gap-2 flex-wrap">
+                          <span className="font-mono font-bold text-blue-700 text-xs">{invMissioneCode(m.id)}</span>
+                          <span className={`text-[10px] font-black px-2 py-0.5 rounded-full border ${st.cls}`}>{st.label}</span>
+                        </div>
+                        <p className="text-base font-black text-gray-800 font-mono mt-1 truncate">{m.codice}</p>
+                        <p className="text-xs text-gray-500 truncate">{m.magazzino}</p>
+                        {m.stato === 'in_corso' && (
+                          <p className="text-[11px] text-amber-700 mt-1">
+                            {m.operatore ? `${m.operatore} · ` : ''}{invProgress[m.id]?.ok ?? 0}/{m.qty_attese} trovate
+                            {invProgress[m.id]?.daVerificare > 0 ? ` · ${invProgress[m.id].daVerificare} da verificare` : ''}
+                          </p>
+                        )}
+                      </div>
+                      <div className="text-right shrink-0">
+                        <span className="block text-2xl font-black text-gray-800 font-mono">{m.qty_attese}</span>
+                        <span className="text-[10px] font-bold text-gray-400 uppercase">matricole</span>
+                      </div>
+                      <span className="text-blue-600 font-black text-sm shrink-0">{m.stato === 'in_corso' ? 'Riprendi →' : 'Apri →'}</span>
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+          );
+        })()}
+
+        {activeModule === 'missioni-inventario' && invExec && (() => {
+          const attese = invExecAttese.size;
+          const okN = invExecRilevazioni.filter(r => r.esito === 'ok').length;
+          const daVerificare = invExecRilevazioni.filter(r => r.esito === 'da_verificare');
+          const perc = attese > 0 ? Math.min((okN / attese) * 100, 100) : 0;
+          const fbCls = {
+            success: 'bg-green-50 text-green-800 border-green-200',
+            error: 'bg-red-50 text-red-800 border-red-200',
+            warning: 'bg-amber-100 text-amber-900 border-amber-400',
+            info: 'bg-blue-50 text-blue-800 border-blue-200',
+          };
+          return (
+            <div className="grid grid-cols-1 md:grid-cols-12 gap-6 items-start">
+              <div className="md:col-span-5 space-y-4">
+                <div className="bg-white p-5 rounded-2xl shadow-xs border border-gray-200 space-y-3">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="text-[10px] sm:text-xs bg-blue-50 text-blue-700 font-bold px-2.5 py-1 rounded-md uppercase border border-blue-100">{invMissioneCode(invExec.id)}</span>
+                    <button onClick={esciInvMissione} className="text-xs font-bold text-gray-500 hover:text-gray-800 hover:bg-gray-100 px-2.5 py-1 rounded-lg cursor-pointer transition">← Sospendi</button>
+                  </div>
+                  <div>
+                    <h2 className="text-lg sm:text-xl font-black text-gray-800 font-mono break-all">{invExec.codice}</h2>
+                    <p className="text-xs text-gray-500">{invExec.magazzino}</p>
+                  </div>
+                  <div className="pt-3 border-t border-gray-100 space-y-2">
+                    <div className="flex justify-between items-center">
+                      <span className="text-xs sm:text-sm text-gray-400 font-bold">Matricole trovate:</span>
+                      <span className="text-xl sm:text-2xl font-black text-blue-600 font-mono">{okN}/{attese}</span>
+                    </div>
+                    <div className="w-full bg-gray-100 rounded-full h-3 overflow-hidden">
+                      <div className="bg-blue-600 h-3 rounded-full transition-all duration-300" style={{ width: `${perc}%` }}></div>
+                    </div>
+                    <div className="grid grid-cols-2 gap-2">
+                      <div className="bg-gray-50 border border-gray-100 rounded-xl px-3 py-2 flex justify-between items-center">
+                        <span className="text-[11px] font-bold text-gray-500">📍 Ubicazioni</span>
+                        <span className="font-black font-mono text-gray-800">{invExecUbicazioni.size}</span>
+                      </div>
+                      <div className={`border rounded-xl px-3 py-2 flex justify-between items-center ${daVerificare.length > 0 ? 'bg-amber-50 border-amber-200' : 'bg-gray-50 border-gray-100'}`}>
+                        <span className={`text-[11px] font-bold ${daVerificare.length > 0 ? 'text-amber-700' : 'text-gray-500'}`}>⚠ Da verificare</span>
+                        <span className={`font-black font-mono ${daVerificare.length > 0 ? 'text-amber-700' : 'text-gray-800'}`}>{daVerificare.length}</span>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
+                <div className={`p-4 rounded-2xl border-2 text-center ${invExecUbicazione ? 'bg-blue-600 border-blue-600 text-white' : 'bg-white border-dashed border-gray-300 text-gray-400'}`}>
+                  <span className={`block text-[10px] font-black uppercase tracking-wider ${invExecUbicazione ? 'text-blue-100' : ''}`}>Ubicazione corrente</span>
+                  <span className="block text-2xl font-black font-mono mt-0.5">{invExecUbicazione || "Spara l'ubicazione"}</span>
+                </div>
+
+                <form onSubmit={handleInvScan} className="space-y-2">
+                  <label className="block text-xs sm:text-sm font-bold text-gray-500 uppercase tracking-wider">Input Terminale / Scanner:</label>
+                  <input
+                    type="text"
+                    ref={invExecScannerRef}
+                    value={invExecScanner}
+                    onChange={e => setInvExecScanner(e.target.value)}
+                    autoComplete="off" autoCorrect="off" autoCapitalize="off" spellCheck="false"
+                    placeholder={invExecUbicazione ? 'Spara matricola, QR cartone o nuova ubicazione...' : "Spara il barcode dell'ubicazione..."}
+                    className="w-full bg-white border-2 border-blue-500 text-gray-800 font-mono text-base sm:text-xl p-4 rounded-xl shadow-inner focus:outline-hidden text-center"
+                  />
+                </form>
+
+                {invExecFeedback.text && (
+                  <div className={`p-4 rounded-xl text-center border-2 ${fbCls[invExecFeedback.type] || fbCls.info}`}>
+                    <p className={`font-black break-words ${invExecFeedback.type === 'warning' ? 'text-lg sm:text-xl' : 'text-sm'}`}>
+                      {invExecFeedback.type === 'warning' ? '⚠ ' : ''}{invExecFeedback.text}
+                    </p>
+                    {invExecFeedback.sub && <p className="text-xs mt-1 opacity-80 break-words">{invExecFeedback.sub}</p>}
+                  </div>
+                )}
+
+                <button onClick={terminaInvMissione} disabled={invExecLoading}
+                  className="w-full bg-green-600 hover:bg-green-700 disabled:opacity-50 disabled:cursor-not-allowed text-white font-black p-4 rounded-xl text-base shadow-md transition cursor-pointer flex items-center justify-center gap-2">
+                  ✓ Termina missione
+                </button>
+              </div>
+
+              <div className="md:col-span-7 space-y-4">
+                {daVerificare.length > 0 && (
+                  <div className="bg-amber-50 p-4 rounded-2xl border border-amber-200 space-y-2">
+                    <h3 className="text-xs sm:text-sm font-black text-amber-800 uppercase tracking-wider">⚠ Matricole da verificare ({daVerificare.length})</h3>
+                    <ul className="divide-y divide-amber-100 max-h-48 overflow-y-auto">
+                      {daVerificare.map(r => (
+                        <li key={r.matricola} className="py-1.5 flex items-center gap-x-3 gap-y-0.5 flex-wrap">
+                          <span className="font-mono font-bold text-amber-900 text-sm">{r.matricola} da verificare</span>
+                          <span className="text-[11px] text-amber-700">📍 {r.ubicazione}</span>
+                          {r.nota && <span className="text-[10px] text-amber-600 ml-auto">{r.nota}</span>}
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
+
+                <div className="bg-white p-5 rounded-2xl shadow-xs border border-gray-200 space-y-3">
+                  <div className="flex justify-between items-center border-b border-gray-100 pb-2">
+                    <h3 className="text-xs sm:text-sm font-bold text-gray-400 uppercase tracking-wider">Matricole rilevate</h3>
+                    <span className="text-xs font-bold text-gray-400">{invExecRilevazioni.length}</span>
+                  </div>
+                  {invExecRilevazioni.length > 50 && (
+                    <p className="text-[11px] text-gray-400 italic">Mostrate le ultime 50 di {invExecRilevazioni.length} matricole rilevate.</p>
+                  )}
+                  {invExecRilevazioni.length === 0 && <p className="text-center py-8 text-gray-400 text-sm">Nessuna matricola rilevata.</p>}
+                  <ul className="divide-y divide-gray-100 max-h-80 md:max-h-[500px] overflow-y-auto font-mono text-sm pr-1">
+                    {invExecRilevazioni.slice(0, 50).map(r => (
+                      <li key={r.matricola} className="py-2.5 flex items-center gap-3 group">
+                        <div className="flex-grow min-w-0">
+                          <div className="flex items-center justify-between gap-2">
+                            <span className={`font-bold text-base truncate ${r.esito === 'ok' ? 'text-gray-900' : 'text-amber-800'}`}>{r.esito === 'ok' ? '🟢' : '🟠'} {r.matricola}</span>
+                            {r.esito === 'ok'
+                              ? <span className="text-xs text-green-700 bg-green-50 font-bold px-2.5 py-0.5 rounded-full border border-green-100">OK</span>
+                              : <span className="text-[10px] text-amber-800 bg-amber-100 font-bold px-2 py-0.5 rounded-full border border-amber-200 whitespace-nowrap">DA VERIFICARE</span>}
+                          </div>
+                          <div className="text-xs text-gray-400 mt-1 flex gap-x-4 flex-wrap font-sans">
+                            <span><strong>Ubicazione:</strong> {r.ubicazione}</span>
+                            {r.fonte === 'qr' && <span>QR cartone</span>}
+                            {r.operatore && <span>{r.operatore}</span>}
+                            <span className="ml-auto text-[11px] font-medium text-gray-300">{r.rilevata_at ? new Date(r.rilevata_at).toLocaleTimeString('it-IT') : ''}</span>
+                          </div>
+                        </div>
+                        <button onClick={() => eliminaInvRilevazione(r)}
+                          className="shrink-0 text-gray-400 hover:text-red-500 hover:bg-red-50 rounded-lg p-1.5 transition cursor-pointer md:opacity-0 md:group-hover:opacity-100"
+                          title="Elimina questa rilevazione">
+                          ✕
+                        </button>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              </div>
+            </div>
+          );
+        })()}
 
         {/* ==================== MODULO RIEPILOGO STOCK ==================== */}
         {activeModule === 'riepilogo' && (() => {
