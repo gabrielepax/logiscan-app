@@ -6261,9 +6261,19 @@ export default function App() {
 
         {/* ==================== MODULO RIEPILOGO STOCK ==================== */}
         {activeModule === 'riepilogo' && (() => {
-          // Stock totale per codice
+          // Anagrafica articoli (Hardware) per codice (= PNIT): gruppo specificato manualmente
+          const anagByCodice = {};
+          anagrafica.forEach(a => { anagByCodice[String(a.codice || '').trim()] = a; });
+          const gruppoDesc = (a) => a ? String(a.gruppo || '').trim() : '';
+
+          // Un codice è un accessorio se la riga di stock è taggata 'accessori', OPPURE se Anagrafica lo
+          // classifica cluster "Accessories" (fallback: un import sbagliato può taggare la riga di stock con
+          // la fonte sbagliata, ma Anagrafica resta la fonte di verità sulla natura dell'articolo).
+          const isAccessorio = (s) => s.fonte === 'accessori' || String(anagByCodice[s.codice]?.cluster || '').trim().toLowerCase() === 'accessories';
+
+          // Stock totale per codice (esclude gli accessori, che vivono nella vista ACC)
           const stockByCodice = {};
-          stockItems.forEach(s => { if (s.stock > 0 && s.fonte !== 'accessori') stockByCodice[s.codice] = (stockByCodice[s.codice] || 0) + s.stock; });
+          stockItems.forEach(s => { if (s.stock > 0 && !isAccessorio(s)) stockByCodice[s.codice] = (stockByCodice[s.codice] || 0) + s.stock; });
 
           // IN ARRIVO per codice: dal Piano Arrivi (po_lines), somma qty_expected per item_code
           const arrivoByCodice = {};
@@ -6274,15 +6284,10 @@ export default function App() {
             arrivoByCodice[cod] = (arrivoByCodice[cod] || 0) + (l.qty_expected || 0);
           });
 
-          // Anagrafica articoli (Hardware) per codice (= PNIT): gruppo specificato manualmente
-          const anagByCodice = {};
-          anagrafica.forEach(a => { anagByCodice[String(a.codice || '').trim()] = a; });
-          const gruppoDesc = (a) => a ? String(a.gruppo || '').trim() : '';
-
-          // Vista ACC: accessori (fonte='accessori'), niente TYPE/PNIT — solo codice + descrizione + stock + CL
+          // Vista ACC: accessori, niente TYPE/PNIT — solo codice + descrizione + stock + CL
           const accByCodice = {};
           stockItems.forEach(s => {
-            if (s.fonte !== 'accessori' || !(s.stock > 0)) return;
+            if (!isAccessorio(s) || !(s.stock > 0)) return;
             if (!accByCodice[s.codice]) accByCodice[s.codice] = { codice: s.codice, stock: 0 };
             accByCodice[s.codice].stock += s.stock;
           });
@@ -6787,9 +6792,15 @@ export default function App() {
 
         {/* ==================== MODULO MATRICE PNIT × TYPE ==================== */}
         {activeModule === 'matrice' && (() => {
-          // Stock / in arrivo / in ordine per codice
+          // Cluster Anagrafica per codice: fallback per riconoscere gli accessori anche se una riga di stock
+          // è taggata con la fonte sbagliata (es. import errato) — Anagrafica resta la fonte di verità.
+          const clusterByCodiceMrp = {};
+          anagrafica.forEach(a => { clusterByCodiceMrp[String(a.codice || '').trim()] = String(a.cluster || '').trim(); });
+          const isAccessorioMrp = (s) => s.fonte === 'accessori' || clusterByCodiceMrp[s.codice]?.toLowerCase() === 'accessories';
+
+          // Stock / in arrivo / in ordine per codice (esclude gli accessori)
           const stockByCodice = {};
-          stockItems.forEach(s => { if (s.stock > 0 && s.fonte !== 'accessori') stockByCodice[s.codice] = (stockByCodice[s.codice] || 0) + s.stock; });
+          stockItems.forEach(s => { if (s.stock > 0 && !isAccessorioMrp(s)) stockByCodice[s.codice] = (stockByCodice[s.codice] || 0) + s.stock; });
           const arrivoByCodice = {};
           poLines.forEach(l => {
             const cod = String(l.item_code || '').trim();
