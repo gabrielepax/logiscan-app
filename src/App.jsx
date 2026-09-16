@@ -732,6 +732,8 @@ export default function App() {
       const cPrice = colFor('vendorprice', 'price', 'prezzo');
       const cCur = colFor('vendorpricecurrency', 'currency', 'valuta');
       const cStatus = colFor('paxstatus', 'status', 'stato');
+      const cMainComponent = colFor('paxmaincomponent', 'maincomponent');
+      const cCustomerId = colFor('paxcustomerid', 'customerid');
       if (!cId || !cName) {
         alert("Colonne obbligatorie mancanti: servono 'Internal ID' e 'Name'.");
         setAnagLoading(false);
@@ -767,6 +769,8 @@ export default function App() {
           prezzo: cPrice ? toNum(r[cPrice]) : 0,
           valuta: g(r, cCur),
           pax_status: g(r, cStatus),
+          main_component: g(r, cMainComponent),
+          customer_id: g(r, cCustomerId),
           gruppo: gruppoPrev[id] || '',
           updated_at: new Date().toISOString(),
         };
@@ -7087,6 +7091,33 @@ export default function App() {
             if (codice) paxStatusByPnit[codice] = (a.pax_status || '').trim();
           });
 
+          // Prezzo/valuta per PN (Anagrafica): usato per il costo del PN ufficiale.
+          const priceByPn = {};
+          const valutaByPn = {};
+          anagrafica.forEach(a => {
+            const codice = String(a.codice || '').trim();
+            if (!codice) return;
+            priceByPn[codice] = a.prezzo;
+            valutaByPn[codice] = a.valuta || '';
+          });
+          const costoRow = (r) => {
+            if (r.isNA || !r.pnUfficiale) return null;
+            const prezzo = priceByPn[r.pnUfficiale];
+            if (!(prezzo > 0)) return null;
+            return { prezzo, valuta: valutaByPn[r.pnUfficiale] || '' };
+          };
+          const totaleCosti = (rowsList) => {
+            const totals = {};
+            rowsList.forEach(r => {
+              const c = costoRow(r);
+              if (!c) return;
+              const key = c.valuta || '—';
+              totals[key] = (totals[key] || 0) + c.prezzo;
+            });
+            return Object.entries(totals);
+          };
+          const fmtCosto = (n) => (n || 0).toLocaleString('it-IT', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+
           const pnitSummaryByPnit = {};
           dbaseRows.forEach(r => {
             if (!pnitSummaryByPnit[r.pnit]) pnitSummaryByPnit[r.pnit] = { pnit: r.pnit, hwStatus: paxStatusByPnit[r.pnit] || '', esisteHardware: Object.prototype.hasOwnProperty.call(paxStatusByPnit, r.pnit), totale: 0, assegnati: 0, na: 0, daSistemare: 0, orfane: 0 };
@@ -7178,13 +7209,17 @@ export default function App() {
                         </button>
                       )}
                       <button onClick={() => {
-                        const out = rows.map(r => ({
-                          'PNIT': r.pnit, 'SPARE': r.type, 'PN Ufficiale': r.pnUfficiale,
-                          'REF': r.refEffective ? 'SI' : '', 'R+': r.rplusEffective ? 'SI' : '',
-                          'N. Candidati': r.candidati.length, 'NON SERVE': r.isNA ? 'SI' : '', 'Orfana': r.isOrphan ? 'SI' : '', 'Bloccato': r.locked ? 'SI' : '', 'Stato': r.stato,
-                          'Ultimo aggiornamento': r.updatedAt ? new Date(r.updatedAt).toLocaleString('it-IT') : '',
-                          'Aggiornato da': r.updatedBy || '',
-                        }));
+                        const out = rows.map(r => {
+                          const c = costoRow(r);
+                          return {
+                            'PNIT': r.pnit, 'SPARE': r.type, 'PN Ufficiale': r.pnUfficiale,
+                            'Costo': c ? c.prezzo : '', 'Valuta': c ? c.valuta : '',
+                            'REF': r.refEffective ? 'SI' : '', 'R+': r.rplusEffective ? 'SI' : '',
+                            'N. Candidati': r.candidati.length, 'NON SERVE': r.isNA ? 'SI' : '', 'Orfana': r.isOrphan ? 'SI' : '', 'Bloccato': r.locked ? 'SI' : '', 'Stato': r.stato,
+                            'Ultimo aggiornamento': r.updatedAt ? new Date(r.updatedAt).toLocaleString('it-IT') : '',
+                            'Aggiornato da': r.updatedBy || '',
+                          };
+                        });
                         const ws = XLSX.utils.json_to_sheet(out);
                         const wb = XLSX.utils.book_new();
                         XLSX.utils.book_append_sheet(wb, ws, 'Distinte Base');
@@ -7227,9 +7262,16 @@ export default function App() {
 
                   {rows.length > 0 && (
                     <div className="flex items-center justify-between gap-3 flex-wrap">
-                      <p className="text-[11px] text-gray-400">
-                        {rows.length} risultati — pag. {page + 1}/{totalPages}
-                      </p>
+                      <div className="flex items-center gap-3 flex-wrap">
+                        <p className="text-[11px] text-gray-400">
+                          {rows.length} risultati — pag. {page + 1}/{totalPages}
+                        </p>
+                        {totaleCosti(rows).length > 0 && (
+                          <p className="text-[11px] font-bold text-gray-600">
+                            💰 Totale costo PN ufficiali: {totaleCosti(rows).map(([valuta, tot]) => `${currencySymbol(valuta === '—' ? '' : valuta)}${fmtCosto(tot)}`).join(' + ')}
+                          </p>
+                        )}
+                      </div>
                       {totalPages > 1 && (
                         <div className="flex gap-1">
                           <button onClick={() => setDbasePage(p => Math.max(0, p - 1))} disabled={page === 0}
@@ -7250,6 +7292,7 @@ export default function App() {
                             <th className="px-3 py-3">PNIT</th>
                             <th className="px-3 py-3">SPARE</th>
                             <th className="px-3 py-3">PN Ufficiale</th>
+                            <th className="px-3 py-3 text-right">Costo</th>
                             <th className="px-3 py-3 text-center">REF</th>
                             <th className="px-3 py-3 text-center">R+</th>
                             <th className="px-3 py-3 text-center">NON SERVE</th>
@@ -7286,6 +7329,9 @@ export default function App() {
                                     <span className="text-[10px] font-bold text-gray-400 ml-1" title="PN disponibili per questa combinazione">({r.candidati.length})</span>
                                   )}
                                 </div>
+                              </td>
+                              <td className="px-3 py-2.5 text-right font-mono text-gray-600">
+                                {costoRow(r) ? `${currencySymbol(costoRow(r).valuta)}${fmtCosto(costoRow(r).prezzo)}` : ''}
                               </td>
                               <td className="px-3 py-2.5 text-center">
                                 {r.refFromType ? (
@@ -7503,6 +7549,11 @@ export default function App() {
                             {dettaglioPnitSummary.hwStatus}
                           </span>
                         )}
+                        {totaleCosti(dettaglioPnitRows).length > 0 && (
+                          <span className="text-[11px] font-bold text-gray-600">
+                            💰 {totaleCosti(dettaglioPnitRows).map(([valuta, tot]) => `${currencySymbol(valuta === '—' ? '' : valuta)}${fmtCosto(tot)}`).join(' + ')}
+                          </span>
+                        )}
                       </div>
                       <div className="flex items-center gap-2">
                         {dettaglioPnitSummary && !dettaglioPnitSummary.esisteHardware && canEdit('distinte-base') && (
@@ -7521,6 +7572,7 @@ export default function App() {
                           <tr>
                             <th className="px-3 py-2.5">SPARE</th>
                             <th className="px-3 py-2.5">PN Ufficiale</th>
+                            <th className="px-3 py-2.5 text-right">Costo</th>
                             <th className="px-3 py-2.5 text-center">REF</th>
                             <th className="px-3 py-2.5 text-center">R+</th>
                             <th className="px-3 py-2.5 text-center">NON SERVE</th>
@@ -7555,6 +7607,9 @@ export default function App() {
                                     <span className="text-[10px] font-bold text-gray-400 ml-1" title="PN disponibili per questa combinazione">({r.candidati.length})</span>
                                   )}
                                 </div>
+                              </td>
+                              <td className="px-3 py-2 text-right font-mono text-gray-600">
+                                {costoRow(r) ? `${currencySymbol(costoRow(r).valuta)}${fmtCosto(costoRow(r).prezzo)}` : ''}
                               </td>
                               <td className="px-3 py-2 text-center">
                                 {r.refFromType ? (

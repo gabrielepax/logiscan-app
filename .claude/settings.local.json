@@ -3,7 +3,13 @@
     "allow": [
       "Bash(python -c ' *)",
       "Bash(npx eslint *)",
-      "Bash(npm run *)"
+      "Bash(npm run *)",
+      "Bash(git add *)",
+      "Bash(git commit -m ' *)",
+      "Bash(git push *)",
+      "Bash(npx vite *)",
+      "Bash(powershell -Command \"Get-Content 'C:\\\\Users\\\\gabriele.maccali\\\\Downloads\\\\APPAnagraficaResults64.csv' -TotalCount 5\")",
+      "PowerShell($c = Import-Csv 'C:\\\\Users\\\\gabriele.maccali\\\\Downloads\\\\APPAnagraficaResults64.csv'; $c | Where-Object { $_.'[PAX] Cluster Item' -eq 'Products' } | Select-Object -First 8 'Internal ID','Name','Display Name','[PAX] Main Component','[PAX] Customer ID' | Format-Table -AutoSize)"
     ]
   }
 }
