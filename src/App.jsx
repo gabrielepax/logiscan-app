@@ -21,6 +21,7 @@ const APP_MODULES = [
   { id: 'distinte-base', label: 'Distinte Base', group: 'Repair', edit: true, genera: true },
   { id: 'matrice', label: 'MRP', group: 'Repair', upload: true },
   { id: 'anagrafica', label: 'Anagrafica', group: 'Repair', upload: true, edit: true },
+  { id: 'catalogazione', label: 'Catalogazione', group: 'Repair', upload: true, edit: true },
 ];
 
 const SP_DEFAULT_WIDTHS = {
@@ -49,6 +50,48 @@ const currencySymbol = (valuta) => {
 // dell'Inventario spare parts (es. H-07-03). Le matricole non contengono trattini, quindi
 // una lettura che rispetta il formato viene sempre interpretata come cambio ubicazione.
 const INV_LOC_RE = /^[A-Z]{1,2}-\d{1,3}-\d{1,3}$/i;
+const INV_SNAPSHOT_LOCK = 'inv_snapshot_lock'; // chiave import_meta: caricamento giacenza NS in corso
+
+// CSV testuali (giacenza NS, catalogato): separatore dedotto dall'intestazione, campi tra virgolette supportati
+const csvSeparator = (header) => (header.match(/;/g) || []).length > (header.match(/,/g) || []).length ? ';' : ',';
+function splitCsvLine(line, sep) {
+  const out = [];
+  let cur = '';
+  let quoted = false;
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (quoted) {
+      if (ch === '"' && line[i + 1] === '"') { cur += '"'; i++; }
+      else if (ch === '"') quoted = false;
+      else cur += ch;
+    } else if (ch === '"') quoted = true;
+    else if (ch === sep) { out.push(cur.trim()); cur = ''; }
+    else cur += ch;
+  }
+  out.push(cur.trim());
+  return out;
+}
+
+// Catalogazione: esiti per matricola e tipi di errore bloccante
+const CAT_ESITI = {
+  IT: { label: 'Transfer (IT)', cls: 'bg-blue-50 text-blue-700 border-blue-200' },
+  RA: { label: 'Return (RA)', cls: 'bg-purple-50 text-purple-700 border-purple-200' },
+  nessuna: { label: 'Nessuna azione', cls: 'bg-green-50 text-green-700 border-green-200' },
+  ignorata: { label: 'Ignorata (regola)', cls: 'bg-gray-100 text-gray-500 border-gray-200' },
+  esclusa: { label: 'Esclusa (nessun prodotto)', cls: 'bg-gray-100 text-gray-500 border-gray-200' },
+  scartata: { label: 'Doppione scartato', cls: 'bg-gray-100 text-gray-400 border-gray-200' },
+};
+const CAT_ERRORI = {
+  doppione: 'Matricola ripetuta',
+  transcodifica: 'pot_ senza transcodifica',
+  anagrafica: 'Prodotto non in Anagrafica',
+  cliente: 'Cliente ≠ Customer ID Anagrafica',
+  articolo: 'Articolo ≠ articolo in giacenza NS',
+  regola: 'Trasferimento da verificare (regola)',
+  gia_esportato: 'Documento già esportato',
+};
+const catDataCompatta = (d) => d.replace(/\//g, ''); // 10/09/2026 -> 10092026
+const catDataIso = (d) => { const [g, m, a] = d.split('/'); return `${a}-${m}-${g}`; };
 const invMissioneCode = (id) => `INV-${String(id).padStart(5, '0')}`;
 const INV_STATI = {
   aperta: { label: 'Da eseguire', cls: 'bg-blue-50 text-blue-700 border-blue-200' },
@@ -513,6 +556,23 @@ export default function App() {
   const [invExecScanner, setInvExecScanner] = useState('');
   const [invExecFeedback, setInvExecFeedback] = useState({ text: '', type: '', sub: '' });
   const [invExecLoading, setInvExecLoading] = useState(false);
+
+  // Catalogazione (catalogato vs giacenza NS → Inventory Transfer / Return Authorization)
+  const [catTab, setCatTab] = useState('analisi'); // 'analisi' | 'storico' | 'impostazioni'
+  const [catRighe, setCatRighe] = useState([]); // righe del catalogato caricato (non persistite)
+  const [catFile, setCatFile] = useState('');
+  const [catGiacenza, setCatGiacenza] = useState(new Map()); // matricola -> { item, location } dalla giacenza NS
+  const [catGiacenzaAt, setCatGiacenzaAt] = useState(null); // data file giacenza usata per l'analisi
+  const [catLoading, setCatLoading] = useState(false);
+  const [catImpostazioni, setCatImpostazioni] = useState({ clienti_ripax: [], magazzino_ripax: '', magazzino_rip: '' });
+  const [catRegole, setCatRegole] = useState([]);
+  const [catTranscodifiche, setCatTranscodifiche] = useState([]);
+  const [catStorico, setCatStorico] = useState([]); // testate export (tutte, servono al controllo IDext)
+  const [catDupScelte, setCatDupScelte] = useState({}); // matricola doppia -> indice riga scelta
+  const [catFiltro, setCatFiltro] = useState('tutte');
+  const [catSearch, setCatSearch] = useState('');
+  const [catNuovaRegola, setCatNuovaRegola] = useState({ magazzino_origine: '', magazzino_destinazione: '', azione: 'da_verificare' });
+  const [catImpDraft, setCatImpDraft] = useState({ clienti: '', magazzino_ripax: '', magazzino_rip: '' }); // impostazioni in modifica
   const invExecSetRef = useRef(new Map()); // matricola -> ubicazione: guardia sincrona anti-duplicati
   const invExecUbicazioneRef = useRef(''); // ubicazione corrente letta dallo scanner (non attende il render)
   const invExecScannerRef = useRef(null);
@@ -533,6 +593,7 @@ export default function App() {
     fetchDistinteBase();
     fetchDistinteBaseTipi();
     fetchStockVerifica();
+    fetchInvMissioni();
     fetchImportMeta();
     // eslint-disable-next-line react-hooks/set-state-in-effect
     fetchPermessi();
@@ -561,6 +622,11 @@ export default function App() {
       fetchInvMissioni();
     }
     if (activeModule === 'missioni-inventario') fetchInvMissioni();
+    if (activeModule === 'catalogazione') {
+      fetchCatConfig();
+      fetchInvRiepilogo();
+      fetchImportMeta();
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeModule]);
 
@@ -1201,13 +1267,13 @@ export default function App() {
   async function fetchImportMeta() {
     const { data } = await supabase.from('import_meta').select('*');
     const map = {};
-    (data || []).forEach(r => { map[r.chiave] = r.updated_at; });
+    (data || []).forEach(r => { map[r.chiave] = r.updated_at; map[`${r.chiave}__by`] = r.updated_by; });
     setImportMeta(map);
   }
   async function recordImportMeta(chiave) {
     const now = new Date().toISOString();
     await supabase.from('import_meta').upsert({ chiave, updated_at: now, updated_by: currentUser || 'import' }, { onConflict: 'chiave' });
-    setImportMeta(prev => ({ ...prev, [chiave]: now }));
+    setImportMeta(prev => ({ ...prev, [chiave]: now, [`${chiave}__by`]: currentUser || 'import' }));
   }
 
   // ===== Quantità IN ORDINE / IN ARRIVO (stock_ordini) =====
@@ -2002,11 +2068,18 @@ export default function App() {
       .eq('stato', 'pending');
     const errors = errArr ? ['carton_arrivals: ' + errArr.message] : [];
 
-    // Marca le righe non serializzate dell'invoice come confermate
-    await supabase.from('po_lines')
-      .update({ is_user_confirmed: true })
-      .eq('china_invoice', arrivoQtyInvoice)
-      .eq('sn_required', false);
+    // Marca confermate SOLO le righe non serializzate effettivamente complete (caricato >= atteso):
+    // le altre righe dello stesso invoice non toccate in questa sessione restano come sono.
+    const completeKeys = poLines
+      .filter(l => l.china_invoice === arrivoQtyInvoice && l.sn_required === false
+        && (l.qty_expected || 0) > 0 && (l.qty_loaded || 0) >= l.qty_expected)
+      .map(l => l.unique_key);
+    if (completeKeys.length > 0) {
+      const { error: errConf } = await supabase.from('po_lines')
+        .update({ is_user_confirmed: true })
+        .in('unique_key', completeKeys);
+      if (errConf) errors.push('po_lines: ' + errConf.message);
+    }
 
     // 2. Applica allo stock secondo le coordinate (codice + magazzino + bancale)
     errors.push(...await applyCartoniToStock(arrivoQtyCartoni));
@@ -3838,24 +3911,8 @@ export default function App() {
   function parseInvCsv(text) {
     const lines = (text.charCodeAt(0) === 0xFEFF ? text.slice(1) : text).split(/\r?\n/).filter(l => l.trim());
     if (lines.length < 2) return { error: 'File vuoto.' };
-    const sep = (lines[0].match(/;/g) || []).length > (lines[0].match(/,/g) || []).length ? ';' : ',';
-    const splitLine = (line) => {
-      const out = [];
-      let cur = '';
-      let quoted = false;
-      for (let i = 0; i < line.length; i++) {
-        const ch = line[i];
-        if (quoted) {
-          if (ch === '"' && line[i + 1] === '"') { cur += '"'; i++; }
-          else if (ch === '"') quoted = false;
-          else cur += ch;
-        } else if (ch === '"') quoted = true;
-        else if (ch === sep) { out.push(cur.trim()); cur = ''; }
-        else cur += ch;
-      }
-      out.push(cur.trim());
-      return out;
-    };
+    const sep = csvSeparator(lines[0]);
+    const splitLine = (line) => splitCsvLine(line, sep);
     const norm = s => s.toLowerCase().replace(/[^a-z0-9]/g, '');
     const headers = splitLine(lines[0]).map(norm);
     const col = (...cands) => headers.findIndex(h => cands.includes(h));
@@ -3896,46 +3953,47 @@ export default function App() {
     const dataFile = new Date(file.lastModified);
     if (!window.confirm(
       `Caricare la giacenza NS: ${rows.length.toLocaleString('it-IT')} matricole (file del ${dataFile.toLocaleString('it-IT')})?\n\n` +
-      `La giacenza attuale verrà SOSTITUITA. Le missioni già lanciate non cambiano: conservano le matricole attese al momento del lancio.` +
+      `La giacenza attuale verrà SOSTITUITA per tutti i moduli (Controlli Inventariali e Catalogazione). Le missioni già lanciate non cambiano: conservano le matricole attese al momento del lancio.` +
       (duplicati ? `\n\n${duplicati} matricole ripetute nel file: viene tenuta l'ultima occorrenza.` : '')
     )) return;
 
-    const agg = new Map();
-    rows.forEach(r => {
-      const k = `${r.location}__${r.item}`;
-      const a = agg.get(k) || { location: r.location, item: r.item, qty: 0 };
-      a.qty++;
-      agg.set(k, a);
-    });
+    // Blocco: un solo caricamento alla volta (scade da solo dopo 30 minuti, es. browser chiuso a metà)
+    const { data: lock } = await supabase.from('import_meta').select('*').eq('chiave', INV_SNAPSHOT_LOCK).maybeSingle();
+    if (lock && Date.now() - new Date(lock.updated_at).getTime() < 30 * 60 * 1000) {
+      alert(`Caricamento giacenza NS già in corso da ${lock.updated_by || 'un altro utente'} (iniziato alle ${new Date(lock.updated_at).toLocaleTimeString('it-IT')}). Riprova tra qualche minuto.`);
+      return;
+    }
+    await supabase.from('import_meta').upsert({ chiave: INV_SNAPSHOT_LOCK, updated_at: new Date().toISOString(), updated_by: currentUser || 'import' }, { onConflict: 'chiave' });
 
     setInvSnapshotLoading(true);
     try {
-      const { error: resetErr } = await supabase.rpc('inv_snapshot_reset');
+      // Caricamento nella tabella d'appoggio: la giacenza attiva resta integra e leggibile fino allo swap
+      const { error: resetErr } = await supabase.rpc('inv_snapshot_staging_reset');
       if (resetErr) throw resetErr;
       const chunks = [];
       for (let i = 0; i < rows.length; i += 1000) chunks.push(rows.slice(i, i + 1000));
       let done = 0;
       for (let i = 0; i < chunks.length; i += 4) {
         const batch = chunks.slice(i, i + 4);
-        const res = await Promise.all(batch.map(c => supabase.from('inv_snapshot').insert(c)));
+        const res = await Promise.all(batch.map(c => supabase.from('inv_snapshot_staging').insert(c)));
         const err = res.find(r => r.error)?.error;
         if (err) throw err;
         done += batch.reduce((s, c) => s + c.length, 0);
         setInvImportProgress(`${done.toLocaleString('it-IT')}/${rows.length.toLocaleString('it-IT')}`);
       }
-      const riep = [...agg.values()];
-      for (let i = 0; i < riep.length; i += 1000) {
-        const { error } = await supabase.from('inv_snapshot_riepilogo').insert(riep.slice(i, i + 1000));
-        if (error) throw error;
-      }
+      // Sostituzione atomica di inv_snapshot + ricostruzione del riepilogo (una transazione)
+      setInvImportProgress('attivazione');
+      const { error: swapErr } = await supabase.rpc('inv_snapshot_swap');
+      if (swapErr) throw swapErr;
       await recordImportMeta('inv_snapshot');
       // Data della giacenza = data del file esportato da NS
       await supabase.from('import_meta').upsert({ chiave: 'inv_snapshot_file', updated_at: dataFile.toISOString(), updated_by: currentUser || 'import' }, { onConflict: 'chiave' });
       setImportMeta(prev => ({ ...prev, inv_snapshot_file: dataFile.toISOString() }));
-      alert(`Giacenza NS caricata: ${rows.length.toLocaleString('it-IT')} matricole, ${riep.length} combinazioni codice/magazzino.`);
+      alert(`Giacenza NS caricata: ${rows.length.toLocaleString('it-IT')} matricole.`);
     } catch (err) {
-      alert('Errore caricamento giacenza NS: ' + err.message + '\n\nLa giacenza potrebbe essere incompleta: ricarica il file.');
+      alert('Errore caricamento giacenza NS: ' + err.message + '\n\nLa giacenza precedente è rimasta attiva: ricarica il file.');
     }
+    await supabase.from('import_meta').delete().eq('chiave', INV_SNAPSHOT_LOCK);
     setInvImportProgress('');
     setInvSnapshotLoading(false);
     setInvSelezione(new Set());
@@ -4272,6 +4330,338 @@ export default function App() {
     fetchInvMissioni();
   }
 
+  // ==================== CATALOGAZIONE ====================
+  // Il catalogato (CSV del sistema di catalogazione) viene confrontato con la giacenza NS condivisa (inv_snapshot):
+  // destinazione RIPAX per i clienti RIPAX, RIP per gli altri; matricola in giacenza fuori destinazione → Inventory
+  // Transfer, assente → Return Authorization. Qualsiasi errore blocca l'intero export. Storico solo di testata.
+
+  async function fetchCatConfig() {
+    try {
+      const [imp, regole, transc, storico] = await Promise.all([
+        supabase.from('cat_impostazioni').select('*'),
+        supabase.from('cat_regole_magazzino').select('*').order('magazzino_origine'),
+        invFetchAll('cat_transcodifiche', '*', q => q, ['customer_id', 'main_component']),
+        invFetchAll('cat_export_testate', '*', q => q, ['id']),
+      ]);
+      if (imp.error) throw imp.error;
+      if (regole.error) throw regole.error;
+      const map = {};
+      (imp.data || []).forEach(r => { map[r.chiave] = r.valore; });
+      const conf = {
+        clienti_ripax: (map.clienti_ripax || []).map(String),
+        magazzino_ripax: map.magazzino_ripax || '',
+        magazzino_rip: map.magazzino_rip || '',
+      };
+      setCatImpostazioni(conf);
+      setCatImpDraft({ clienti: conf.clienti_ripax.join(', '), magazzino_ripax: conf.magazzino_ripax, magazzino_rip: conf.magazzino_rip });
+      setCatRegole(regole.data || []);
+      setCatTranscodifiche(transc);
+      setCatStorico(storico.reverse());
+    } catch (err) { alert('Errore caricamento configurazione Catalogazione: ' + err.message); }
+  }
+
+  async function handleCatalogatoUpload(event) {
+    const file = event.target.files[0];
+    if (!file) return;
+    event.target.value = '';
+    const text = await file.text();
+    const lines = (text.charCodeAt(0) === 0xFEFF ? text.slice(1) : text).split(/\r?\n/).filter(l => l.trim());
+    if (lines.length < 2) { alert('File vuoto.'); return; }
+    const sep = csvSeparator(lines[0]);
+    const norm = s => s.toLowerCase().replace(/[^a-z0-9]/g, '');
+    const headers = splitCsvLine(lines[0], sep).map(norm);
+    const col = (h) => headers.indexOf(h);
+    const iExt = col('externalid'), iCust = col('customer'), iDate = col('date'), iRef = col('yourref'), iItem = col('item'), iSerial = col('serial');
+    if (iCust < 0 || iDate < 0 || iItem < 0 || iSerial < 0) { alert("Colonne mancanti: servono almeno 'Customer', 'Date', 'Item' e 'Serial'."); return; }
+    const righe = [];
+    lines.slice(1).forEach(line => {
+      const c = splitCsvLine(line, sep);
+      const serial = (c[iSerial] || '').toUpperCase();
+      if (!serial) return;
+      righe.push({
+        externalId: iExt >= 0 ? c[iExt] || '' : '', customer: c[iCust] || '', date: c[iDate] || '',
+        ref: iRef >= 0 ? c[iRef] || '' : '', item: c[iItem] || '', serial,
+      });
+    });
+    if (righe.length === 0) { alert('Nessuna matricola nel file.'); return; }
+    const dataNonValida = righe.find(r => !/^\d{2}\/\d{2}\/\d{4}$/.test(r.date));
+    if (dataNonValida) { alert(`Data non valida (atteso gg/mm/aaaa): "${dataNonValida.date}" sulla matricola ${dataNonValida.serial}.`); return; }
+    setCatRighe(righe);
+    setCatFile(file.name);
+    setCatDupScelte({});
+    setCatFiltro('tutte');
+    setCatSearch('');
+    await analizzaCatalogato(righe);
+  }
+
+  // Legge dalla giacenza NS solo le matricole del catalogato (e la data del file giacenza a cui si riferiscono)
+  async function analizzaCatalogato(righe = catRighe) {
+    if (righe.length === 0) return;
+    setCatLoading(true);
+    try {
+      const { data: meta } = await supabase.from('import_meta').select('*').in('chiave', ['inv_snapshot_file', 'inv_snapshot']);
+      const metaMap = {};
+      (meta || []).forEach(m => { metaMap[m.chiave] = m.updated_at; });
+      const serials = [...new Set(righe.map(r => r.serial))];
+      const chunks = [];
+      for (let i = 0; i < serials.length; i += 200) chunks.push(serials.slice(i, i + 200));
+      const giacenza = new Map();
+      for (let i = 0; i < chunks.length; i += 5) {
+        const res = await Promise.all(chunks.slice(i, i + 5).map(c => supabase.from('inv_snapshot').select('numero, item, location').in('numero', c)));
+        const err = res.find(r => r.error)?.error;
+        if (err) throw err;
+        res.forEach(r => (r.data || []).forEach(d => giacenza.set(d.numero, { item: d.item, location: d.location })));
+      }
+      setCatGiacenza(giacenza);
+      setCatGiacenzaAt(metaMap.inv_snapshot_file || metaMap.inv_snapshot || null);
+      await fetchCatConfig();
+      await fetchImportMeta();
+    } catch (err) { alert('Errore analisi catalogato: ' + err.message); }
+    setCatLoading(false);
+  }
+
+  const catAnalisi = useMemo(() => {
+    if (catRighe.length === 0) return null;
+    const clientiRipax = new Set(catImpostazioni.clienti_ripax);
+    const anagByCodice = new Map(anagrafica.map(a => [a.codice, a]));
+    const transc = new Map(catTranscodifiche.map(t => [`${t.customer_id}|${t.main_component}`, t.prodotto]));
+    const regole = new Map(catRegole.map(r => [`${r.magazzino_origine}|${r.magazzino_destinazione}`, r.azione]));
+    const perMatricola = new Map();
+    catRighe.forEach((r, i) => perMatricola.set(r.serial, [...(perMatricola.get(r.serial) || []), i]));
+
+    const righe = catRighe.map((r, i) => {
+      const base = { ...r, i, errori: [], prodotto: '', origine: '', idext: '' };
+      const occorrenze = perMatricola.get(r.serial);
+      if (occorrenze.length > 1) {
+        const scelta = catDupScelte[r.serial];
+        if (scelta == null) base.errori.push({ tipo: 'doppione', msg: `Matricola presente ${occorrenze.length} volte nel catalogato: scegliere la riga corretta` });
+        else if (scelta !== i) return { ...base, esito: 'scartata' };
+      }
+      const destinazione = clientiRipax.has(r.customer) ? catImpostazioni.magazzino_ripax : catImpostazioni.magazzino_rip;
+      base.destinazione = destinazione;
+      base.ripax = clientiRipax.has(r.customer);
+
+      // Articolo: il catalogato riporta già il prodotto, tranne i pot_ (Main Component da transcodificare)
+      const pot = r.item.toLowerCase().startsWith('pot_');
+      if (pot) {
+        const mc = r.item.slice(4);
+        const k = `${r.customer}|${mc}`;
+        if (!transc.has(k)) base.errori.push({ tipo: 'transcodifica', msg: `${mc}: scegliere il prodotto per il cliente ${r.customer}` });
+        else if (transc.get(k) == null) return { ...base, esito: 'esclusa' };
+        else base.prodotto = transc.get(k);
+      } else base.prodotto = r.item;
+      if (base.prodotto) {
+        const a = anagByCodice.get(base.prodotto);
+        if (!a) base.errori.push({ tipo: 'anagrafica', msg: `${base.prodotto} non presente in Anagrafica` });
+        // Per i pot_ la transcodifica scelta dall'utente vale come conferma del cliente
+        else if (!pot && String(a.customer_id || '') !== r.customer) base.errori.push({ tipo: 'cliente', msg: `Cliente ${r.customer}, ma ${base.prodotto} in Anagrafica ha Customer ID ${a.customer_id || '(vuoto)'}` });
+      }
+
+      const g = catGiacenza.get(r.serial);
+      if (!g) return { ...base, esito: 'RA' };
+      base.origine = g.location;
+      if (base.prodotto && g.item !== base.prodotto) base.errori.push({ tipo: 'articolo', msg: `In giacenza NS la matricola è su ${g.item}, non su ${base.prodotto}` });
+      if (g.location === destinazione) return { ...base, esito: 'nessuna' };
+      const azione = regole.get(`${g.location}|${destinazione}`);
+      if (azione === 'ignora') return { ...base, esito: 'ignorata' };
+      if (azione === 'da_verificare') base.errori.push({ tipo: 'regola', msg: `Regola: trasferimento ${g.location} → ${destinazione} da verificare` });
+      return { ...base, esito: 'IT' };
+    });
+
+    // Documenti: IDext deterministico (senza data export) → un secondo export dello stesso documento è riconoscibile
+    const docs = new Map();
+    righe.filter(r => r.esito === 'IT' || r.esito === 'RA').forEach(r => {
+      r.idext = r.esito === 'RA'
+        ? `${r.customer}-RA-${catDataCompatta(r.date)}`
+        : `${r.customer}-IT-${catDataCompatta(r.date)}-${r.origine.split(' - ')[0].trim()}`;
+      if (!docs.has(r.idext)) docs.set(r.idext, { idext: r.idext, tipo: r.esito, cliente: r.customer, data: r.date, origine: r.esito === 'IT' ? r.origine : '', destinazione: r.destinazione, righe: [] });
+      docs.get(r.idext).righe.push(r);
+    });
+    const storico = new Map(catStorico.map(s => [s.idext, s]));
+    docs.forEach(d => {
+      const perItem = new Map();
+      d.righe.forEach(r => perItem.set(r.prodotto, [...(perItem.get(r.prodotto) || []), r]));
+      d.linee = [...perItem.entries()].map(([item, rr], k) => ({ item, surrogate: k + 1, righe: rr }));
+      const s = storico.get(d.idext);
+      if (!s) return;
+      // Stessa giacenza e stesse matricole: è lo stesso documento già esportato, si salta.
+      // Altrimenti ci sono matricole nuove (o non ancora caricate) su un IDext già usato: va corretto a mano in NetSuite.
+      const stessaGiacenza = s.giacenza_at && catGiacenzaAt && new Date(s.giacenza_at).getTime() === new Date(catGiacenzaAt).getTime();
+      if (stessaGiacenza && s.n_matricole === d.righe.length) d.giaEsportato = s;
+      else d.righe.forEach(r => r.errori.push({
+        tipo: 'gia_esportato',
+        msg: `${d.idext} già esportato il ${new Date(s.esportato_at).toLocaleString('it-IT')} (${s.n_matricole} matricole): ora ${d.righe.length} matricole da caricare, correggere a mano in NetSuite`,
+      }));
+    });
+
+    const conErrori = righe.filter(r => r.errori.length > 0);
+    const erroriPerTipo = {};
+    conErrori.forEach(r => new Set(r.errori.map(e => e.tipo)).forEach(t => { erroriPerTipo[t] = (erroriPerTipo[t] || 0) + 1; }));
+    const transcMancanti = new Map();
+    righe.forEach(r => r.errori.filter(e => e.tipo === 'transcodifica').forEach(() => {
+      const k = `${r.customer}|${r.item.slice(4)}`;
+      const t = transcMancanti.get(k) || { customer: r.customer, mc: r.item.slice(4), n: 0 };
+      t.n++;
+      transcMancanti.set(k, t);
+    }));
+    const doppioni = [...perMatricola.entries()].filter(([, idx]) => idx.length > 1).map(([serial, idx]) => ({ serial, righe: idx.map(i => catRighe[i]), indici: idx }));
+    const conta = (esito) => righe.filter(r => r.esito === esito).length;
+    return {
+      righe, docs: [...docs.values()], conErrori, erroriPerTipo, transcMancanti: [...transcMancanti.values()], doppioni,
+      n: { IT: conta('IT'), RA: conta('RA'), nessuna: conta('nessuna'), ignorata: conta('ignorata'), esclusa: conta('esclusa'), scartata: conta('scartata') },
+    };
+  }, [catRighe, catGiacenza, catGiacenzaAt, catImpostazioni, catRegole, catTranscodifiche, catStorico, catDupScelte, anagrafica]);
+
+  async function salvaCatTranscodifica(customer_id, main_component, prodotto) {
+    const { error } = await supabase.from('cat_transcodifiche').upsert(
+      { customer_id, main_component, prodotto, updated_at: new Date().toISOString(), updated_by: currentUser || null },
+      { onConflict: 'customer_id,main_component' },
+    );
+    if (error) { alert('Errore salvataggio transcodifica: ' + error.message); return; }
+    setCatTranscodifiche(prev => [...prev.filter(t => !(t.customer_id === customer_id && t.main_component === main_component)), { customer_id, main_component, prodotto, updated_by: currentUser || null, updated_at: new Date().toISOString() }]);
+  }
+
+  async function eliminaCatTranscodifica(t) {
+    if (!window.confirm(`Eliminare la transcodifica ${t.customer_id} + ${t.main_component}? Alla prossima analisi verrà richiesta di nuovo.`)) return;
+    const { error } = await supabase.from('cat_transcodifiche').delete().eq('customer_id', t.customer_id).eq('main_component', t.main_component);
+    if (error) { alert('Errore eliminazione transcodifica: ' + error.message); return; }
+    setCatTranscodifiche(prev => prev.filter(x => !(x.customer_id === t.customer_id && x.main_component === t.main_component)));
+  }
+
+  async function salvaCatImpostazioni() {
+    const clienti = [...new Set(catImpDraft.clienti.split(/[\s,;]+/).map(s => s.trim()).filter(Boolean))];
+    if (!catImpDraft.magazzino_ripax.trim() || !catImpDraft.magazzino_rip.trim()) { alert('Indicare entrambi i magazzini di destinazione.'); return; }
+    const now = new Date().toISOString();
+    const { error } = await supabase.from('cat_impostazioni').upsert([
+      { chiave: 'clienti_ripax', valore: clienti, updated_at: now, updated_by: currentUser || null },
+      { chiave: 'magazzino_ripax', valore: catImpDraft.magazzino_ripax.trim(), updated_at: now, updated_by: currentUser || null },
+      { chiave: 'magazzino_rip', valore: catImpDraft.magazzino_rip.trim(), updated_at: now, updated_by: currentUser || null },
+    ], { onConflict: 'chiave' });
+    if (error) { alert('Errore salvataggio impostazioni: ' + error.message); return; }
+    await fetchCatConfig();
+    alert('Impostazioni salvate.');
+  }
+
+  async function aggiungiCatRegola() {
+    const { magazzino_origine, magazzino_destinazione, azione } = catNuovaRegola;
+    if (!magazzino_origine || !magazzino_destinazione) return;
+    if (magazzino_origine === magazzino_destinazione) { alert('Origine e destinazione coincidono: la matricola è già a destinazione, nessuna regola necessaria.'); return; }
+    const { error } = await supabase.from('cat_regole_magazzino').upsert(
+      { magazzino_origine, magazzino_destinazione, azione, updated_at: new Date().toISOString(), updated_by: currentUser || null },
+      { onConflict: 'magazzino_origine,magazzino_destinazione' },
+    );
+    if (error) { alert('Errore salvataggio regola: ' + error.message); return; }
+    setCatNuovaRegola(prev => ({ ...prev, magazzino_origine: '' }));
+    await fetchCatConfig();
+  }
+
+  async function eliminaCatRegola(r) {
+    if (!window.confirm(`Eliminare la regola ${r.magazzino_origine} → ${r.magazzino_destinazione}? Tornerà a generare un trasferimento.`)) return;
+    const { error } = await supabase.from('cat_regole_magazzino').delete().eq('id', r.id);
+    if (error) { alert('Errore eliminazione regola: ' + error.message); return; }
+    setCatRegole(prev => prev.filter(x => x.id !== r.id));
+  }
+
+  const catDownloadCsv = (header, rows, nome) => {
+    const blob = new Blob(['﻿' + [header, ...rows].join('\r\n')], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a'); a.href = url;
+    a.download = nome; a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  async function esportaCatalogazione() {
+    const an = catAnalisi;
+    if (!an || an.conErrori.length > 0) return;
+    // La giacenza può essere stata ricaricata da un altro utente dopo l'analisi: verifica sul DB, non sullo stato locale
+    const { data: meta } = await supabase.from('import_meta').select('*').in('chiave', ['inv_snapshot_file', 'inv_snapshot', INV_SNAPSHOT_LOCK]);
+    const metaMap = {};
+    (meta || []).forEach(m => { metaMap[m.chiave] = m.updated_at; });
+    const giacenzaAttuale = metaMap.inv_snapshot_file || metaMap.inv_snapshot || null;
+    if (metaMap[INV_SNAPSHOT_LOCK] || giacenzaAttuale !== catGiacenzaAt) {
+      alert('La giacenza NS è stata ricaricata (o è in caricamento) dopo l\'analisi: rianalizza prima di esportare.');
+      await fetchImportMeta();
+      return;
+    }
+    const docs = an.docs.filter(d => !d.giaEsportato);
+    if (docs.length === 0) { alert('Nessun documento da esportare.'); return; }
+    const it = docs.filter(d => d.tipo === 'IT');
+    const ra = docs.filter(d => d.tipo === 'RA');
+    const nMat = ds => ds.reduce((s, d) => s + d.righe.length, 0);
+    if (!window.confirm(
+      `Esportare ${docs.length} documenti?\n\n` +
+      `Inventory Transfer: ${it.length} documenti, ${nMat(it)} matricole\n` +
+      `Return Authorization: ${ra.length} documenti, ${nMat(ra)} matricole\n\n` +
+      'I documenti vengono registrati nello storico: lo stesso IDext non potrà essere esportato di nuovo.'
+    )) return;
+
+    // Prima lo storico (idext univoco): se un altro utente ha già esportato lo stesso documento l'export si ferma
+    setCatLoading(true);
+    const testate = docs.map(d => ({
+      idext: d.idext, tipo: d.tipo, cliente: d.cliente, data_catalogazione: catDataIso(d.data),
+      magazzino_origine: d.origine || null, magazzino_destinazione: d.destinazione,
+      n_righe: d.linee.length, n_matricole: d.righe.length, giacenza_at: catGiacenzaAt,
+      file_catalogato: catFile, esportato_da: currentUser || null,
+    }));
+    const { error } = await supabase.from('cat_export_testate').insert(testate);
+    if (error) {
+      alert('Export annullato, nessun file generato: ' + error.message + '\n\nProbabilmente un documento è già stato esportato da un altro utente: rianalizza.');
+      await fetchCatConfig();
+      setCatLoading(false);
+      return;
+    }
+
+    const stamp = new Date().toISOString().slice(0, 16).replace(/[-:]/g, '').replace('T', '_');
+    const memo = d => `catalogazione ${d.data}`;
+    if (it.length > 0) {
+      const rows = [];
+      it.forEach(d => d.linee.forEach(l => l.righe.forEach(r => rows.push(
+        [d.idext, l.surrogate, d.data, l.item, l.righe.length, r.serial, d.origine, d.destinazione, memo(d)].join(';'),
+      ))));
+      catDownloadCsv('IDextIT;Surrogate Line;Date;Item;Quantity;Serial;Magazzino di origine;Magazzino di destinazione;memo', rows, `catalogazione_IT_${stamp}.csv`);
+    }
+    if (ra.length > 0) {
+      const rows = [];
+      ra.forEach(d => d.linee.forEach(l => l.righe.forEach(r => rows.push(
+        [d.idext, l.surrogate, d.data, d.cliente, r.serial, l.item, l.righe.length, d.destinazione, memo(d)].join(';'),
+      ))));
+      catDownloadCsv('External ID;Surrogate Line;Date;Customer;Serial;Item;Quantity;Magazzino di destinazione;memo', rows, `catalogazione_RA_${stamp}.csv`);
+    }
+    await fetchCatConfig();
+    setCatLoading(false);
+  }
+
+  function scaricaCatDettaglio() {
+    const an = catAnalisi;
+    if (!an) return;
+    const dettaglio = an.righe.map(r => ({
+      Matricola: r.serial, Customer: r.customer, 'Data catalogazione': r.date, 'External ID catalogato': r.externalId, 'Your Ref': r.ref,
+      'Item catalogato': r.item, Prodotto: r.prodotto, 'Magazzino NS': r.origine, Destinazione: r.destinazione || '',
+      Esito: CAT_ESITI[r.esito]?.label || r.esito, IDext: r.idext, Errori: r.errori.map(e => e.msg).join(' | '),
+    }));
+    const cols = Object.keys(dettaglio[0]);
+    const documenti = an.docs.map(d => ({
+      IDext: d.idext, Tipo: d.tipo, Cliente: d.cliente, Data: d.data, Origine: d.origine, Destinazione: d.destinazione,
+      Righe: d.linee.length, Matricole: d.righe.length, Stato: d.giaEsportato ? `Già esportato il ${new Date(d.giaEsportato.esportato_at).toLocaleString('it-IT')}` : 'Da esportare',
+    }));
+    const riepilogo = [
+      ['File catalogato', catFile], ['Giacenza NS del', catGiacenzaAt ? new Date(catGiacenzaAt).toLocaleString('it-IT') : ''],
+      [],
+      ['Matricole', an.righe.length],
+      ...Object.entries(CAT_ESITI).map(([k, v]) => [v.label, an.n[k]]),
+      ['Con errori bloccanti', an.conErrori.length],
+      ...Object.entries(an.erroriPerTipo).map(([k, v]) => [`  ${CAT_ERRORI[k]}`, v]),
+      [],
+      ['Scaricato da', currentUser || ''], ['Scaricato il', new Date().toLocaleString('it-IT')],
+    ];
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(riepilogo), 'Riepilogo');
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(dettaglio, { header: cols }), 'Dettaglio');
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(dettaglio.filter(r => r.Errori), { header: cols }), 'Errori');
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(documenti), 'Documenti');
+    XLSX.writeFile(wb, `catalogazione_dettaglio_${new Date().toISOString().slice(0, 10)}.xlsx`);
+  }
+
   // ==================== PERMESSI DI RUOLO ====================
   const myRole = (authUser?.ruolo || '').toLowerCase();
   const isAdmin = myRole === 'admin';
@@ -4282,6 +4672,43 @@ export default function App() {
   const canGenera = (mod) => isAdmin || hasPerm(`${mod}:genera`); // pulsante "Genera da Compatibilità" per modulo
   const canManuale = (mod) => isAdmin || hasPerm(`${mod}:manuale`); // arrivi caricati a mano, senza PO
   const isSper = (mod) => moduliSper.has(mod);                    // modulo sperimentale (SP)
+
+  // Giacenza NS condivisa (Controlli Inventariali + Catalogazione): stessa informazione e stesso caricamento in entrambi i moduli
+  const renderGiacenzaNS = (mod, onRefresh) => {
+    const fmt = iso => iso ? new Date(iso).toLocaleString('it-IT') : '—';
+    const lockAt = importMeta[INV_SNAPSHOT_LOCK];
+    const lockAttivo = lockAt && Date.now() - new Date(lockAt).getTime() < 30 * 60 * 1000;
+    return (
+      <div className="flex items-center justify-between flex-wrap gap-3 bg-white border border-gray-200 rounded-xl px-4 py-3">
+        <div>
+          <p className="text-[10px] font-black uppercase tracking-wider text-gray-400">Giacenza NS (condivisa)</p>
+          {importMeta.inv_snapshot_file || importMeta.inv_snapshot ? (
+            <p className="text-sm font-bold text-gray-800">
+              File del {fmt(importMeta.inv_snapshot_file)}
+              <span className="font-normal text-gray-500"> · caricato il {fmt(importMeta.inv_snapshot)}{importMeta.inv_snapshot__by ? ` da ${importMeta.inv_snapshot__by}` : ''}</span>
+            </p>
+          ) : (
+            <p className="text-sm font-bold text-amber-700">Nessuna giacenza NS caricata</p>
+          )}
+          {lockAttivo && (
+            <p className="text-xs font-bold text-amber-700">⏳ Caricamento in corso da {importMeta[`${INV_SNAPSHOT_LOCK}__by`] || 'un altro utente'}: fino al termine resta attiva la giacenza precedente</p>
+          )}
+        </div>
+        <div className="flex gap-2">
+          <button onClick={() => { fetchImportMeta(); onRefresh?.(); }}
+            className="bg-gray-100 hover:bg-gray-200 text-gray-600 text-sm font-bold px-3 py-2.5 rounded-xl cursor-pointer transition" title="Aggiorna">
+            ↻
+          </button>
+          {canUpload(mod) && (
+            <label className={`bg-blue-600 hover:bg-blue-700 text-white text-sm font-bold px-4 py-2.5 rounded-xl cursor-pointer transition shadow-xs ${invSnapshotLoading ? 'opacity-50 pointer-events-none' : ''}`}>
+              {invImportProgress ? `Caricamento ${invImportProgress}…` : '📂 Carica giacenza NS (CSV)'}
+              <input type="file" accept=".csv,text/csv" className="hidden" onChange={handleInvSnapshotUpload} />
+            </label>
+          )}
+        </div>
+      </div>
+    );
+  };
 
   // Se il modulo attivo non è accessibile col ruolo corrente, spostati sul primo consentito
   useEffect(() => {
@@ -4380,18 +4807,19 @@ export default function App() {
               {[
                 { group: 'Magazzino', modules: [
                   { id: 'arrivi', label: 'Piano Arrivi', icon: '📦' },
-                  { id: 'prelievi', label: 'Prelievi', icon: '📤' },
+                  { id: 'prelievi', label: 'Prelievi', icon: '📤', badge: missioniList.length },
                   { id: 'sposta-bancale', label: 'Sposta Bancale', icon: '🏭' },
                   { id: 'stock', label: 'Inventario', icon: '🗄️' },
                   { id: 'riepilogo', label: 'Stock Spare Parts', icon: '📊' },
                   { id: 'controlli-inventariali', label: 'Controlli Inventariali', icon: '🔎' },
-                  { id: 'missioni-inventario', label: 'Missioni Inventario', icon: '📱' },
+                  { id: 'missioni-inventario', label: 'Missioni Inventario', icon: '📱', badge: invMissioni.filter(m => m.stato !== 'chiusa').length },
                 ]},
                 { group: 'Repair', modules: [
                   { id: 'spare-parts', label: 'Compatibilità', icon: '🔧' },
                   { id: 'distinte-base', label: 'Distinte Base', icon: '📋' },
                   { id: 'matrice', label: 'MRP', icon: '🧮' },
                   { id: 'anagrafica', label: 'Anagrafica', icon: '📇' },
+                  { id: 'catalogazione', label: 'Catalogazione', icon: '🏷️' },
                 ]},
                 { group: 'Impostazioni', adminOnly: true, modules: [
                   { id: 'utenti', label: 'Utenti / Ruoli', icon: '👥' },
@@ -4411,6 +4839,9 @@ export default function App() {
                       >
                         <span className="text-lg">{mod.icon}</span>
                         <span className="flex-grow">{mod.label}</span>
+                        {mod.badge > 0 && (
+                          <span className={`text-xs font-black px-2.5 py-1 rounded-full min-w-[22px] text-center shadow-sm ${activeModule === mod.id ? 'bg-white text-blue-700' : 'bg-red-600 text-white'}`}>{mod.badge}</span>
+                        )}
                         {isSper(mod.id) && (
                           <span className={`text-[9px] font-black px-1.5 py-0.5 rounded ${activeModule === mod.id ? 'bg-white/25 text-white' : 'bg-amber-100 text-amber-700'}`}>SP</span>
                         )}
@@ -4459,6 +4890,7 @@ export default function App() {
                 {activeModule === 'distinte-base' && 'Distinte Base'}
                 {activeModule === 'prelievi' && 'Prelievi'}
                 {activeModule === 'anagrafica' && 'Anagrafica'}
+                {activeModule === 'catalogazione' && 'Catalogazione'}
                 {activeModule === 'utenti' && 'Utenti / Ruoli'}
                 {activeModule === 'moduli' && 'Moduli sperimentali'}
                 {activeModule === 'controlli-inventariali' && 'Controlli Inventariali'}
@@ -4913,8 +5345,9 @@ export default function App() {
           // Inventario unico: spare parts + accessori (marcati con fonte)
           const stockSource = stockItems;
 
-          // Riscontro codifica: verificato contro l'Anagrafica (fonte anagrafica articoli), non contro Compatibilità
-          const noMatchCount = stockSource.filter(s => !anagCodiceSet.has(s.codice)).length;
+          // Riscontro codifica: verificato contro l'Anagrafica (fonte anagrafica articoli), non contro Compatibilità.
+          // Stesso criterio stock>0 di `filtered`, altrimenti il conteggio non coincide con quanto si vede filtrando.
+          const noMatchCount = stockSource.filter(s => !anagCodiceSet.has(s.codice) && s.stock && s.stock !== 0).length;
           const uniqueMagazzini  = [...new Set(stockSource.map(s => s.magazzino).filter(Boolean))].sort();
           const uniqueLocazioni  = [...new Set(stockSource.map(s => s.locazione).filter(Boolean))].sort();
           const uniqueClusters   = [...new Set(stockSource.map(s => clusterByCodice[s.codice]).filter(Boolean))].sort();
@@ -5861,25 +6294,9 @@ export default function App() {
                   <p className="text-xs text-gray-500">
                     Giacenza matricolare NetSuite: <strong>{totMatricole.toLocaleString('it-IT')}</strong> matricole · {nCodici} codici · {magazzini.length} magazzini
                   </p>
-                  {importMeta.inv_snapshot_file && (
-                    <p className="text-[11px] text-gray-400">
-                      Giacenza NS del {fmt(importMeta.inv_snapshot_file)}{importMeta.inv_snapshot ? ` · caricata il ${fmt(importMeta.inv_snapshot)}` : ''}
-                    </p>
-                  )}
-                </div>
-                <div className="flex gap-2 flex-wrap">
-                  <button onClick={() => { fetchInvRiepilogo(); fetchInvMissioni(); }}
-                    className="bg-gray-100 hover:bg-gray-200 text-gray-600 text-sm font-bold px-3 py-2.5 rounded-xl cursor-pointer transition" title="Aggiorna">
-                    ↻
-                  </button>
-                  {canUpload('controlli-inventariali') && (
-                    <label className={`bg-blue-600 hover:bg-blue-700 text-white text-sm font-bold px-4 py-2.5 rounded-xl cursor-pointer transition shadow-xs ${invSnapshotLoading ? 'opacity-50 pointer-events-none' : ''}`}>
-                      {invImportProgress ? `Caricamento ${invImportProgress}…` : '📂 Carica giacenza NS (CSV)'}
-                      <input type="file" accept=".csv,text/csv" className="hidden" onChange={handleInvSnapshotUpload} />
-                    </label>
-                  )}
                 </div>
               </div>
+              {renderGiacenzaNS('controlli-inventariali', () => { fetchInvRiepilogo(); fetchInvMissioni(); })}
 
               <div className="flex gap-1 bg-gray-100 p-1 rounded-xl w-fit">
                 {[
@@ -7775,6 +8192,346 @@ export default function App() {
         })()}
 
         {/* ==================== MODULO PRELIEVI — LISTA ==================== */}
+        {/* ==================== MODULO CATALOGAZIONE ==================== */}
+        {activeModule === 'catalogazione' && (() => {
+          const an = catAnalisi;
+          const fmt = iso => iso ? new Date(iso).toLocaleString('it-IT') : '—';
+          const giacenzaCambiata = an && catGiacenzaAt !== (importMeta.inv_snapshot_file || importMeta.inv_snapshot || null);
+          const daEsportare = an ? an.docs.filter(d => !d.giaEsportato) : [];
+          const bloccato = !an || an.conErrori.length > 0 || giacenzaCambiata || daEsportare.length === 0;
+          const q = catSearch.trim().toLowerCase();
+          const righeVis = !an ? [] : an.righe.filter(r =>
+            (catFiltro === 'tutte' || (catFiltro === 'errori' ? r.errori.length > 0 : r.esito === catFiltro)) &&
+            (!q || [r.serial, r.customer, r.item, r.prodotto, r.idext, r.origine].some(v => (v || '').toLowerCase().includes(q))));
+          const anagByMC = new Map();
+          anagrafica.forEach(a => { if (a.main_component) anagByMC.set(a.main_component, [...(anagByMC.get(a.main_component) || []), a]); });
+          const magazzini = [...new Set(invRiepilogo.map(r => r.location))].sort();
+          const destinazioni = [catImpostazioni.magazzino_ripax, catImpostazioni.magazzino_rip].filter(Boolean);
+          const selectTranscodifica = (customer, mc, valore) => {
+            const candidati = [...(anagByMC.get(mc) || [])].sort((a, b) =>
+              (b.customer_id === customer) - (a.customer_id === customer) || a.codice.localeCompare(b.codice));
+            return (
+              <select value={valore === undefined ? '' : valore === null ? '__null__' : valore} disabled={!canEdit('catalogazione')}
+                onChange={e => e.target.value && salvaCatTranscodifica(customer, mc, e.target.value === '__null__' ? null : e.target.value)}
+                className="text-xs border border-gray-300 rounded-lg px-2 py-1.5 bg-white max-w-xs">
+                <option value="">— scegli prodotto —</option>
+                <option value="__null__">Nessun prodotto (escludi)</option>
+                {candidati.map(a => (
+                  <option key={a.internal_id} value={a.codice}>{a.codice} · cliente {a.customer_id || '—'}{a.customer_id === customer ? ' ✓' : ''}</option>
+                ))}
+              </select>
+            );
+          };
+          return (
+            <div className="space-y-5">
+              <div>
+                <h2 className="text-lg font-black text-gray-800">🏷️ Catalogazione</h2>
+                <p className="text-xs text-gray-500">Confronto del catalogato con la giacenza NS: Inventory Transfer per le matricole presenti fuori destinazione, Return Authorization per quelle assenti.</p>
+              </div>
+              {renderGiacenzaNS('catalogazione', () => { fetchInvRiepilogo(); fetchCatConfig(); })}
+
+              <div className="flex gap-1 bg-gray-100 p-1 rounded-xl w-fit">
+                {[
+                  { id: 'analisi', label: '🔍 Analisi' },
+                  { id: 'storico', label: '📜 Storico export', n: catStorico.length },
+                  { id: 'impostazioni', label: '⚙️ Impostazioni' },
+                ].map(t => (
+                  <button key={t.id} onClick={() => setCatTab(t.id)}
+                    className={`text-xs font-bold px-4 py-2 rounded-lg cursor-pointer transition ${catTab === t.id ? 'bg-white text-gray-800 shadow-xs' : 'text-gray-500 hover:text-gray-700'}`}>
+                    {t.label}{t.n != null && <span className="ml-1 text-[10px] opacity-70">({t.n})</span>}
+                  </button>
+                ))}
+              </div>
+
+              {catTab === 'analisi' && (
+                <div className="space-y-4">
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <label className={`bg-blue-600 hover:bg-blue-700 text-white text-sm font-bold px-4 py-2.5 rounded-xl cursor-pointer transition shadow-xs ${catLoading ? 'opacity-50 pointer-events-none' : ''}`}>
+                      {catLoading ? 'Analisi in corso…' : '📂 Carica catalogato (CSV)'}
+                      <input type="file" accept=".csv,text/csv" className="hidden" onChange={handleCatalogatoUpload} />
+                    </label>
+                    {an && (
+                      <>
+                        <button onClick={() => analizzaCatalogato()} disabled={catLoading}
+                          className="bg-gray-100 hover:bg-gray-200 text-gray-700 text-sm font-bold px-4 py-2.5 rounded-xl cursor-pointer transition disabled:opacity-50">
+                          ↻ Rianalizza
+                        </button>
+                        <button onClick={scaricaCatDettaglio}
+                          className="bg-gray-100 hover:bg-gray-200 text-gray-700 text-sm font-bold px-4 py-2.5 rounded-xl cursor-pointer transition">
+                          ⬇️ Dettaglio Excel
+                        </button>
+                        <button onClick={esportaCatalogazione} disabled={bloccato || catLoading}
+                          title={bloccato ? 'Export bloccato: risolvere gli errori' : ''}
+                          className="bg-green-600 hover:bg-green-700 text-white text-sm font-bold px-4 py-2.5 rounded-xl cursor-pointer transition shadow-xs disabled:opacity-40 disabled:cursor-not-allowed">
+                          📤 Esporta IT + RA ({daEsportare.length} documenti)
+                        </button>
+                      </>
+                    )}
+                  </div>
+
+                  {!an ? (
+                    <div className="text-center py-16 text-gray-400 text-sm">Carica il CSV del catalogato per avviare il confronto con la giacenza NS.</div>
+                  ) : (
+                    <>
+                      <p className="text-xs text-gray-500">
+                        <strong>{catFile}</strong> · {an.righe.length.toLocaleString('it-IT')} matricole · analizzato sulla giacenza NS del {fmt(catGiacenzaAt)}
+                      </p>
+                      {giacenzaCambiata && (
+                        <div className="bg-amber-50 border border-amber-200 text-amber-800 text-sm font-bold rounded-xl px-4 py-3">
+                          La giacenza NS è cambiata dopo l'analisi: premi “Rianalizza” prima di esportare.
+                        </div>
+                      )}
+
+                      <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-8 gap-2">
+                        {[
+                          { id: 'IT', label: 'Transfer (IT)', n: an.n.IT, sub: `${an.docs.filter(d => d.tipo === 'IT').length} doc`, cls: 'text-blue-700' },
+                          { id: 'RA', label: 'Return (RA)', n: an.n.RA, sub: `${an.docs.filter(d => d.tipo === 'RA').length} doc`, cls: 'text-purple-700' },
+                          { id: 'nessuna', label: 'Nessuna azione', n: an.n.nessuna, cls: 'text-green-700' },
+                          { id: 'ignorata', label: 'Ignorate', n: an.n.ignorata, cls: 'text-gray-500' },
+                          { id: 'esclusa', label: 'Escluse', n: an.n.esclusa, cls: 'text-gray-500' },
+                          { id: 'scartata', label: 'Doppioni scartati', n: an.n.scartata, cls: 'text-gray-400' },
+                          { id: 'errori', label: 'Con errori', n: an.conErrori.length, cls: an.conErrori.length ? 'text-red-600' : 'text-gray-400' },
+                          { id: 'tutte', label: 'Totale', n: an.righe.length, cls: 'text-gray-800' },
+                        ].map(c => (
+                          <button key={c.id} onClick={() => setCatFiltro(c.id)}
+                            className={`text-left bg-white border rounded-xl px-3 py-2.5 cursor-pointer transition ${catFiltro === c.id ? 'border-blue-500 ring-2 ring-blue-100' : 'border-gray-200 hover:border-gray-300'}`}>
+                            <p className="text-[10px] font-bold uppercase text-gray-400">{c.label}</p>
+                            <p className={`text-xl font-black ${c.cls}`}>{c.n.toLocaleString('it-IT')}</p>
+                            {c.sub && <p className="text-[10px] text-gray-400">{c.sub}</p>}
+                          </button>
+                        ))}
+                      </div>
+
+                      {an.conErrori.length > 0 ? (
+                        <div className="bg-red-50 border border-red-200 rounded-xl px-4 py-3 space-y-1">
+                          <p className="text-sm font-black text-red-700">⛔ Export bloccato: {an.conErrori.length} matricole con errori</p>
+                          <div className="flex flex-wrap gap-2">
+                            {Object.entries(an.erroriPerTipo).map(([t, n]) => (
+                              <span key={t} className="text-xs font-bold bg-white border border-red-200 text-red-700 rounded-lg px-2 py-1">{CAT_ERRORI[t]}: {n}</span>
+                            ))}
+                          </div>
+                        </div>
+                      ) : (
+                        <div className="bg-green-50 border border-green-200 text-green-800 text-sm font-bold rounded-xl px-4 py-3">
+                          ✓ Nessun errore bloccante · {daEsportare.length} documenti da esportare{an.docs.length > daEsportare.length ? ` · ${an.docs.length - daEsportare.length} già esportati (saltati)` : ''}
+                        </div>
+                      )}
+
+                      {an.transcMancanti.length > 0 && (
+                        <div className="bg-white border border-gray-200 rounded-xl p-4 space-y-2">
+                          <p className="text-sm font-black text-gray-800">Transcodifiche pot_ da scegliere</p>
+                          <p className="text-xs text-gray-500">Customer ID + Main Component → prodotto. La scelta viene salvata e resta modificabile nelle Impostazioni.</p>
+                          {an.transcMancanti.map(t => (
+                            <div key={`${t.customer}|${t.mc}`} className="flex items-center gap-3 flex-wrap border-t border-gray-100 pt-2">
+                              <span className="text-xs font-bold text-gray-700 min-w-[16rem]">Cliente {t.customer} · <span className="font-mono">{t.mc}</span> <span className="text-gray-400 font-normal">({t.n} matricole)</span></span>
+                              {selectTranscodifica(t.customer, t.mc, undefined)}
+                            </div>
+                          ))}
+                        </div>
+                      )}
+
+                      {an.doppioni.length > 0 && (
+                        <div className="bg-white border border-gray-200 rounded-xl p-4 space-y-2">
+                          <p className="text-sm font-black text-gray-800">Matricole ripetute nel catalogato: scegli la riga corretta</p>
+                          {an.doppioni.map(d => (
+                            <div key={d.serial} className="border-t border-gray-100 pt-2">
+                              <p className="text-xs font-mono font-bold text-gray-700">{d.serial}</p>
+                              {d.righe.map((r, k) => (
+                                <label key={d.indici[k]} className="flex items-center gap-2 text-xs text-gray-600 cursor-pointer py-0.5">
+                                  <input type="radio" name={`dup-${d.serial}`} checked={catDupScelte[d.serial] === d.indici[k]}
+                                    onChange={() => setCatDupScelte(prev => ({ ...prev, [d.serial]: d.indici[k] }))} className="accent-blue-600" />
+                                  {r.externalId} · {r.date} · cliente {r.customer} · {r.item} · {r.ref}
+                                </label>
+                              ))}
+                            </div>
+                          ))}
+                        </div>
+                      )}
+
+                      <div className="flex items-center gap-2 flex-wrap">
+                        <input value={catSearch} onChange={e => setCatSearch(e.target.value)} placeholder="Cerca matricola, cliente, articolo, IDext…"
+                          className="text-sm border border-gray-300 rounded-xl px-3 py-2 w-80 max-w-full" />
+                        <span className="text-xs text-gray-400">
+                          {righeVis.length.toLocaleString('it-IT')} righe{righeVis.length > 500 ? ' (visualizzate le prime 500, tutte nel dettaglio Excel)' : ''}
+                        </span>
+                      </div>
+                      <div className="bg-white border border-gray-200 rounded-xl overflow-x-auto">
+                        <table className="w-full text-xs">
+                          <thead className="bg-gray-50 text-gray-500 uppercase text-[10px]">
+                            <tr>
+                              {['Matricola', 'Cliente', 'Data', 'Item catalogato', 'Prodotto', 'Magazzino NS', 'Destinazione', 'Esito', 'IDext', 'Errori'].map(h => (
+                                <th key={h} className="px-3 py-2 text-left font-black whitespace-nowrap">{h}</th>
+                              ))}
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {righeVis.slice(0, 500).map(r => (
+                              <tr key={r.i} className={`border-t border-gray-100 ${r.errori.length ? 'bg-red-50/50' : ''}`}>
+                                <td className="px-3 py-1.5 font-mono">{r.serial}</td>
+                                <td className="px-3 py-1.5">{r.customer}{r.ripax && <span className="ml-1 text-[9px] font-black text-amber-600">RIPAX</span>}</td>
+                                <td className="px-3 py-1.5 whitespace-nowrap">{r.date}</td>
+                                <td className="px-3 py-1.5 font-mono">{r.item}</td>
+                                <td className="px-3 py-1.5 font-mono">{r.prodotto}</td>
+                                <td className="px-3 py-1.5 whitespace-nowrap">{r.origine || <span className="text-gray-300">non in giacenza</span>}</td>
+                                <td className="px-3 py-1.5 whitespace-nowrap">{r.destinazione}</td>
+                                <td className="px-3 py-1.5">
+                                  <span className={`text-[10px] font-bold border rounded px-1.5 py-0.5 whitespace-nowrap ${CAT_ESITI[r.esito]?.cls || ''}`}>{CAT_ESITI[r.esito]?.label}</span>
+                                </td>
+                                <td className="px-3 py-1.5 font-mono whitespace-nowrap">{r.idext}</td>
+                                <td className="px-3 py-1.5 text-red-700">{r.errori.map(e => e.msg).join(' · ')}</td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    </>
+                  )}
+                </div>
+              )}
+
+              {catTab === 'storico' && (
+                <div className="bg-white border border-gray-200 rounded-xl overflow-x-auto">
+                  {catStorico.length === 0 ? (
+                    <div className="text-center py-16 text-gray-400 text-sm">Nessun export registrato.</div>
+                  ) : (
+                    <table className="w-full text-xs">
+                      <thead className="bg-gray-50 text-gray-500 uppercase text-[10px]">
+                        <tr>
+                          {['Esportato il', 'Da', 'IDext', 'Tipo', 'Cliente', 'Data cat.', 'Origine', 'Destinazione', 'Righe', 'Matricole', 'Giacenza NS del', 'File'].map(h => (
+                            <th key={h} className="px-3 py-2 text-left font-black whitespace-nowrap">{h}</th>
+                          ))}
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {catStorico.map(s => (
+                          <tr key={s.id} className="border-t border-gray-100">
+                            <td className="px-3 py-1.5 whitespace-nowrap">{fmt(s.esportato_at)}</td>
+                            <td className="px-3 py-1.5">{s.esportato_da || ''}</td>
+                            <td className="px-3 py-1.5 font-mono whitespace-nowrap">{s.idext}</td>
+                            <td className="px-3 py-1.5"><span className={`text-[10px] font-bold border rounded px-1.5 py-0.5 ${CAT_ESITI[s.tipo]?.cls || ''}`}>{s.tipo}</span></td>
+                            <td className="px-3 py-1.5">{s.cliente}</td>
+                            <td className="px-3 py-1.5 whitespace-nowrap">{new Date(s.data_catalogazione).toLocaleDateString('it-IT')}</td>
+                            <td className="px-3 py-1.5 whitespace-nowrap">{s.magazzino_origine || ''}</td>
+                            <td className="px-3 py-1.5 whitespace-nowrap">{s.magazzino_destinazione}</td>
+                            <td className="px-3 py-1.5 text-right">{s.n_righe}</td>
+                            <td className="px-3 py-1.5 text-right">{s.n_matricole}</td>
+                            <td className="px-3 py-1.5 whitespace-nowrap">{fmt(s.giacenza_at)}</td>
+                            <td className="px-3 py-1.5">{s.file_catalogato || ''}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  )}
+                </div>
+              )}
+
+              {catTab === 'impostazioni' && (
+                <div className="space-y-4">
+                  <div className="bg-white border border-gray-200 rounded-xl p-4 space-y-3">
+                    <p className="text-sm font-black text-gray-800">Destinazioni</p>
+                    <label className="block text-xs font-bold text-gray-600">
+                      Clienti RIPAX (Customer ID separati da virgola)
+                      <input value={catImpDraft.clienti} disabled={!canEdit('catalogazione')} onChange={e => setCatImpDraft(p => ({ ...p, clienti: e.target.value }))}
+                        className="mt-1 block w-full text-sm font-normal border border-gray-300 rounded-lg px-3 py-2" />
+                    </label>
+                    <div className="grid md:grid-cols-2 gap-3">
+                      <label className="block text-xs font-bold text-gray-600">
+                        Magazzino destinazione clienti RIPAX
+                        <input value={catImpDraft.magazzino_ripax} disabled={!canEdit('catalogazione')} onChange={e => setCatImpDraft(p => ({ ...p, magazzino_ripax: e.target.value }))}
+                          list="cat-magazzini" className="mt-1 block w-full text-sm font-normal border border-gray-300 rounded-lg px-3 py-2" />
+                      </label>
+                      <label className="block text-xs font-bold text-gray-600">
+                        Magazzino destinazione altri clienti (RIP)
+                        <input value={catImpDraft.magazzino_rip} disabled={!canEdit('catalogazione')} onChange={e => setCatImpDraft(p => ({ ...p, magazzino_rip: e.target.value }))}
+                          list="cat-magazzini" className="mt-1 block w-full text-sm font-normal border border-gray-300 rounded-lg px-3 py-2" />
+                      </label>
+                      <datalist id="cat-magazzini">{magazzini.map(m => <option key={m} value={m} />)}</datalist>
+                    </div>
+                    {canEdit('catalogazione') && (
+                      <button onClick={salvaCatImpostazioni} className="bg-blue-600 hover:bg-blue-700 text-white text-sm font-bold px-4 py-2 rounded-xl cursor-pointer transition">Salva</button>
+                    )}
+                  </div>
+
+                  <div className="bg-white border border-gray-200 rounded-xl p-4 space-y-3">
+                    <div>
+                      <p className="text-sm font-black text-gray-800">Regole magazzino origine → destinazione</p>
+                      <p className="text-xs text-gray-500">Senza regola, una matricola presente in un altro magazzino genera un Inventory Transfer.</p>
+                    </div>
+                    {canEdit('catalogazione') && (
+                      <div className="flex items-center gap-2 flex-wrap">
+                        <select value={catNuovaRegola.magazzino_origine} onChange={e => setCatNuovaRegola(p => ({ ...p, magazzino_origine: e.target.value }))}
+                          className="text-xs border border-gray-300 rounded-lg px-2 py-2 bg-white">
+                          <option value="">— magazzino origine —</option>
+                          {magazzini.map(m => <option key={m} value={m}>{m}</option>)}
+                        </select>
+                        <span className="text-gray-400">→</span>
+                        <select value={catNuovaRegola.magazzino_destinazione} onChange={e => setCatNuovaRegola(p => ({ ...p, magazzino_destinazione: e.target.value }))}
+                          className="text-xs border border-gray-300 rounded-lg px-2 py-2 bg-white">
+                          <option value="">— destinazione —</option>
+                          {destinazioni.map(m => <option key={m} value={m}>{m}</option>)}
+                        </select>
+                        <select value={catNuovaRegola.azione} onChange={e => setCatNuovaRegola(p => ({ ...p, azione: e.target.value }))}
+                          className="text-xs border border-gray-300 rounded-lg px-2 py-2 bg-white">
+                          <option value="da_verificare">Da verificare (blocca l'export)</option>
+                          <option value="ignora">Ignora (nessun trasferimento)</option>
+                        </select>
+                        <button onClick={aggiungiCatRegola} disabled={!catNuovaRegola.magazzino_origine || !catNuovaRegola.magazzino_destinazione}
+                          className="bg-blue-600 hover:bg-blue-700 text-white text-xs font-bold px-3 py-2 rounded-lg cursor-pointer transition disabled:opacity-40">+ Aggiungi</button>
+                      </div>
+                    )}
+                    {catRegole.length === 0 ? (
+                      <p className="text-xs text-gray-400">Nessuna regola.</p>
+                    ) : (
+                      <table className="w-full text-xs">
+                        <tbody>
+                          {catRegole.map(r => (
+                            <tr key={r.id} className="border-t border-gray-100">
+                              <td className="py-1.5">{r.magazzino_origine}</td>
+                              <td className="py-1.5 text-gray-400">→</td>
+                              <td className="py-1.5">{r.magazzino_destinazione}</td>
+                              <td className="py-1.5 font-bold">{r.azione === 'ignora' ? 'Ignora' : 'Da verificare'}</td>
+                              <td className="py-1.5 text-gray-400">{r.updated_by || ''}</td>
+                              <td className="py-1.5 text-right">
+                                {canEdit('catalogazione') && <button onClick={() => eliminaCatRegola(r)} className="text-red-500 hover:text-red-700 font-bold cursor-pointer">Elimina</button>}
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    )}
+                  </div>
+
+                  <div className="bg-white border border-gray-200 rounded-xl p-4 space-y-3">
+                    <div>
+                      <p className="text-sm font-black text-gray-800">Transcodifiche pot_ ({catTranscodifiche.length})</p>
+                      <p className="text-xs text-gray-500">Customer ID + Main Component → prodotto in Anagrafica. “Nessun prodotto” esclude le matricole dagli export.</p>
+                    </div>
+                    {catTranscodifiche.length === 0 ? (
+                      <p className="text-xs text-gray-400">Nessuna transcodifica salvata.</p>
+                    ) : (
+                      <table className="w-full text-xs">
+                        <tbody>
+                          {[...catTranscodifiche].sort((a, b) => a.customer_id.localeCompare(b.customer_id) || a.main_component.localeCompare(b.main_component)).map(t => (
+                            <tr key={`${t.customer_id}|${t.main_component}`} className="border-t border-gray-100">
+                              <td className="py-1.5">Cliente {t.customer_id}</td>
+                              <td className="py-1.5 font-mono">{t.main_component}</td>
+                              <td className="py-1.5">{selectTranscodifica(t.customer_id, t.main_component, t.prodotto)}</td>
+                              <td className="py-1.5 text-gray-400">{t.updated_by || ''}</td>
+                              <td className="py-1.5 text-right">
+                                {canEdit('catalogazione') && <button onClick={() => eliminaCatTranscodifica(t)} className="text-red-500 hover:text-red-700 font-bold cursor-pointer">Elimina</button>}
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    )}
+                  </div>
+                </div>
+              )}
+            </div>
+          );
+        })()}
+
         {activeModule === 'prelievi' && prelievoView === 'list' && (
           <div className="space-y-5">
             <div className="flex items-center justify-between">
@@ -9078,23 +9835,22 @@ export default function App() {
               // Riepilogo per codice: la quantità attesa è la SOMMA delle righe con lo stesso codice
               // Arrivo Manuale: nessun piano di riferimento, quindi nessun "atteso" da rispettare
               const invoiceLines = arrivoManualMode ? [] : poLines.filter(l => l.china_invoice === arrivoQtyInvoice && l.sn_required === false);
+              // caricata = qty_loaded delle righe (già riflette TUTTI i carton_arrivals, pending+caricato,
+              // quindi anche i codici completati in sessioni precedenti che qui non hanno righe pending)
               const attesaByCodice = {};
+              const caricataByCodice = {};
               invoiceLines.forEach(l => {
                 const q = l.qty_expected || 0;
+                const loaded = l.qty_loaded || 0;
                 const ic = (l.item_code || '').trim();
                 const pnr = (l.part_number || '').trim();
-                if (ic) attesaByCodice[ic] = (attesaByCodice[ic] || 0) + q;
-                if (pnr && pnr !== ic) attesaByCodice[pnr] = (attesaByCodice[pnr] || 0) + q;
+                if (ic) { attesaByCodice[ic] = (attesaByCodice[ic] || 0) + q; caricataByCodice[ic] = (caricataByCodice[ic] || 0) + loaded; }
+                if (pnr && pnr !== ic) { attesaByCodice[pnr] = (attesaByCodice[pnr] || 0) + q; caricataByCodice[pnr] = (caricataByCodice[pnr] || 0) + loaded; }
               });
+              const codici = new Set([...arrivoQtyCartoni.map(c => c.codice), ...invoiceLines.map(l => l.item_code || l.part_number)]);
               const summary = {};
-              arrivoQtyCartoni.forEach(c => {
-                if (!summary[c.codice]) summary[c.codice] = { caricata: 0, attesa: attesaByCodice[c.codice] || 0 };
-                summary[c.codice].caricata += c.quantita || 0;
-              });
-              // Righe dell'invoice non ancora toccate
-              invoiceLines.forEach(l => {
-                const codice = l.item_code || l.part_number;
-                if (!summary[codice]) summary[codice] = { caricata: 0, attesa: attesaByCodice[codice] || 0 };
+              codici.forEach(codice => {
+                summary[codice] = { caricata: caricataByCodice[codice] || 0, attesa: attesaByCodice[codice] || 0 };
               });
               const invoiceComplete = arrivoManualMode || Object.values(summary).every(({ caricata, attesa }) => attesa > 0 && caricata >= attesa);
               return (
