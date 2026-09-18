@@ -9851,9 +9851,10 @@ export default function App() {
                 if (pnr && pnr !== ic) { attesaByCodice[pnr] = (attesaByCodice[pnr] || 0) + q; caricataByCodice[pnr] = (caricataByCodice[pnr] || 0) + loaded; }
               });
               const codici = new Set([...arrivoQtyCartoni.map(c => c.codice), ...invoiceLines.map(l => l.item_code || l.part_number)]);
+              const codiciSessione = new Set(arrivoQtyCartoni.map(c => c.codice));
               const summary = {};
               codici.forEach(codice => {
-                summary[codice] = { caricata: caricataByCodice[codice] || 0, attesa: attesaByCodice[codice] || 0 };
+                summary[codice] = { caricata: caricataByCodice[codice] || 0, attesa: attesaByCodice[codice] || 0, inSessione: codiciSessione.has(codice) };
               });
               const invoiceComplete = arrivoManualMode || Object.values(summary).every(({ caricata, attesa }) => attesa > 0 && caricata >= attesa);
               return (
@@ -9867,7 +9868,7 @@ export default function App() {
                 </button>
                 {riepCodiceOpen && (
                   <div className="divide-y divide-gray-100">
-                    {Object.entries(summary).map(([codice, { caricata, attesa }]) => {
+                    {Object.entries(summary).map(([codice, { caricata, attesa, inSessione }]) => {
                       if (arrivoManualMode) return (
                         <div key={codice} className="flex items-center justify-between px-4 py-2.5 bg-gray-50">
                           <span className="font-mono font-bold text-sm text-gray-800">{codice}</span>
@@ -9875,15 +9876,21 @@ export default function App() {
                         </div>
                       );
                       const status = caricata === attesa ? 'ok' : caricata < attesa ? 'under' : 'over';
+                      // Completato ma non toccato in questa sessione: già caricato in precedenza
+                      const gia = status === 'ok' && !inSessione;
                       return (
-                        <div key={codice} className={`flex items-center justify-between px-4 py-2.5 ${status === 'under' ? 'bg-yellow-50' : status === 'over' ? 'bg-red-50' : 'bg-green-50'}`}>
+                        <div key={codice} className={`flex items-center justify-between px-4 py-2.5 ${gia ? 'bg-slate-50' : status === 'under' ? 'bg-yellow-50' : status === 'over' ? 'bg-red-50' : 'bg-green-50'}`}>
                           <span className="font-mono font-bold text-sm text-gray-800">{codice}</span>
                           <div className="flex items-center gap-3">
                             <span className="text-xs text-gray-500">Attesi: <strong>{attesa}</strong></span>
-                            <span className={`text-sm font-black ${status === 'under' ? 'text-yellow-700' : status === 'over' ? 'text-red-700' : 'text-green-700'}`}>
+                            <span className={`text-sm font-black ${gia ? 'text-slate-500' : status === 'under' ? 'text-yellow-700' : status === 'over' ? 'text-red-700' : 'text-green-700'}`}>
                               Caricati: {caricata}
                             </span>
-                            <span className="text-base">{status === 'ok' ? '✅' : status === 'under' ? '🟡' : '🔴'}</span>
+                            {gia ? (
+                              <span className="text-[9px] font-black text-slate-500 bg-slate-100 border border-slate-200 px-1.5 py-0.5 rounded-md uppercase tracking-wide whitespace-nowrap" title="Completato in una sessione precedente, non toccato ora">🔒 Già caricato</span>
+                            ) : (
+                              <span className="text-base">{status === 'ok' ? '✅' : status === 'under' ? '🟡' : '🔴'}</span>
+                            )}
                           </div>
                         </div>
                       );
