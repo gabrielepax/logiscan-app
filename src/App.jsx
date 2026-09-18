@@ -6692,9 +6692,13 @@ export default function App() {
           // la fonte sbagliata, ma Anagrafica resta la fonte di verità sulla natura dell'articolo).
           const isAccessorio = (s) => s.fonte === 'accessori' || String(anagByCodice[s.codice]?.cluster || '').trim().toLowerCase() === 'accessories';
 
-          // Stock totale per codice (esclude gli accessori, che vivono nella vista ACC)
+          // Un codice è "conto lavoro cliente" se contiene "CL-" (es. DOJOCL-..., HERTZCL-..., ICACL-...):
+          // vive nella vista CLI dedicata, non in quella SPARE/PNIT generica.
+          const isClienteCL = (codice) => String(codice || '').includes('CL-');
+
+          // Stock totale per codice (esclude accessori e conto lavoro cliente, che vivono in viste dedicate)
           const stockByCodice = {};
-          stockItems.forEach(s => { if (s.stock > 0 && !isAccessorio(s)) stockByCodice[s.codice] = (stockByCodice[s.codice] || 0) + s.stock; });
+          stockItems.forEach(s => { if (s.stock > 0 && !isAccessorio(s) && !isClienteCL(s.codice)) stockByCodice[s.codice] = (stockByCodice[s.codice] || 0) + s.stock; });
 
           // IN ARRIVO per codice: dal Piano Arrivi (po_lines), somma qty_expected per item_code
           const arrivoByCodice = {};
@@ -6758,6 +6762,42 @@ export default function App() {
             }
           });
 
+          // Vista CLI: "conto lavoro cliente" — codici che contengono "CL-" (es. DOJOCL-..., HERTZCL-...).
+          // Raggruppamento a due livelli: Cliente (prefisso prima di "CL-") → SPARE (TYPE da Compatibilità).
+          const cliByCodice = {};
+          stockItems.forEach(s => { if (s.stock > 0 && !isAccessorio(s) && isClienteCL(s.codice)) cliByCodice[s.codice] = (cliByCodice[s.codice] || 0) + s.stock; });
+          const cliCodiciBase = riepMostraZeroStock
+            ? new Set([...Object.keys(cliByCodice), ...Object.keys(pnInfo).filter(isClienteCL)])
+            : new Set(Object.keys(cliByCodice));
+          const qCli = riepSearch.trim().toLowerCase();
+          const cliGroups = {};
+          [...cliCodiciBase].forEach(c => {
+            const inf = pnInfo[c] || { type: '', descrizione: '', ref: '', rplus: '', eol: '' };
+            const idxCl = c.indexOf('CL-');
+            const cliente = idxCl > 0 ? c.slice(0, idxCl) : '—';
+            const type = inf.type || '—';
+            const stock = cliByCodice[c] || 0;
+            const inArrivo = arrivoByCodice[c] || 0;
+            const inOrdine = ordini[c]?.in_ordine || 0;
+            if (qCli) {
+              const hay = `${c} ${cliente} ${type} ${inf.descrizione || descByCodice[c] || ''}`.toLowerCase();
+              if (!hay.includes(qCli)) return;
+            }
+            if (!cliGroups[cliente]) cliGroups[cliente] = { key: cliente, cliente, totale: 0, inArrivo: 0, inOrdine: 0, nCodici: 0, types: {} };
+            const cg = cliGroups[cliente];
+            cg.totale += stock; cg.inArrivo += inArrivo; cg.inOrdine += inOrdine; cg.nCodici += 1;
+            if (!cg.types[type]) cg.types[type] = { key: `${cliente}||${type}`, type, totale: 0, inArrivo: 0, inOrdine: 0, codici: [] };
+            const tg = cg.types[type];
+            tg.totale += stock; tg.inArrivo += inArrivo; tg.inOrdine += inOrdine;
+            tg.codici.push({ codice: c, descrizione: inf.descrizione || descByCodice[c] || '', ref: inf.ref, rplus: inf.rplus, eol: inf.eol, stock, inArrivo, inOrdine });
+          });
+          const cliGroupList = Object.values(cliGroups)
+            .map(g => ({ ...g, typeList: Object.values(g.types).sort((a, b) => a.type.localeCompare(b.type)) }))
+            .sort((a, b) => a.cliente.localeCompare(b.cliente));
+          const cliCodiciCount = cliCodiciBase.size;
+          const cliTotale = [...cliCodiciBase].reduce((s, c) => s + (cliByCodice[c] || 0), 0);
+          const cliArrivo = [...cliCodiciBase].reduce((s, c) => s + (arrivoByCodice[c] || 0), 0);
+
           // Liste filtri CONNESSE: la selezione su un filtro restringe le opzioni dell'altro
           const tuttiModelli = new Set();
           const tuttiPnit = new Set();
@@ -6777,7 +6817,7 @@ export default function App() {
           const q = riepSearch.trim().toLowerCase();
           // Base codici: solo quelli con stock, oppure anche i codici noti in Compatibilità ma a stock zero
           const codiciBase = riepMostraZeroStock
-            ? new Set([...Object.keys(stockByCodice), ...Object.keys(pnInfo)])
+            ? new Set([...Object.keys(stockByCodice), ...Object.keys(pnInfo).filter(c => !isClienteCL(c))])
             : new Set(Object.keys(stockByCodice));
           // Costruisci elenco codici con stock, applicando filtri
           const codici = [...codiciBase].filter(c => {
@@ -6787,7 +6827,7 @@ export default function App() {
             if (riepFilterModello && !inf.models.has(riepFilterModello)) return false;
             if (riepFilterPnit && !inf.pnits.has(riepFilterPnit)) return false;
             if (q) {
-              const hay = `${c} ${inf.type} ${inf.descrizione} ${[...inf.models].join(' ')} ${[...inf.gruppi].join(' ')} ${[...inf.pnits].join(' ')}`.toLowerCase();
+              const hay = `${c} ${inf.type} ${inf.descrizione || descByCodice[c] || ''} ${[...inf.models].join(' ')} ${[...inf.gruppi].join(' ')} ${[...inf.pnits].join(' ')}`.toLowerCase();
               if (!hay.includes(q)) return false;
             }
             return true;
@@ -6821,7 +6861,7 @@ export default function App() {
               mg.totale += stock;
               mg.inArrivo += inArrivo;
               mg.inOrdine += inOrdine;
-              mg.codici.push({ codice: c, descrizione: inf.descrizione, ref: inf.ref, rplus: inf.rplus, eol: inf.eol, modello: gruppoLabel, stock, inArrivo, inOrdine });
+              mg.codici.push({ codice: c, descrizione: inf.descrizione || descByCodice[c] || '', ref: inf.ref, rplus: inf.rplus, eol: inf.eol, modello: gruppoLabel, stock, inArrivo, inOrdine });
             });
           });
           const groupList = Object.values(groups)
@@ -6833,7 +6873,7 @@ export default function App() {
           const totOrdine = codici.reduce((s, c) => s + (ordini[c]?.in_ordine || 0), 0);
 
           const toggleGroup = (key) => setRiepExpanded(prev => { const n = new Set(prev); if (n.has(key)) n.delete(key); else n.add(key); return n; });
-          const isFlatView = riepGroupMode === 'acc';
+          const isFlatView = riepGroupMode === 'acc' || riepGroupMode === 'cli';
 
           return (
             <div className="space-y-5">
@@ -6869,7 +6909,7 @@ export default function App() {
                     </>
                   )}
                   <input value={riepSearch} onChange={e => setRiepSearch(e.target.value)}
-                    placeholder={riepGroupMode === 'acc' ? 'Cerca per codice, descrizione...' : 'Cerca per type, codice, descrizione...'}
+                    placeholder={isFlatView ? 'Cerca per codice, descrizione...' : 'Cerca per type, codice, descrizione...'}
                     className="flex-grow min-w-[200px] bg-gray-50 border border-gray-300 rounded-xl p-2.5 text-xs focus:outline-hidden" />
                   {!isFlatView && (
                     <>
@@ -6881,11 +6921,13 @@ export default function App() {
                         <input type="checkbox" checked={riepFilterRplus} onChange={e => setRiepFilterRplus(e.target.checked)} className="w-4 h-4 accent-blue-600 cursor-pointer" />
                         <span className="text-xs font-semibold text-gray-700">Solo R+</span>
                       </label>
-                      <label className="flex items-center gap-2 cursor-pointer">
-                        <input type="checkbox" checked={riepMostraZeroStock} onChange={e => { setRiepMostraZeroStock(e.target.checked); setRiepExpanded(new Set()); }} className="w-4 h-4 accent-blue-600 cursor-pointer" />
-                        <span className="text-xs font-semibold text-gray-700">Mostra anche senza stock</span>
-                      </label>
                     </>
+                  )}
+                  {riepGroupMode !== 'acc' && (
+                    <label className="flex items-center gap-2 cursor-pointer">
+                      <input type="checkbox" checked={riepMostraZeroStock} onChange={e => { setRiepMostraZeroStock(e.target.checked); setRiepExpanded(new Set()); }} className="w-4 h-4 accent-blue-600 cursor-pointer" />
+                      <span className="text-xs font-semibold text-gray-700">Mostra anche senza stock</span>
+                    </label>
                   )}
                   <button onClick={() => {
                     if (riepGroupMode === 'acc') {
@@ -6897,6 +6939,17 @@ export default function App() {
                       const wb = XLSX.utils.book_new();
                       XLSX.utils.book_append_sheet(wb, ws, 'ACC');
                       XLSX.writeFile(wb, `stock_spare_parts_acc_${rows.length}.xlsx`);
+                    } else if (riepGroupMode === 'cli') {
+                      const rows = [];
+                      cliGroupList.forEach(g => g.typeList.forEach(tg => tg.codici.forEach(c => rows.push({
+                        'Cliente': g.cliente, 'SPARE': tg.type, 'Codice': c.codice, 'Descrizione': c.descrizione,
+                        'EOL': c.eol || '', 'REF': c.ref === 'X' ? 'X' : '', 'R+': c.rplus === 'X' ? 'X' : '',
+                        'Stock': c.stock, 'In arrivo': c.inArrivo, 'In ordine': c.inOrdine,
+                      }))));
+                      const ws = XLSX.utils.json_to_sheet(rows);
+                      const wb = XLSX.utils.book_new();
+                      XLSX.utils.book_append_sheet(wb, ws, 'CLI');
+                      XLSX.writeFile(wb, `stock_spare_parts_cli_${rows.length}.xlsx`);
                     } else {
                       const rows = codici.map(c => {
                         const inf = pnInfo[c] || { type: '', pnits: new Set(), descrizione: '', ref: '', rplus: '', eol: '' };
@@ -6920,7 +6973,7 @@ export default function App() {
                     }
                   }}
                     className="text-xs font-bold px-3 py-2 rounded-xl bg-blue-50 hover:bg-blue-100 text-blue-700 border border-blue-200 cursor-pointer transition">
-                    📥 Esporta XLS ({riepGroupMode === 'acc' ? accList.length : codici.length})
+                    📥 Esporta XLS ({riepGroupMode === 'acc' ? accList.length : riepGroupMode === 'cli' ? cliCodiciCount : codici.length})
                   </button>
                   <button onClick={() => { setMissioniPanelOpen(true); fetchMissioni(); }}
                     className="ml-auto text-xs font-bold px-3 py-2 rounded-xl bg-amber-50 hover:bg-amber-100 text-amber-700 border border-amber-200 cursor-pointer transition">
@@ -6935,6 +6988,7 @@ export default function App() {
                         { id: 'type', label: 'SPARE → PNIT' },
                         { id: 'gruppo', label: 'PNIT → SPARE' },
                         { id: 'acc', label: 'ACC' },
+                        { id: 'cli', label: 'CLI' },
                       ].map(v => (
                         <button key={v.id} onClick={() => { setRiepGroupMode(v.id); setRiepExpanded(new Set()); }}
                           className={`text-[11px] font-bold px-3 py-1 rounded-md cursor-pointer transition ${riepGroupMode === v.id ? 'bg-white text-gray-800 shadow-xs' : 'text-gray-500 hover:text-gray-700'}`}>
@@ -6944,15 +6998,119 @@ export default function App() {
                     </div>
                     {riepGroupMode === 'acc'
                       ? <span>· {accList.length} accessori</span>
+                      : riepGroupMode === 'cli'
+                      ? <span>· {cliGroupList.length} clienti · {cliCodiciCount} codici</span>
                       : <span>· {groupList.length} {riepGroupMode === 'gruppo' ? 'PNIT' : 'SPARE'} · {codici.length} codici</span>}
                   </div>
                   {riepGroupMode === 'acc'
                     ? <span className="font-black text-blue-600">Stock: {accTotale} · <span className="text-emerald-600">In arrivo: {accArrivo}</span></span>
+                    : riepGroupMode === 'cli'
+                    ? <span className="font-black text-blue-600">Stock: {cliTotale} · <span className="text-emerald-600">In arrivo: {cliArrivo}</span></span>
                     : <span className="font-black text-blue-600">Stock: {totaleGenerale} · <span className="text-emerald-600">In arrivo: {totArrivo}</span> · <span className="text-amber-600">In ordine: {totOrdine}</span></span>}
                 </div>
               </div>
 
-              {riepGroupMode === 'acc' ? (
+              {riepGroupMode === 'cli' ? (
+                cliGroupList.length > 0 ? (
+                  <div className="bg-white rounded-2xl border border-gray-200 shadow-xs overflow-hidden">
+                    <table className="w-full text-left border-collapse text-xs">
+                      <thead className="bg-gray-50 border-b border-gray-200 text-[10px] font-black text-gray-500 uppercase tracking-wider">
+                        <tr>
+                          <th className="px-3 py-3 w-8"></th>
+                          <th className="px-3 py-3">Cliente</th>
+                          <th className="px-3 py-3 text-right">N. Codici</th>
+                          <th className="px-3 py-3 text-right">Stock Totale</th>
+                          <th className="px-3 py-3 text-right text-emerald-600">In arrivo</th>
+                          <th className="px-3 py-3 text-right text-amber-600">In ordine</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-gray-100">
+                        {cliGroupList.map(g => (
+                          <Fragment key={g.key}>
+                            <tr className="hover:bg-blue-50/50 transition cursor-pointer font-bold" onClick={() => toggleGroup(g.key)}>
+                              <td className="px-3 py-2.5 text-gray-400">{riepExpanded.has(g.key) ? '▾' : '▸'}</td>
+                              <td className="px-3 py-2.5 text-gray-700">{g.cliente}</td>
+                              <td className="px-3 py-2.5 text-right font-mono">{g.nCodici}</td>
+                              <td className="px-3 py-2.5 text-right font-mono font-black text-blue-700">{g.totale}</td>
+                              <td className="px-3 py-2.5 text-right font-mono font-black text-emerald-600">{g.inArrivo || ''}</td>
+                              <td className="px-3 py-2.5 text-right font-mono font-black text-amber-600">{g.inOrdine || ''}</td>
+                            </tr>
+                            {riepExpanded.has(g.key) && g.typeList.map(tg => (
+                              <Fragment key={tg.key}>
+                                <tr className="bg-indigo-50/40 hover:bg-indigo-50 transition cursor-pointer font-bold border-t border-indigo-100" onClick={() => toggleGroup(tg.key)}>
+                                  <td className="px-3 py-2 text-indigo-400 pl-8">{riepExpanded.has(tg.key) ? '▾' : '▸'}</td>
+                                  <td className="px-3 py-2 font-mono font-black text-indigo-800">{tg.type}</td>
+                                  <td className="px-3 py-2 text-right font-mono text-gray-500">{tg.codici.length}</td>
+                                  <td className="px-3 py-2 text-right font-mono font-black text-indigo-700">{tg.totale}</td>
+                                  <td className="px-3 py-2 text-right font-mono font-black text-emerald-600">{tg.inArrivo || ''}</td>
+                                  <td className="px-3 py-2 text-right font-mono font-black text-amber-600">{tg.inOrdine || ''}</td>
+                                </tr>
+                                {riepExpanded.has(tg.key) && (
+                                  <tr>
+                                    <td colSpan={6} className="p-0">
+                                      <table className="w-full text-[11px] bg-gray-50/60">
+                                        <thead className="text-[9px] font-black text-gray-400 uppercase">
+                                          <tr>
+                                            <th className="px-3 py-1.5 text-left pl-14">Codice</th>
+                                            <th className="px-3 py-1.5 text-left">Descrizione</th>
+                                            <th className="px-3 py-1.5 text-center">ST.</th>
+                                            <th className="px-3 py-1.5 text-center">REF</th>
+                                            <th className="px-3 py-1.5 text-center">R+</th>
+                                            <th className="px-3 py-1.5 text-right">Stock</th>
+                                            <th className="px-3 py-1.5 text-right text-emerald-600">In arrivo</th>
+                                            <th className="px-3 py-1.5 text-right text-amber-600">In ordine</th>
+                                            <th className="px-3 py-1.5 w-8"></th>
+                                          </tr>
+                                        </thead>
+                                        <tbody>
+                                          {tg.codici.sort((a, b) => b.stock - a.stock).map(c => (
+                                            <tr key={c.codice} className="border-t border-gray-100">
+                                              <td className="px-3 py-1.5 pl-14 font-mono font-bold text-blue-700">{c.codice}</td>
+                                              <td className="px-3 py-1.5 text-gray-600">{c.descrizione || '—'}</td>
+                                              <td className="px-3 py-1.5 text-center">
+                                                {c.eol ? <span className={`px-1 py-px rounded font-black text-[9px] border ${c.eol === 'EOL' ? 'bg-red-50 text-red-600 border-red-100' : c.eol === 'ALT' ? 'bg-amber-50 text-amber-700 border-amber-100' : 'bg-blue-50 text-blue-700 border-blue-100'}`}>{c.eol}</span> : ''}
+                                              </td>
+                                              <td className="px-3 py-1.5 text-center">{c.ref === 'X' ? '✓' : ''}</td>
+                                              <td className="px-3 py-1.5 text-center">{c.rplus === 'X' ? '✓' : ''}</td>
+                                              <td className="px-3 py-1.5 text-right font-mono font-black">{c.stock}</td>
+                                              <td className="px-3 py-1.5 text-right font-mono text-emerald-600">{c.inArrivo || ''}</td>
+                                              <td className="px-3 py-1.5 text-right font-mono text-amber-600">{c.inOrdine || ''}</td>
+                                              <td className="px-3 py-1.5">
+                                                <div className="flex items-center justify-center gap-1">
+                                                  <input type="number" min="1" max={c.stock}
+                                                    value={riepQtyDraft[c.codice] ?? ''}
+                                                    onChange={e => setRiepQtyDraft(prev => ({ ...prev, [c.codice]: e.target.value }))}
+                                                    onClick={e => e.stopPropagation()}
+                                                    onKeyDown={e => { if (e.key === 'Enter') { e.preventDefault(); addToCart(c.codice, c.descrizione, c.stock, riepQtyDraft[c.codice]); } }}
+                                                    placeholder="Qtà"
+                                                    disabled={!c.stock}
+                                                    className="w-12 text-center bg-white border border-gray-300 rounded-md p-1 text-[11px] font-bold focus:outline-hidden disabled:opacity-30" />
+                                                  <button onClick={e => { e.stopPropagation(); addToCart(c.codice, c.descrizione, c.stock, riepQtyDraft[c.codice]); }}
+                                                    disabled={!c.stock}
+                                                    title="Aggiungi al carrello"
+                                                    className="w-5 h-5 rounded-md bg-blue-50 hover:bg-blue-100 text-blue-600 font-black text-xs leading-none cursor-pointer disabled:opacity-30 disabled:cursor-not-allowed transition">
+                                                    +
+                                                  </button>
+                                                </div>
+                                              </td>
+                                            </tr>
+                                          ))}
+                                        </tbody>
+                                      </table>
+                                    </td>
+                                  </tr>
+                                )}
+                              </Fragment>
+                            ))}
+                          </Fragment>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                ) : (
+                  <div className="text-center py-16 text-gray-400 text-sm">Nessun codice conto lavoro cliente (CL-) da visualizzare.</div>
+                )
+              ) : riepGroupMode === 'acc' ? (
                 accList.length > 0 ? (
                   <div className="bg-white rounded-2xl border border-gray-200 shadow-xs overflow-hidden">
                     <table className="w-full text-left border-collapse text-xs">
