@@ -9498,19 +9498,22 @@ export default function App() {
                                 existing.forEach(c => { if (c.codice) recvByCode[c.codice] = (recvByCode[c.codice] || 0) + (c.quantita || 0); });
                                 setPoLines(prev => {
                                   const grpByCode = {};
+                                  const codOf = {}; // unique_key -> codice riconosciuto (solo se ha pending)
                                   prev.forEach(l => {
                                     if (l.sn_required || l.china_invoice !== group.invoice) return;
                                     const ic = (l.item_code || '').trim(), pnr = (l.part_number || '').trim();
                                     let cod = null;
                                     if (ic && recvByCode[ic] !== undefined) cod = ic; else if (pnr && recvByCode[pnr] !== undefined) cod = pnr;
-                                    if (cod) (grpByCode[cod] = grpByCode[cod] || []).push(l);
+                                    if (cod) { (grpByCode[cod] = grpByCode[cod] || []).push(l); codOf[l.unique_key] = cod; }
                                   });
                                   const byKey = {};
                                   Object.entries(grpByCode).forEach(([cod, grp]) => {
                                     const ordered = [...grp].sort(orderByLineId);
                                     distribuisciCarico(ordered, recvByCode[cod] || 0).forEach((a, i) => { byKey[ordered[i].unique_key] = a; });
                                   });
-                                  return prev.map(l => (l.china_invoice === group.invoice && !l.sn_required) ? { ...l, qty_loaded: byKey[l.unique_key] || 0 } : l);
+                                  // Tocca solo le righe con pending in questo invoice: i codici già completati
+                                  // in sessioni precedenti (nessun pending residuo) mantengono il loro qty_loaded.
+                                  return prev.map(l => (codOf[l.unique_key] !== undefined) ? { ...l, qty_loaded: byKey[l.unique_key] || 0 } : l);
                                 });
                               } else {
                                 setArrivoQtyCartoni([]);
