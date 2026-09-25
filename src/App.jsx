@@ -7787,9 +7787,9 @@ export default function App() {
           const uniquePaxStatus = [...new Set(combos.map(c => c.paxStatus).filter(Boolean))].sort();
 
           const q = matriceSearch.trim().toLowerCase();
-          if (q) combos = combos.filter(c => `${c.pnit} ${c.type}`.toLowerCase().includes(q));
+          if (q) combos = combos.filter(c => `${c.pnit} ${c.type} ${c.pn}`.toLowerCase().includes(q));
           const q2 = matriceSearch2.trim().toLowerCase();
-          if (q2) combos = combos.filter(c => `${c.pnit} ${c.type}`.toLowerCase().includes(q2));
+          if (q2) combos = combos.filter(c => `${c.pnit} ${c.type} ${c.pn}`.toLowerCase().includes(q2));
           if (matriceSoloStima) combos = combos.filter(c => c.stima > 0);
           if (matriceSoloDaOrdinare) combos = combos.filter(c => c.daOrdinare > 0);
           if (matriceSoloSenzaPN) combos = combos.filter(c => !c.pn);
@@ -7852,7 +7852,7 @@ export default function App() {
                     📄 CSV Stock/In ordine
                   </button>
                   <input value={matriceSearch} onChange={e => { setMatriceSearch(e.target.value); setMatricePage(0); }}
-                    placeholder="Cerca per PNIT o SPARE..."
+                    placeholder="Cerca per PNIT, SPARE o PN ufficiale..."
                     className="min-w-[220px] bg-gray-50 border border-gray-300 rounded-xl p-2.5 text-xs focus:outline-hidden" />
                   <input value={matriceSearch2} onChange={e => { setMatriceSearch2(e.target.value); setMatricePage(0); }}
                     placeholder="Secondo filtro (AND)..."
