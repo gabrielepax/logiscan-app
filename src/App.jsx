@@ -2432,12 +2432,29 @@ export default function App() {
   }
 
   // ==================== PRELIEVI ====================
+  // Supabase limita a 1000 righe per richiesta se non si pagina: prelievi_righe supera facilmente quella
+  // soglia, quindi ogni aggregazione su TUTTE le righe (non filtrata per un singolo prelievo) deve paginare,
+  // altrimenti i prelievi più recenti (righe con id più alto) rischiano di sparire dai conteggi/dall'export.
+  async function fetchTuttePrelieviRighe(selectCols) {
+    let all = [];
+    let from = 0;
+    const pageSize = 1000;
+    while (true) {
+      const { data, error } = await supabase.from('prelievi_righe').select(selectCols).range(from, from + pageSize - 1);
+      if (error) return { data: null, error };
+      all = all.concat(data || []);
+      if (!data || data.length < pageSize) break;
+      from += pageSize;
+    }
+    return { data: all, error: null };
+  }
+
   async function fetchPrelievi() {
     setPrelieviLoading(true);
     const [{ data: testate, error }, { data: righe }] = await Promise.all([
       // Esclude le missioni ancora aperte (non evase): vivono nella stessa tabella ma non sono prelievi reali finché non evase
       supabase.from('prelievi').select('*').or('stato.is.null,stato.neq.aperta').order('data_prelievo', { ascending: false }),
-      supabase.from('prelievi_righe').select('prelievo_id, stock_id, quantita')
+      fetchTuttePrelieviRighe('prelievo_id, stock_id, quantita')
     ]);
     if (error) { alert('Errore caricamento prelievi: ' + error.message); setPrelieviLoading(false); return; }
     const agg = {};
@@ -2457,7 +2474,7 @@ export default function App() {
     setMissioniLoading(true);
     const [{ data: testate, error }, { data: righe }] = await Promise.all([
       supabase.from('prelievi').select('*').eq('origine', 'missione').eq('stato', 'aperta').order('richiesta_at', { ascending: false }),
-      supabase.from('prelievi_righe').select('prelievo_id, stock_id, quantita_richiesta, quantita')
+      fetchTuttePrelieviRighe('prelievo_id, stock_id, quantita_richiesta, quantita')
     ]);
     if (error) { alert('Errore caricamento missioni: ' + error.message); setMissioniLoading(false); return; }
     const agg = {};
@@ -2695,7 +2712,7 @@ export default function App() {
     setStoricoMissioniLoading(true);
     const [{ data: testate, error }, { data: righe }] = await Promise.all([
       supabase.from('prelievi').select('*').eq('origine', 'missione').order('richiesta_at', { ascending: false }),
-      supabase.from('prelievi_righe').select('prelievo_id, codice, quantita_richiesta, quantita')
+      fetchTuttePrelieviRighe('prelievo_id, codice, quantita_richiesta, quantita')
     ]);
     if (error) { alert('Errore caricamento storico missioni: ' + error.message); setStoricoMissioniLoading(false); return; }
     const agg = {};
@@ -2746,7 +2763,7 @@ export default function App() {
     const attiviIds = new Set(attivi.map(p => String(p.id)));
     const [{ data: testate }, { data: righe }] = await Promise.all([
       supabase.from('prelievi').select('*'),
-      supabase.from('prelievi_righe').select('*')
+      fetchTuttePrelieviRighe('*')
     ]);
     const testataById = {};
     (testate || []).forEach(t => { if (attiviIds.has(String(t.id))) testataById[t.id] = t; });
