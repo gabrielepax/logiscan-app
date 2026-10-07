@@ -3846,8 +3846,15 @@ export default function App() {
       });
 
       if (aggiunti.length > 0) {
+        const { error: errIns } = await supabase.from('scanned_serials').insert(aggiunti);
+        if (errIns) {
+          // Salvataggio fallito: il cartone non deve risultare letto, così può essere riletto
+          aggiunti.forEach(a => scannedSetRef.current.delete(a.serial));
+          triggerVibration([500]); sounds.error();
+          setFeedback({ text: `ERRORE di salvataggio: cartone NON registrato, rileggilo. (${errIns.message})`, type: 'error' });
+          return;
+        }
         const newCartonsCount = cartonsScanned + 1;
-        await supabase.from('scanned_serials').insert(aggiunti);
         await supabase.from('po_lines').update({ cartons_scanned: newCartonsCount }).eq('unique_key', activeLineKey);
 
         const updatedScanned = [
@@ -3881,7 +3888,14 @@ export default function App() {
       }
       scannedSetRef.current.add(serial); // guardia sincrona anti-duplicati
       const meta = expectedSerials[serial];
-      await supabase.from('scanned_serials').insert({ po_line_key: meta.key || activeLineKey, serial, model: meta.model, pn: meta.pn });
+      const { error: errIns } = await supabase.from('scanned_serials').insert({ po_line_key: meta.key || activeLineKey, serial, model: meta.model, pn: meta.pn });
+      if (errIns) {
+        // Salvataggio fallito: la matricola non deve risultare letta, così può essere riletta
+        scannedSetRef.current.delete(serial);
+        triggerVibration([500]); sounds.error();
+        setFeedback({ text: `ERRORE di salvataggio: matricola ${serial} NON registrata, rileggila. (${errIns.message})`, type: 'error' });
+        return;
+      }
 
       const updatedScanned = [
         { serial, model: meta.model, pn: meta.pn, time: new Date().toLocaleTimeString('it-IT') },
@@ -3923,6 +3937,10 @@ export default function App() {
   }
 
   async function confirmAndFinalizeVerification() {
+    // Le matricole in revisione arrivano dal DB: se sono meno delle attese serve una conferma esplicita
+    const totalExpected = Object.keys(expectedSerials).length || activeLine?.qty_expected || 0;
+    const mancanti = totalExpected - scannedSerials.length;
+    if (mancanti > 0 && !window.confirm(`ATTENZIONE: mancano ${mancanti} matricole su ${totalExpected} attese.\n\nChiudere comunque l'arrivo con ${scannedSerials.length} matricole rilevate?`)) return;
     setLoading(true);
     // Conferma tutte le righe del gruppo (stesso invoice + codice)
     const { error } = await supabase
@@ -11024,6 +11042,8 @@ export default function App() {
           scannedSerials.forEach(s => { counts[s.serial] = (counts[s.serial] || 0) + 1; });
           const extraCount = scannedSerials.length - Object.keys(counts).length; // righe in eccesso da rimuovere
           const hasDuplicates = extraCount > 0;
+          const totalAttese = Object.keys(expectedSerials).length || activeLine?.qty_expected || 0;
+          const mancanti = Math.max(0, totalAttese - Object.keys(counts).length);
           // Ordina mettendo i doppioni in cima
           const ordered = [...scannedSerials].sort((a, b) => (counts[b.serial] > 1 ? 1 : 0) - (counts[a.serial] > 1 ? 1 : 0));
 
@@ -11062,6 +11082,12 @@ export default function App() {
               </div>
             )}
 
+            {mancanti > 0 && (
+              <div className="bg-amber-50 border border-amber-300 rounded-xl p-4 text-sm font-bold text-amber-800">
+                ⚠ Mancano {mancanti} matricole su {totalAttese} attese. Per leggerle esci e riapri la riga con "Modifica", oppure chiudi comunque con una conferma esplicita.
+              </div>
+            )}
+
             <div className="space-y-2">
               <label className="block text-xs font-bold text-gray-400 uppercase tracking-wider">Registro Scansioni (doppioni in evidenza):</label>
               <div className="border border-gray-200 rounded-xl overflow-hidden max-h-60 overflow-y-auto shadow-inner bg-gray-50">
@@ -11095,8 +11121,8 @@ export default function App() {
 
             <div className="grid grid-cols-1 gap-3 pt-2">
               <button onClick={confirmAndFinalizeVerification} disabled={hasDuplicates}
-                className={`w-full font-black p-4 rounded-xl text-base shadow-md transition flex items-center justify-center gap-2 ${hasDuplicates ? 'bg-gray-200 text-gray-400 cursor-not-allowed' : 'bg-green-600 hover:bg-green-700 text-white cursor-pointer'}`}>
-                {hasDuplicates ? '⚠ Rimuovi i doppioni per registrare' : '✓ Approva e Registra Carico su Cloud'}
+                className={`w-full font-black p-4 rounded-xl text-base shadow-md transition flex items-center justify-center gap-2 ${hasDuplicates ? 'bg-gray-200 text-gray-400 cursor-not-allowed' : mancanti > 0 ? 'bg-amber-500 hover:bg-amber-600 text-white cursor-pointer' : 'bg-green-600 hover:bg-green-700 text-white cursor-pointer'}`}>
+                {hasDuplicates ? '⚠ Rimuovi i doppioni per registrare' : mancanti > 0 ? `⚠ Chiudi con ${mancanti} matricole mancanti` : '✓ Approva e Registra Carico su Cloud'}
               </button>
             </div>
           </div>
