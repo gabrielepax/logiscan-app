@@ -476,6 +476,7 @@ export default function App() {
   const [arrivoQtyManuale, setArrivoQtyManuale] = useState({ codice: '', quantita: '' });
   const [arrivoCodiceOpen, setArrivoCodiceOpen] = useState(false);
   const [arrivoBancaleForm, setArrivoBancaleForm] = useState({ open: false, nome: '', magazzino: 'GESSATE' });
+  const [arrivoBancaleOpen, setArrivoBancaleOpen] = useState(false);
   const [riepCodiceOpen, setRiepCodiceOpen] = useState(true);
   const [arrivoQtyFeedback, setArrivoQtyFeedback] = useState({ text: '', type: '' });
   const arrivoQtyScannerRef = useRef(null);
@@ -2145,8 +2146,20 @@ export default function App() {
   }
 
   // Applica una lista di cartoni {codice, quantita, magazzino, bancale} allo stock: incrementa o crea la riga
+  // Le righe nuove su un bancale già esistente ereditano l'ubicazione delle altre righe di quel bancale
   async function applyCartoniToStock(cartoni) {
     const errors = [];
+    const locCache = {};
+    const locazioneBancale = async (magazzino, bancale) => {
+      if (!bancale) return '';
+      const k = `${magazzino}__${bancale}`;
+      if (locCache[k] === undefined) {
+        const { data } = await supabase.from('stock_inventory').select('locazione')
+          .eq('magazzino', magazzino).eq('numero_bancale', bancale).neq('locazione', '').limit(1);
+        locCache[k] = (data && data[0]?.locazione) || '';
+      }
+      return locCache[k];
+    };
     for (const c of cartoni) {
       const { data: existing } = await supabase.from('stock_inventory')
         .select('id, stock').eq('codice', c.codice).eq('magazzino', c.magazzino).eq('numero_bancale', c.bancale).limit(1);
@@ -2156,7 +2169,8 @@ export default function App() {
         if (error) errors.push(`${c.codice}: ${error.message}`);
       } else {
         const { error } = await supabase.from('stock_inventory').insert({
-          codice: c.codice, stock: c.quantita, numero_bancale: c.bancale, magazzino: c.magazzino, locazione: '',
+          codice: c.codice, stock: c.quantita, numero_bancale: c.bancale, magazzino: c.magazzino,
+          locazione: await locazioneBancale(c.magazzino, c.bancale),
         });
         if (error) errors.push(`${c.codice}: ${error.message}`);
       }
@@ -10659,11 +10673,56 @@ export default function App() {
               <div className="bg-white p-4 rounded-2xl border-2 border-blue-300 shadow-xs space-y-3">
                 <span className="text-[10px] font-black text-blue-700 uppercase tracking-wider block">Nuovo bancale</span>
                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                  <div className="space-y-1">
+                  <div className="space-y-1 relative">
                     <label className="block text-xs font-bold text-gray-500">Nome bancale</label>
-                    <input value={arrivoBancaleForm.nome} onChange={e => setArrivoBancaleForm(f => ({ ...f, nome: e.target.value }))}
-                      placeholder="Es. BANCALE-001" autoFocus
+                    <input value={arrivoBancaleForm.nome}
+                      onChange={e => { setArrivoBancaleForm(f => ({ ...f, nome: e.target.value })); setArrivoBancaleOpen(true); }}
+                      onFocus={() => setArrivoBancaleOpen(true)}
+                      onBlur={() => setTimeout(() => setArrivoBancaleOpen(false), 200)}
+                      placeholder="Es. BANCALE-001 o digita per cercare un bancale esistente" autoFocus autoComplete="off"
                       className="w-full bg-gray-50 border border-gray-300 rounded-xl p-2.5 text-sm focus:outline-hidden font-mono" />
+                    {(() => {
+                      // Bancali già presenti in inventario nel magazzino scelto
+                      const q = arrivoBancaleForm.nome.trim().toLowerCase();
+                      const perBancale = {};
+                      stockItems.forEach(s => {
+                        const b = String(s.numero_bancale || '').trim();
+                        if (!b || s.magazzino !== arrivoBancaleForm.magazzino || !(s.stock > 0)) return;
+                        if (!perBancale[b]) perBancale[b] = { nome: b, righe: 0, locazione: '' };
+                        perBancale[b].righe += 1;
+                        if (!perBancale[b].locazione && s.locazione) perBancale[b].locazione = s.locazione;
+                      });
+                      const esistenti = Object.values(perBancale);
+                      const opts = esistenti
+                        .filter(b => !q || b.nome.toLowerCase().includes(q))
+                        .sort((a, b) => a.nome.localeCompare(b.nome))
+                        .slice(0, 30);
+                      const esattoB = esistenti.find(b => b.nome.toLowerCase() === q);
+                      const esatto = !!esattoB;
+                      return (
+                        <>
+                          {arrivoBancaleOpen && opts.length > 0 && (
+                            <div className="absolute z-30 left-0 right-0 mt-1 bg-white border border-gray-200 rounded-xl shadow-lg max-h-56 overflow-y-auto">
+                              {opts.map(b => (
+                                <button key={b.nome} type="button"
+                                  onMouseDown={ev => { ev.preventDefault(); setArrivoBancaleForm(f => ({ ...f, nome: b.nome })); setArrivoBancaleOpen(false); }}
+                                  className="w-full text-left px-3 py-2 hover:bg-blue-50 border-b border-gray-100 last:border-none">
+                                  <div className="font-mono font-bold text-xs text-blue-700">{b.nome}</div>
+                                  <div className="text-[10px] text-gray-500">{b.righe} {b.righe === 1 ? 'codice' : 'codici'}{b.locazione ? ` · ubicazione ${b.locazione}` : ' · senza ubicazione'}</div>
+                                </button>
+                              ))}
+                            </div>
+                          )}
+                          {q && (
+                            <p className={`text-[10px] font-bold ${esatto ? 'text-green-700' : 'text-gray-400'}`}>
+                              {esatto
+                                ? `✓ Bancale già in inventario${esattoB.locazione ? ` — ubicazione ${esattoB.locazione}` : ' (senza ubicazione)'}: le quantità si sommano a quello esistente`
+                                : 'Bancale nuovo: verrà creato in inventario'}
+                            </p>
+                          )}
+                        </>
+                      );
+                    })()}
                   </div>
                   <div className="space-y-1">
                     <label className="block text-xs font-bold text-gray-500">Magazzino</label>
@@ -10677,7 +10736,10 @@ export default function App() {
                 <div className="flex gap-2">
                   <button onClick={() => {
                       if (!arrivoBancaleForm.nome.trim()) { alert('Inserisci il nome del bancale.'); return; }
-                      setArrivoQtyBancale(arrivoBancaleForm.nome.trim());
+                      // Se esiste già in inventario (stesso magazzino) usa il nome esatto, anche se digitato con maiuscole diverse
+                      const digitato = arrivoBancaleForm.nome.trim();
+                      const esistente = stockItems.find(s => s.magazzino === arrivoBancaleForm.magazzino && String(s.numero_bancale || '').trim().toLowerCase() === digitato.toLowerCase());
+                      setArrivoQtyBancale(esistente ? String(esistente.numero_bancale).trim() : digitato);
                       setArrivoQtyMagazzino(arrivoBancaleForm.magazzino);
                       setArrivoBancaleForm({ open: false, nome: '', magazzino: arrivoBancaleForm.magazzino });
                     }}
@@ -10696,6 +10758,13 @@ export default function App() {
                   <div className="min-w-0">
                     <span className="text-[9px] font-black text-blue-400 uppercase tracking-wider block">Bancale in lavorazione · <span className="text-blue-500">{arrivoQtyMagazzino}</span></span>
                     <span className="text-lg sm:text-xl font-black text-blue-800 font-mono break-all block">📦 {arrivoQtyBancale}</span>
+                    {(() => {
+                      // Bancale già in inventario: mostra la sua ubicazione
+                      const righe = stockItems.filter(s => s.magazzino === arrivoQtyMagazzino && String(s.numero_bancale || '').trim() === arrivoQtyBancale.trim() && s.stock > 0);
+                      if (righe.length === 0) return <span className="text-[11px] font-bold text-blue-400 block">Bancale nuovo</span>;
+                      const loc = righe.find(s => s.locazione)?.locazione;
+                      return <span className="text-[11px] font-bold text-green-700 block">Già in inventario · {loc ? `ubicazione ${loc}` : 'senza ubicazione'}</span>;
+                    })()}
                   </div>
                   <button onClick={() => setArrivoBancaleForm({ open: true, nome: '', magazzino: arrivoQtyMagazzino })}
                     className="w-full sm:w-auto shrink-0 bg-blue-600 hover:bg-blue-700 text-white text-xs font-bold px-3 py-2 rounded-xl cursor-pointer transition shadow-xs whitespace-nowrap">+ Nuovo bancale</button>
