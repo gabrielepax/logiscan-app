@@ -50,6 +50,8 @@ const currencySymbol = (valuta) => {
 // dell'Inventario spare parts (es. H-07-03). Le matricole non contengono trattini, quindi
 // una lettura che rispetta il formato viene sempre interpretata come cambio ubicazione.
 const INV_LOC_RE = /^[A-Z]{1,2}-\d{1,3}-\d{1,3}$/i;
+// Etichetta bancale nella rilevazione matricolare: PLT-GGMMAA-NNN
+const PLT_RE = /^PLT-\d{6}-\d{3,}$/i;
 const INV_SNAPSHOT_LOCK = 'inv_snapshot_lock'; // chiave import_meta: caricamento giacenza NS in corso
 
 // CSV testuali (giacenza NS, catalogato): separatore dedotto dall'intestazione, campi tra virgolette supportati
@@ -418,6 +420,9 @@ export default function App() {
   const [expectedSerials, setExpectedSerials] = useState({});
   const [scannedSerials, setScannedSerials] = useState([]);
   const scannedSetRef = useRef(new Set()); // guardia sincrona anti-duplicati
+  const [scanBancale, setScanBancale] = useState(''); // bancale corrente della rilevazione matricolare
+  const scanBancaleRef = useRef('');
+  const bancaleColRef = useRef(true); // false se su Supabase manca la colonna scanned_serials.bancale
   const [cartonsScanned, setCartonsScanned] = useState(0);
   const [scannerValue, setScannerValue] = useState('');
   const [feedback, setFeedback] = useState({ text: '', type: '' });
@@ -3639,7 +3644,14 @@ export default function App() {
     };
 
     const expectedData = await fetchAllByKeys('expected_serials', 'serial, model, pn, po_line_key');
-    const scannedData = await fetchAllByKeys('scanned_serials', 'serial, model, pn, scanned_at');
+    // '*' così la colonna bancale è inclusa solo se esiste su Supabase
+    const scannedData = await fetchAllByKeys('scanned_serials', '*');
+
+    // Bancale obbligatorio solo se la colonna esiste: altrimenti si legge come prima
+    const { error: probeErr } = await supabase.from('scanned_serials').select('bancale').limit(1);
+    bancaleColRef.current = !probeErr;
+    scanBancaleRef.current = '';
+    setScanBancale('');
 
     // Ogni seriale atteso porta con sé la riga che lo attende: la scansione verrà imputata lì
     const expectedMap = {};
@@ -3650,6 +3662,7 @@ export default function App() {
       serial: s.serial,
       model: s.model,
       pn: s.pn,
+      bancale: s.bancale || '',
       time: new Date(s.scanned_at).toLocaleTimeString('it-IT')
     }));
     scannedSetRef.current = new Set(formattedScanned.map(s => s.serial));
@@ -3660,7 +3673,9 @@ export default function App() {
     if (line.is_user_confirmed) {
       openReviewSession();
     } else {
-      setFeedback({ text: 'Scanner pronto, punta il laser sul codice.', type: 'success' });
+      setFeedback(bancaleColRef.current
+        ? { text: "Spara prima l'etichetta del bancale (PLT-GGMMAA-001), poi le matricole.", type: 'success' }
+        : { text: 'Scanner pronto, punta il laser sul codice.', type: 'success' });
       setCurrentView('scan');
     }
     setLoading(false);
@@ -3682,13 +3697,13 @@ export default function App() {
     buildAndDownloadCSV(line, scannedData);
   }
 
-  const CSV_ARRIVO_HEADER = "Internal ID,Date,Document Number,Subsidiary,Item,CODICE CINESE,Fornitore,Memo,[PAX] China Invoice,Quantity Riga,Quantity Serial,Seriale,Line ID,Surrogate ID,Vendor DDT,Vendor DDT Date";
+  const CSV_ARRIVO_HEADER = "Internal ID,Date,Document Number,Subsidiary,Item,CODICE CINESE,Fornitore,Memo,[PAX] China Invoice,Quantity Riga,Quantity Serial,Seriale,Line ID,Surrogate ID,Vendor DDT,Vendor DDT Date,Bancale";
 
   // Costruisce le righe CSV di una singola riga di piano: ogni record porta il proprio Line ID
   function csvRowsForLine(line, serials) {
     return (serials || []).map(s => [
       line.po_internal_id, line.arrival_date, line.po_name, "", line.item_code, s.model, "",
-      line.description, line.china_invoice, line.qty_expected, 1, s.serial, line.line_id, line.line_id, "", ""
+      line.description, line.china_invoice, line.qty_expected, 1, s.serial, line.line_id, line.line_id, "", "", s.bancale || ""
     ]);
   }
 
@@ -3729,7 +3744,7 @@ export default function App() {
     let from = 0;
     while (true) {
       const { data, error } = await supabase.from('scanned_serials')
-        .select('serial, model, pn, scanned_at').eq('po_line_key', key)
+        .select('*').eq('po_line_key', key)
         .order('id', { ascending: true }).range(from, from + pageSize - 1);
       if (error) break;
       all = [...all, ...(data || [])];
@@ -3832,12 +3847,31 @@ export default function App() {
     if (scannerInputRef.current) scannerInputRef.current.value = '';
     if (!rawInput || !activeLineKey) return;
 
+    // Etichetta bancale (PLT-GGMMAA-NNN): diventa il bancale corrente, le matricole successive vi vengono associate
+    if (bancaleColRef.current && PLT_RE.test(rawInput)) {
+      const plt = rawInput.toUpperCase();
+      scanBancaleRef.current = plt;
+      setScanBancale(plt);
+      triggerVibration([80, 60, 80]); sounds.location();
+      setFeedback({ text: `📦 Bancale ${plt}: spara le matricole.`, type: 'success' });
+      return;
+    }
+
     // Il totale da rilevare è il numero di matricole ATTESE (tutte devono essere lette per completare)
     const totalExpected = Object.keys(expectedSerials).length || activeLine?.qty_expected || 0;
     if (scannedSerials.length >= totalExpected && totalExpected > 0) {
       openReviewSession();
       return;
     }
+
+    // Senza bancale corrente non si registrano matricole
+    if (bancaleColRef.current && !scanBancaleRef.current) {
+      triggerVibration([300]); sounds.error();
+      setFeedback({ text: "Spara prima l'etichetta del bancale (PLT-GGMMAA-001).", type: 'error' });
+      return;
+    }
+    const bancaleCorrente = bancaleColRef.current ? scanBancaleRef.current : null;
+    const conBancale = (rec) => bancaleCorrente ? { ...rec, bancale: bancaleCorrente } : rec;
 
     if (isMasterQRCode(rawInput)) {
       const qrData = parseMasterQRCode(rawInput);
@@ -3856,7 +3890,7 @@ export default function App() {
         if (!Object.hasOwn(expectedSerials, serial)) { errati++; return; }
         scannedSetRef.current.add(serial); // guardia sincrona: previene doppi da scansioni rapide o QR con seriali ripetuti
         // Il seriale viene imputato alla riga che lo attende (split automatico tra righe stesso codice)
-        aggiunti.push({ po_line_key: expectedSerials[serial].key || activeLineKey, serial, model: expectedSerials[serial].model, pn: expectedSerials[serial].pn });
+        aggiunti.push(conBancale({ po_line_key: expectedSerials[serial].key || activeLineKey, serial, model: expectedSerials[serial].model, pn: expectedSerials[serial].pn }));
       });
 
       if (aggiunti.length > 0) {
@@ -3872,7 +3906,7 @@ export default function App() {
         await supabase.from('po_lines').update({ cartons_scanned: newCartonsCount }).eq('unique_key', activeLineKey);
 
         const updatedScanned = [
-          ...aggiunti.map(a => ({ serial: a.serial, model: a.model, pn: a.pn, time: new Date().toLocaleTimeString('it-IT') })),
+          ...aggiunti.map(a => ({ serial: a.serial, model: a.model, pn: a.pn, bancale: a.bancale || '', time: new Date().toLocaleTimeString('it-IT') })),
           ...scannedSerials
         ];
         setScannedSerials(updatedScanned);
@@ -3902,7 +3936,7 @@ export default function App() {
       }
       scannedSetRef.current.add(serial); // guardia sincrona anti-duplicati
       const meta = expectedSerials[serial];
-      const { error: errIns } = await supabase.from('scanned_serials').insert({ po_line_key: meta.key || activeLineKey, serial, model: meta.model, pn: meta.pn });
+      const { error: errIns } = await supabase.from('scanned_serials').insert(conBancale({ po_line_key: meta.key || activeLineKey, serial, model: meta.model, pn: meta.pn }));
       if (errIns) {
         // Salvataggio fallito: la matricola non deve risultare letta, così può essere riletta
         scannedSetRef.current.delete(serial);
@@ -3912,7 +3946,7 @@ export default function App() {
       }
 
       const updatedScanned = [
-        { serial, model: meta.model, pn: meta.pn, time: new Date().toLocaleTimeString('it-IT') },
+        { serial, model: meta.model, pn: meta.pn, bancale: bancaleCorrente || '', time: new Date().toLocaleTimeString('it-IT') },
         ...scannedSerials
       ];
       setScannedSerials(updatedScanned);
@@ -3936,7 +3970,7 @@ export default function App() {
       let from = 0;
       while (true) {
         const { data, error } = await supabase.from('scanned_serials')
-          .select('serial, model, pn, scanned_at').in('po_line_key', activeGroupKeys.length ? activeGroupKeys : [activeLineKey])
+          .select('*').in('po_line_key', activeGroupKeys.length ? activeGroupKeys : [activeLineKey])
           .order('id', { ascending: true }).range(from, from + pageSize - 1);
         if (error) break;
         all = [...all, ...(data || [])];
@@ -3944,7 +3978,7 @@ export default function App() {
         from += pageSize;
       }
       all.reverse(); // più recenti in cima
-      setScannedSerials(all.map(s => ({ serial: s.serial, model: s.model, pn: s.pn, time: new Date(s.scanned_at).toLocaleTimeString('it-IT') })));
+      setScannedSerials(all.map(s => ({ serial: s.serial, model: s.model, pn: s.pn, bancale: s.bancale || '', time: new Date(s.scanned_at).toLocaleTimeString('it-IT') })));
       setLoading(false);
     }
     setCurrentView('review');
@@ -11032,6 +11066,15 @@ export default function App() {
                 </div>
               </div>
 
+              {bancaleColRef.current && (
+                <div className={`px-4 py-3 rounded-xl border ${scanBancale ? 'bg-blue-50 border-blue-200' : 'bg-amber-50 border-amber-300'}`}>
+                  <span className={`text-[9px] font-black uppercase tracking-wider block ${scanBancale ? 'text-blue-400' : 'text-amber-600'}`}>Bancale in lavorazione</span>
+                  {scanBancale
+                    ? <span className="text-lg font-black text-blue-800 font-mono break-all block">📦 {scanBancale}</span>
+                    : <span className="text-sm font-bold text-amber-800 block">Nessun bancale: spara l&apos;etichetta PLT-GGMMAA-001 per iniziare</span>}
+                </div>
+              )}
+
               <form onSubmit={handleScanSubmit} className="space-y-3">
                 <label className="block text-xs sm:text-sm font-bold text-gray-500 uppercase tracking-wider">Input Terminale / Scanner:</label>
                 <input
@@ -11087,6 +11130,7 @@ export default function App() {
                       <div className="text-xs text-gray-400 mt-1 flex gap-x-4">
                         <span><strong>Modello:</strong> {s.model}</span>
                         <span><strong>P/N:</strong> {s.pn}</span>
+                        {s.bancale && <span><strong>Bancale:</strong> {s.bancale}</span>}
                         <span className="ml-auto text-[11px] font-medium text-gray-300">{s.time}</span>
                       </div>
                     </div>
@@ -11166,6 +11210,7 @@ export default function App() {
                       <th className="p-2.5 pl-4">Matricola (SN)</th>
                       <th className="p-2.5">Modello</th>
                       <th className="p-2.5">Part Number</th>
+                      <th className="p-2.5">Bancale</th>
                       <th className="p-2.5 pr-4 text-right">Ora</th>
                     </tr>
                   </thead>
@@ -11179,6 +11224,7 @@ export default function App() {
                           </td>
                           <td className="p-2.5 text-gray-600">{s.model}</td>
                           <td className="p-2.5 text-gray-500">{s.pn}</td>
+                          <td className="p-2.5 text-gray-500">{s.bancale || '—'}</td>
                           <td className="p-2.5 pr-4 text-right text-gray-400">{s.time}</td>
                         </tr>
                       );
