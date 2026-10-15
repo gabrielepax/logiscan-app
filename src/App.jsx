@@ -17,6 +17,7 @@ const APP_MODULES = [
   { id: 'riepilogo', label: 'Stock Spare Parts', group: 'Magazzino' },
   { id: 'controlli-inventariali', label: 'Controlli Inventariali', group: 'Magazzino', upload: true },
   { id: 'missioni-inventario', label: 'Missioni Inventario', group: 'Magazzino' },
+  { id: 'missione-libera', label: 'Missione Libera', group: 'Magazzino' },
   { id: 'spare-parts', label: 'Compatibilità', group: 'Repair', upload: true, edit: true },
   { id: 'distinte-base', label: 'Distinte Base', group: 'Repair', edit: true, genera: true },
   { id: 'matrice', label: 'MRP', group: 'Repair', upload: true },
@@ -101,6 +102,13 @@ const catDataIso = (d) => { const [g, m, a] = d.split('/'); return `${a}-${m}-${
 const invMissioneCode = (id) => `INV-${String(id).padStart(5, '0')}`;
 const INV_STATI = {
   aperta: { label: 'Da eseguire', cls: 'bg-blue-50 text-blue-700 border-blue-200' },
+  in_corso: { label: 'In corso', cls: 'bg-amber-50 text-amber-700 border-amber-200' },
+  completata: { label: 'Completata', cls: 'bg-green-50 text-green-700 border-green-200' },
+  chiusa: { label: 'Chiusa', cls: 'bg-gray-100 text-gray-500 border-gray-200' },
+};
+// Missione Libera: rilevazione matricolare su bancali senza lista di matricole attese
+const libMissioneCode = (id) => `LIB-${String(id).padStart(5, '0')}`;
+const LIB_STATI = {
   in_corso: { label: 'In corso', cls: 'bg-amber-50 text-amber-700 border-amber-200' },
   completata: { label: 'Completata', cls: 'bg-green-50 text-green-700 border-green-200' },
   chiusa: { label: 'Chiusa', cls: 'bg-gray-100 text-gray-500 border-gray-200' },
@@ -662,6 +670,19 @@ export default function App() {
   const [invExecFeedback, setInvExecFeedback] = useState({ text: '', type: '', sub: '' });
   const [invExecLoading, setInvExecLoading] = useState(false);
 
+  // Missione Libera: bancali + matricole sparate senza lista attesa, export Excel e pulizia del dettaglio
+  const [libMissioni, setLibMissioni] = useState([]);
+  const [libLoading, setLibLoading] = useState(false);
+  const [libFiltro, setLibFiltro] = useState('attive'); // 'attive' | 'chiuse'
+  const [libProgress, setLibProgress] = useState({}); // missione_id -> { matricole, bancali } delle missioni non chiuse
+  const [libNuovaDescrizione, setLibNuovaDescrizione] = useState('');
+  const [libExec, setLibExec] = useState(null); // testata della missione aperta
+  const [libRilevazioni, setLibRilevazioni] = useState([]); // più recenti in cima
+  const [libBancali, setLibBancali] = useState([]); // bancali sparati, in ordine di sparo
+  const [libBancale, setLibBancale] = useState(''); // bancale corrente
+  const [libScanner, setLibScanner] = useState('');
+  const [libFeedback, setLibFeedback] = useState({ text: '', type: '', sub: '' });
+
   // Catalogazione (catalogato vs giacenza NS → Inventory Transfer / Return Authorization)
   const [catTab, setCatTab] = useState('analisi'); // 'analisi' | 'storico' | 'impostazioni'
   const [catRighe, setCatRighe] = useState([]); // righe del catalogato caricato (non persistite)
@@ -689,6 +710,9 @@ export default function App() {
   const invExecSetRef = useRef(new Map()); // matricola -> ubicazione: guardia sincrona anti-duplicati
   const invExecUbicazioneRef = useRef(''); // ubicazione corrente letta dallo scanner (non attende il render)
   const invExecScannerRef = useRef(null);
+  const libSetRef = useRef(new Map()); // matricola -> bancale: guardia sincrona anti-duplicati
+  const libBancaleRef = useRef(''); // bancale corrente letto dallo scanner (non attende il render)
+  const libScannerRef = useRef(null);
 
   const scannerInputRef = useRef(null);
 
@@ -737,6 +761,7 @@ export default function App() {
       fetchInvMissioni();
     }
     if (activeModule === 'missioni-inventario') fetchInvMissioni();
+    if (activeModule === 'missione-libera') fetchLibMissioni();
     if (activeModule === 'catalogazione') {
       fetchCatConfig();
       fetchInvRiepilogo();
@@ -756,6 +781,18 @@ export default function App() {
     window.addEventListener('click', refocus);
     return () => window.removeEventListener('click', refocus);
   }, [invExec]);
+
+  // Missione libera in esecuzione: lo scanner resta sempre a fuoco
+  useEffect(() => {
+    if (!libExec) return;
+    libScannerRef.current?.focus();
+    const refocus = (ev) => {
+      if (ev.target?.closest?.('input, select, textarea, button')) return;
+      libScannerRef.current?.focus();
+    };
+    window.addEventListener('click', refocus);
+    return () => window.removeEventListener('click', refocus);
+  }, [libExec]);
 
   // Helper: carica TUTTE le righe di una tabella superando il limite di 1000
   async function fetchAllRows(table, cols) {
@@ -4514,6 +4551,336 @@ export default function App() {
     fetchInvMissioni();
   }
 
+  // ==================== MISSIONE LIBERA ====================
+  // Rilevazione matricolare senza lista attesa: stesso flusso degli arrivi serializzati (etichetta bancale
+  // PLT-GGMMAA-NNN, poi matricole singole o QR master del cartone). Controlli: doppioni nella missione,
+  // letture con formato ubicazione, matricole già presenti in altre missioni libere (segnalate, non bloccate).
+  // Al download dell'Excel resta la testata con i conteggi; il dettaglio si può eliminare dal database.
+
+  async function fetchLibMissioni() {
+    setLibLoading(true);
+    const { data, error } = await supabase.from('ml_missioni').select('*').order('created_at', { ascending: false }).limit(1000);
+    if (error) { alert('Errore caricamento missioni libere: ' + error.message); setLibLoading(false); return; }
+    setLibMissioni(data || []);
+    // Avanzamento live delle missioni con dettaglio ancora a DB (le chiuse hanno i conteggi in testata)
+    const prog = {};
+    await Promise.all((data || []).filter(m => m.stato !== 'chiusa').map(async m => {
+      const [ril, ban] = await Promise.all([
+        supabase.from('ml_rilevazioni').select('id', { count: 'exact', head: true }).eq('missione_id', m.id),
+        supabase.from('ml_bancali').select('bancale', { count: 'exact', head: true }).eq('missione_id', m.id),
+      ]);
+      prog[m.id] = { matricole: ril.count || 0, bancali: ban.count || 0 };
+    }));
+    setLibProgress(prog);
+    setLibLoading(false);
+  }
+
+  async function creaLibMissione() {
+    setLibLoading(true);
+    const { data, error } = await supabase.from('ml_missioni')
+      .insert({ descrizione: libNuovaDescrizione.trim() || null, stato: 'in_corso', creata_da: currentUser || null })
+      .select().single();
+    setLibLoading(false);
+    if (error) { alert('Errore creazione missione: ' + error.message); return; }
+    setLibNuovaDescrizione('');
+    await apriLibMissione(data);
+  }
+
+  async function apriLibMissione(m) {
+    setLibLoading(true);
+    try {
+      // Rilegge la testata: la missione potrebbe essere stata terminata o annullata nel frattempo
+      const { data: cur, error: curErr } = await supabase.from('ml_missioni').select('*').eq('id', m.id).maybeSingle();
+      if (curErr) throw curErr;
+      if (!cur || cur.stato !== 'in_corso') {
+        alert(`La missione ${libMissioneCode(m.id)} non è più in corso (annullata o già terminata).`);
+        setLibLoading(false);
+        await fetchLibMissioni();
+        return;
+      }
+      const [ril, ban] = await Promise.all([
+        invFetchAll('ml_rilevazioni', '*', q => q.eq('missione_id', m.id), ['id']),
+        invFetchAll('ml_bancali', 'bancale, sparato_at', q => q.eq('missione_id', m.id), ['sparato_at']),
+      ]);
+      libSetRef.current = new Map(ril.map(r => [r.matricola, r.bancale]));
+      libBancaleRef.current = '';
+      setLibRilevazioni([...ril].reverse());
+      setLibBancali(ban.map(b => b.bancale));
+      setLibBancale('');
+      setLibScanner('');
+      setLibFeedback(ril.length
+        ? { text: `Missione ripresa: ${ril.length} matricole già rilevate. Spara il bancale per continuare.`, type: 'info', sub: '' }
+        : { text: "Spara l'etichetta del bancale (PLT-GGMMAA-001), poi le matricole.", type: 'info', sub: '' });
+      setLibExec(cur);
+    } catch (err) {
+      alert('Errore apertura missione: ' + err.message);
+    }
+    setLibLoading(false);
+  }
+
+  async function handleLibScan(e) {
+    e.preventDefault();
+    const raw = (libScannerRef.current?.value || libScanner).trim();
+    setLibScanner('');
+    if (libScannerRef.current) libScannerRef.current.value = '';
+    if (!raw || !libExec) return;
+    const missioneId = libExec.id;
+
+    // 1) Etichetta bancale: diventa il bancale corrente (anche se resta vuoto conta come bancale sparato)
+    if (PLT_RE.test(raw)) {
+      const plt = raw.toUpperCase();
+      libBancaleRef.current = plt;
+      setLibBancale(plt);
+      setLibBancali(prev => prev.includes(plt) ? prev : [...prev, plt]);
+      triggerVibration([80, 60, 80]); sounds.location();
+      const nGia = [...libSetRef.current.values()].filter(b => b === plt).length;
+      setLibFeedback({ text: `📦 Bancale ${plt}: spara le matricole.`, type: 'info', sub: nGia ? `${nGia} matricole già rilevate su questo bancale` : '' });
+      const { error } = await supabase.from('ml_bancali')
+        .upsert({ missione_id: missioneId, bancale: plt, operatore: currentUser || null }, { onConflict: 'missione_id,bancale', ignoreDuplicates: true });
+      if (error) setLibFeedback({ text: 'Errore salvataggio bancale: ' + error.message, type: 'error', sub: '' });
+      return;
+    }
+
+    // Un barcode ubicazione (es. H-07-03) non è né un bancale né una matricola
+    if (INV_LOC_RE.test(raw)) {
+      triggerVibration([300]); sounds.error();
+      setLibFeedback({ text: `${raw.toUpperCase()} è un'ubicazione, non una matricola.`, type: 'error', sub: 'Lettura scartata.' });
+      return;
+    }
+
+    const bancale = libBancaleRef.current;
+    if (!bancale) {
+      triggerVibration([300]); sounds.error();
+      setLibFeedback({ text: "Spara prima l'etichetta del bancale (PLT-GGMMAA-001).", type: 'error', sub: raw });
+      return;
+    }
+
+    // 2) Matricole: QR master del cartone (più matricole) oppure matricola singola
+    const isQr = isMasterQRCode(raw);
+    let serials = [raw];
+    let modello = null;
+    let avvisoQr = '';
+    if (isQr) {
+      const qr = parseMasterQRCode(raw);
+      if (!qr) {
+        triggerVibration([300]); sounds.error();
+        setLibFeedback({ text: 'Formato QR non interpretabile.', type: 'error', sub: '' });
+        return;
+      }
+      serials = qr.serials;
+      modello = qr.model || null;
+      if (qr.qty > 0 && qr.qty !== qr.serials.length) avvisoQr = `QR dichiara ${qr.qty} pezzi ma contiene ${qr.serials.length} matricole`;
+    }
+    serials = [...new Set(serials.map(s => s.trim().toUpperCase()).filter(Boolean))];
+
+    const nuove = [];
+    const duplicati = [];
+    serials.forEach(s => {
+      if (libSetRef.current.has(s)) { duplicati.push(s); return; }
+      libSetRef.current.set(s, bancale); // guardia sincrona: scansioni rapide non creano doppi
+      nuove.push(s);
+    });
+    if (nuove.length === 0) {
+      triggerVibration([300]); sounds.error();
+      setLibFeedback(serials.length === 1
+        ? { text: `Duplicato! Matricola ${serials[0]} già rilevata.`, type: 'error', sub: `Bancale: ${libSetRef.current.get(serials[0])}` }
+        : { text: `QR scartato: ${duplicati.length} matricole già rilevate.`, type: 'error', sub: '' });
+      return;
+    }
+
+    // Matricole già presenti in altre missioni libere (con dettaglio ancora a DB): si registrano ma si segnalano
+    const altrove = {};
+    for (let i = 0; i < nuove.length; i += 100) {
+      const { data } = await supabase.from('ml_rilevazioni').select('matricola, missione_id, bancale')
+        .in('matricola', nuove.slice(i, i + 100)).neq('missione_id', missioneId);
+      (data || []).forEach(d => { if (!altrove[d.matricola]) altrove[d.matricola] = d; });
+    }
+    const nowIso = new Date().toISOString();
+    const records = nuove.map(s => {
+      const a = altrove[s];
+      return {
+        missione_id: missioneId, matricola: s, bancale, modello, fonte: isQr ? 'qr' : 'singola',
+        operatore: currentUser || null, rilevata_at: nowIso,
+        nota: a ? `Già rilevata in ${libMissioneCode(a.missione_id)} (bancale ${a.bancale})` : null,
+      };
+    });
+    // ignoreDuplicates: una matricola già letta da un altro operatore sulla stessa missione non blocca il resto del QR
+    const { data: saved, error } = await supabase.from('ml_rilevazioni')
+      .upsert(records, { onConflict: 'missione_id,matricola', ignoreDuplicates: true }).select('matricola');
+    if (error) {
+      nuove.forEach(s => libSetRef.current.delete(s));
+      triggerVibration([500]); sounds.error();
+      setLibFeedback({ text: `ERRORE di salvataggio: lettura NON registrata, rileggi${isQr ? ' il cartone' : ' la matricola'}.`, type: 'error', sub: error.message });
+      return;
+    }
+    const salvate = new Set((saved || []).map(d => d.matricola));
+    const inserite = records.filter(r => salvate.has(r.matricola));
+    const giaLetteAltroOp = records.length - inserite.length;
+    setLibRilevazioni(prev => [...inserite, ...prev]);
+
+    const segnalate = inserite.filter(r => r.nota);
+    const extra = [
+      duplicati.length + giaLetteAltroOp > 0 && `${duplicati.length + giaLetteAltroOp} già rilevate`,
+      avvisoQr,
+    ].filter(Boolean).join(' · ');
+    if (inserite.length === 0) {
+      triggerVibration([300]); sounds.error();
+      setLibFeedback({ text: 'Matricole già rilevate da un altro operatore.', type: 'error', sub: '' });
+    } else if (segnalate.length > 0 || avvisoQr) {
+      triggerVibration([200, 100, 200, 100, 200]); sounds.warn();
+      setLibFeedback({
+        text: segnalate.length > 0
+          ? `${segnalate.length === 1 ? segnalate[0].matricola : `${segnalate.length} matricole`} già in altra missione`
+          : `+${inserite.length} matricole: QR da verificare`,
+        type: 'warning',
+        sub: [segnalate.length === 1 && segnalate[0].nota, isQr && `+${inserite.length} registrate`, extra].filter(Boolean).join(' · '),
+      });
+    } else {
+      triggerVibration(isQr ? [150, 100, 150] : [150]);
+      if (isQr) sounds.carton(); else sounds.ok();
+      setLibFeedback(isQr
+        ? { text: `QR cartone: +${inserite.length} matricole`, type: 'success', sub: [modello && `Modello ${modello}`, extra].filter(Boolean).join(' · ') }
+        : { text: `OK: ${inserite[0].matricola}`, type: 'success', sub: `Bancale ${bancale}` });
+    }
+  }
+
+  async function eliminaLibRilevazione(r) {
+    if (!libExec || !window.confirm(`Eliminare la matricola ${r.matricola} (bancale ${r.bancale})?`)) return;
+    const { error } = await supabase.from('ml_rilevazioni').delete().eq('missione_id', libExec.id).eq('matricola', r.matricola);
+    if (error) { alert('Errore: ' + error.message); return; }
+    libSetRef.current.delete(r.matricola);
+    setLibRilevazioni(prev => prev.filter(x => x.matricola !== r.matricola));
+  }
+
+  // Conteggi di testata ricalcolati dal DB: includono anche le letture di altri operatori
+  async function libConteggi(id) {
+    const [ril, ban] = await Promise.all([
+      invFetchAll('ml_rilevazioni', 'bancale, nota', q => q.eq('missione_id', id), ['id']),
+      invFetchAll('ml_bancali', 'bancale', q => q.eq('missione_id', id), ['bancale']),
+    ]);
+    const conMatricole = new Set(ril.map(r => r.bancale));
+    return {
+      esiti: { n_matricole: ril.length, n_bancali: conMatricole.size, n_segnalazioni: ril.filter(r => r.nota).length },
+      bancaliVuoti: ban.map(b => b.bancale).filter(b => !conMatricole.has(b)),
+    };
+  }
+
+  async function terminaLibMissione() {
+    if (!libExec) return;
+    setLibLoading(true);
+    let c;
+    try { c = await libConteggi(libExec.id); } catch (err) { setLibLoading(false); alert('Errore: ' + err.message); return; }
+    setLibLoading(false);
+    if (c.esiti.n_matricole === 0) { alert('Nessuna matricola rilevata: non c\'è nulla da terminare. Usa "Sospendi" per uscire.'); return; }
+    if (!window.confirm(
+      `Terminare la missione ${libMissioneCode(libExec.id)}?\n\n` +
+      `Matricole rilevate: ${c.esiti.n_matricole}\nBancali: ${c.esiti.n_bancali}\n` +
+      (c.esiti.n_segnalazioni ? `Già presenti in altre missioni: ${c.esiti.n_segnalazioni}\n` : '') +
+      (c.bancaliVuoti.length ? `\nATTENZIONE: bancali sparati senza matricole: ${c.bancaliVuoti.join(', ')}\n` : '') +
+      `\nDopo la chiusura potrai scaricare l'Excel. Finché il dettaglio non viene eliminato la missione resta riapribile.`
+    )) return;
+    setLibLoading(true);
+    const { error } = await supabase.from('ml_missioni')
+      .update({ ...c.esiti, stato: 'completata', completata_at: new Date().toISOString() })
+      .eq('id', libExec.id);
+    setLibLoading(false);
+    if (error) { alert('Errore: ' + error.message); return; }
+    triggerVibration([100, 50, 100, 50, 200]);
+    esciLibMissione();
+  }
+
+  function esciLibMissione() {
+    setLibExec(null);
+    setLibFeedback({ text: '', type: '', sub: '' });
+    libBancaleRef.current = '';
+    fetchLibMissioni();
+  }
+
+  async function riapriLibMissione(m) {
+    if (!window.confirm(`Riaprire la missione ${libMissioneCode(m.id)} per aggiungere o correggere matricole?`)) return;
+    const { error } = await supabase.from('ml_missioni').update({ stato: 'in_corso', completata_at: null }).eq('id', m.id).eq('stato', 'completata');
+    if (error) { alert('Errore: ' + error.message); return; }
+    await apriLibMissione(m);
+  }
+
+  async function annullaLibMissione(m) {
+    const n = libProgress[m.id]?.matricole || 0;
+    if (!window.confirm(`Annullare la missione ${libMissioneCode(m.id)}?${n ? `\n\nATTENZIONE: verranno eliminate le ${n} matricole rilevate.` : ''}`)) return;
+    const { error } = await supabase.from('ml_missioni').delete().eq('id', m.id); // il dettaglio si elimina in cascata
+    if (error) { alert('Errore: ' + error.message); return; }
+    await fetchLibMissioni();
+  }
+
+  async function scaricaLibMissione(m) {
+    const code = libMissioneCode(m.id);
+    setLibLoading(true);
+    try {
+      const [ril, ban] = await Promise.all([
+        invFetchAll('ml_rilevazioni', '*', q => q.eq('missione_id', m.id), ['id']),
+        invFetchAll('ml_bancali', '*', q => q.eq('missione_id', m.id), ['sparato_at']),
+      ]);
+      const fmtD = iso => iso ? new Date(iso).toLocaleDateString('it-IT') : '';
+      const fmtT = iso => iso ? new Date(iso).toLocaleTimeString('it-IT') : '';
+      const fmtDT = iso => iso ? new Date(iso).toLocaleString('it-IT') : '';
+      // Matricole raggruppate per bancale, nell'ordine in cui i bancali sono stati sparati
+      const ordineBancali = [...new Set([...ban.map(b => b.bancale), ...ril.map(r => r.bancale)])];
+      const posBancale = new Map(ordineBancali.map((b, i) => [b, i]));
+      const perBancale = {};
+      ril.forEach(r => { perBancale[r.bancale] = (perBancale[r.bancale] || 0) + 1; });
+      const rilOrd = [...ril].sort((a, b) => posBancale.get(a.bancale) - posBancale.get(b.bancale) || a.id - b.id);
+      const esiti = { n_matricole: ril.length, n_bancali: Object.keys(perBancale).length, n_segnalazioni: ril.filter(r => r.nota).length };
+
+      const colsRil = ['Matricola', 'Bancale', 'Modello', 'Lettura', 'Operatore', 'Data', 'Ora', 'Nota'];
+      const rowsRil = rilOrd.map(r => ({
+        Matricola: r.matricola, Bancale: r.bancale, Modello: r.modello || '', Lettura: r.fonte === 'qr' ? 'QR cartone' : 'Singola',
+        Operatore: r.operatore || '', Data: fmtD(r.rilevata_at), Ora: fmtT(r.rilevata_at), Nota: r.nota || '',
+      }));
+      const banMap = Object.fromEntries(ban.map(b => [b.bancale, b]));
+      const rowsBan = ordineBancali.map(b => ({
+        Bancale: b, Matricole: perBancale[b] || 0, 'Sparato da': banMap[b]?.operatore || '',
+        Data: fmtD(banMap[b]?.sparato_at), Ora: fmtT(banMap[b]?.sparato_at),
+      }));
+      const riepilogo = [
+        ['Missione', code], ['Descrizione', m.descrizione || ''],
+        ['Creata il', fmtDT(m.created_at)], ['Creata da', m.creata_da || ''], ['Terminata il', fmtDT(m.completata_at)],
+        [],
+        ['Matricole rilevate', esiti.n_matricole], ['Bancali con matricole', esiti.n_bancali],
+        ['Bancali vuoti', rowsBan.filter(b => b.Matricole === 0).length], ['Già presenti in altre missioni', esiti.n_segnalazioni],
+        [],
+        ['Scaricato da', currentUser || ''], ['Scaricato il', new Date().toLocaleString('it-IT')],
+      ];
+      const wb = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(riepilogo), 'Riepilogo');
+      XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(rowsRil, { header: colsRil }), 'Matricole');
+      XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(rowsBan, { header: ['Bancale', 'Matricole', 'Sparato da', 'Data', 'Ora'] }), 'Bancali');
+      if (esiti.n_segnalazioni > 0) XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(rowsRil.filter(r => r.Nota), { header: colsRil }), 'Segnalazioni');
+      XLSX.writeFile(wb, `missione_libera_${code}_${new Date().toISOString().slice(0, 10)}.xlsx`);
+
+      const { error: upErr } = await supabase.from('ml_missioni')
+        .update({ ...esiti, scaricata_da: currentUser || null, scaricata_at: new Date().toISOString() })
+        .eq('id', m.id);
+      if (upErr) throw upErr;
+      setLibLoading(false);
+      // Sgancio del dettaglio: resta la testata con i conteggi, bancali e matricole si eliminano dal database
+      if (window.confirm(
+        `File scaricato.\n\nEliminare ora il dettaglio della missione ${code} dal database?\n\n` +
+        `Resteranno solo la testata e i conteggi (${esiti.n_matricole} matricole, ${esiti.n_bancali} bancali). ` +
+        `Se annulli, la missione resta completata e potrai riscaricarla o chiuderla più tardi.`
+      )) {
+        setLibLoading(true);
+        const { error: stErr } = await supabase.from('ml_missioni').update({ stato: 'chiusa' }).eq('id', m.id);
+        if (stErr) throw stErr;
+        const dels = await Promise.all(['ml_rilevazioni', 'ml_bancali'].map(t => supabase.from(t).delete().eq('missione_id', m.id)));
+        const delErr = dels.find(r => r.error)?.error;
+        if (delErr) alert('Missione chiusa, ma errore nella pulizia del dettaglio: ' + delErr.message);
+      }
+    } catch (err) {
+      alert('Errore: ' + err.message);
+    }
+    setLibLoading(false);
+    await fetchLibMissioni();
+  }
+
   // ==================== CATALOGAZIONE ====================
   // Il catalogato (CSV del sistema di catalogazione) viene confrontato con la giacenza NS condivisa (inv_snapshot):
   // destinazione RIPAX per i clienti RIPAX, RIP per gli altri; matricola in giacenza fuori destinazione → Inventory
@@ -5204,6 +5571,7 @@ export default function App() {
                   { id: 'riepilogo', label: 'Stock Spare Parts', icon: '📊' },
                   { id: 'controlli-inventariali', label: 'Controlli Inventariali', icon: '🔎' },
                   { id: 'missioni-inventario', label: 'Missioni Inventario', icon: '📱', badge: invMissioni.filter(m => m.stato !== 'chiusa').length },
+                  { id: 'missione-libera', label: 'Missione Libera', icon: '🔢' },
                 ]},
                 { group: 'Repair', modules: [
                   { id: 'spare-parts', label: 'Compatibilità', icon: '🔧' },
@@ -5286,6 +5654,7 @@ export default function App() {
                 {activeModule === 'moduli' && 'Moduli sperimentali'}
                 {activeModule === 'controlli-inventariali' && 'Controlli Inventariali'}
                 {activeModule === 'missioni-inventario' && 'Missioni Inventario'}
+                {activeModule === 'missione-libera' && 'Missione Libera'}
               </span>
               {isSper(activeModule) && (
                 <span className="text-[10px] font-black bg-amber-100 text-amber-700 px-2 py-0.5 rounded-md tracking-normal" title="Modulo sperimentale">SP</span>
@@ -7095,6 +7464,244 @@ export default function App() {
                         <button onClick={() => eliminaInvRilevazione(r)}
                           className="shrink-0 text-gray-400 hover:text-red-500 hover:bg-red-50 rounded-lg p-1.5 transition cursor-pointer md:opacity-0 md:group-hover:opacity-100"
                           title="Elimina questa rilevazione">
+                          ✕
+                        </button>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              </div>
+            </div>
+          );
+        })()}
+
+        {/* ==================== MODULO MISSIONE LIBERA (rilevazione matricolare senza lista) ==================== */}
+        {activeModule === 'missione-libera' && !libExec && (() => {
+          const attive = libMissioni.filter(m => m.stato !== 'chiusa')
+            .sort((a, b) => (b.stato === 'in_corso') - (a.stato === 'in_corso') || new Date(b.created_at) - new Date(a.created_at));
+          const chiuse = libMissioni.filter(m => m.stato === 'chiusa');
+          const lista = libFiltro === 'chiuse' ? chiuse : attive;
+          const fmtDT = iso => iso ? new Date(iso).toLocaleString('it-IT', { dateStyle: 'short', timeStyle: 'short' }) : '';
+          return (
+            <div className="space-y-5 max-w-3xl mx-auto">
+              <div className="flex items-center justify-between gap-3">
+                <div>
+                  <h2 className="text-lg font-black text-gray-800">🔢 Missione Libera</h2>
+                  <p className="text-xs text-gray-500">Rilevazione matricolare senza lista attesa: spara il bancale, poi le matricole o il QR del cartone. A fine missione scarichi l&apos;Excel.</p>
+                </div>
+                <button onClick={fetchLibMissioni}
+                  className="bg-gray-100 hover:bg-gray-200 text-gray-600 text-sm font-bold px-3 py-2.5 rounded-xl cursor-pointer transition" title="Aggiorna">
+                  ↻
+                </button>
+              </div>
+
+              <div className="bg-white p-4 rounded-2xl border border-gray-200 shadow-xs flex flex-col sm:flex-row gap-2">
+                <input type="text" value={libNuovaDescrizione} onChange={e => setLibNuovaDescrizione(e.target.value)}
+                  onKeyDown={e => { if (e.key === 'Enter' && !libLoading) creaLibMissione(); }}
+                  placeholder="Riferimento (facoltativo): cliente, DDT, motivo..."
+                  className="flex-grow bg-gray-50 border border-gray-300 rounded-xl p-2.5 text-sm focus:outline-hidden" />
+                <button onClick={creaLibMissione} disabled={libLoading}
+                  className="bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white text-sm font-black px-5 py-2.5 rounded-xl cursor-pointer transition shadow-xs whitespace-nowrap">
+                  + Nuova missione
+                </button>
+              </div>
+
+              <div className="flex bg-gray-100 rounded-xl p-1 w-fit">
+                {[{ id: 'attive', label: 'Da completare / scaricare', n: attive.length }, { id: 'chiuse', label: 'Chiuse', n: chiuse.length }].map(f => (
+                  <button key={f.id} onClick={() => setLibFiltro(f.id)}
+                    className={`text-xs font-bold px-4 py-2 rounded-lg cursor-pointer transition ${libFiltro === f.id ? 'bg-white text-blue-800 shadow-xs' : 'text-gray-400 hover:text-gray-600'}`}>
+                    {f.label} <span className="ml-1 text-[10px] opacity-70">({f.n})</span>
+                  </button>
+                ))}
+              </div>
+
+              {libLoading && <div className="text-center py-4 text-xs font-bold text-amber-600 animate-pulse">Caricamento...</div>}
+              {!libLoading && lista.length === 0 && (
+                <div className="text-center py-12 text-gray-400 text-sm">{libFiltro === 'chiuse' ? 'Nessuna missione chiusa.' : 'Nessuna missione aperta. Creane una nuova.'}</div>
+              )}
+              <div className="grid grid-cols-1 gap-3">
+                {lista.map(m => {
+                  const st = LIB_STATI[m.stato] || LIB_STATI.in_corso;
+                  const nMat = m.stato === 'chiusa' ? m.n_matricole : libProgress[m.id]?.matricole;
+                  const nBan = m.stato === 'chiusa' ? m.n_bancali : libProgress[m.id]?.bancali;
+                  return (
+                    <div key={m.id} className="bg-white p-4 rounded-2xl border border-gray-200 shadow-xs flex flex-col sm:flex-row sm:items-center gap-3">
+                      <div className="flex-grow min-w-0">
+                        <div className="flex items-center gap-2 flex-wrap">
+                          <span className="font-mono font-bold text-blue-700 text-xs">{libMissioneCode(m.id)}</span>
+                          <span className={`text-[10px] font-black px-2 py-0.5 rounded-full border ${st.cls}`}>{st.label}</span>
+                          {m.scaricata_at && m.stato !== 'chiusa' && <span className="text-[10px] font-bold text-gray-400">⬇ già scaricata</span>}
+                        </div>
+                        <p className="text-sm font-bold text-gray-800 mt-1 truncate">{m.descrizione || <span className="text-gray-400 font-normal italic">Senza riferimento</span>}</p>
+                        <p className="text-[11px] text-gray-500">
+                          {m.creata_da ? `${m.creata_da} · ` : ''}{fmtDT(m.created_at)}
+                          {m.stato === 'chiusa' && m.scaricata_at ? ` · scaricata il ${fmtDT(m.scaricata_at)}${m.scaricata_da ? ` da ${m.scaricata_da}` : ''}` : ''}
+                        </p>
+                      </div>
+                      <div className="flex items-center gap-4 shrink-0">
+                        <div className="text-right">
+                          <span className="block text-xl font-black text-gray-800 font-mono">{nMat ?? 0}</span>
+                          <span className="text-[10px] font-bold text-gray-400 uppercase">matricole</span>
+                        </div>
+                        <div className="text-right">
+                          <span className="block text-xl font-black text-gray-800 font-mono">{nBan ?? 0}</span>
+                          <span className="text-[10px] font-bold text-gray-400 uppercase">bancali</span>
+                        </div>
+                        {m.stato !== 'chiusa' && (
+                          <div className="flex flex-col gap-1">
+                            {m.stato === 'in_corso' && (
+                              <button onClick={() => apriLibMissione(m)} disabled={libLoading}
+                                className="bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white text-xs font-black px-3 py-2 rounded-lg cursor-pointer transition">
+                                Riprendi →
+                              </button>
+                            )}
+                            {m.stato === 'completata' && (
+                              <>
+                                <button onClick={() => scaricaLibMissione(m)} disabled={libLoading}
+                                  className="bg-green-600 hover:bg-green-700 disabled:opacity-50 text-white text-xs font-black px-3 py-2 rounded-lg cursor-pointer transition">
+                                  ⬇ Scarica Excel
+                                </button>
+                                <button onClick={() => riapriLibMissione(m)} disabled={libLoading}
+                                  className="text-[11px] font-bold text-blue-600 hover:bg-blue-50 px-3 py-1 rounded-lg cursor-pointer transition">
+                                  Riapri
+                                </button>
+                              </>
+                            )}
+                            <button onClick={() => annullaLibMissione(m)} disabled={libLoading}
+                              className="text-[11px] font-bold text-red-500 hover:bg-red-50 px-3 py-1 rounded-lg cursor-pointer transition">
+                              Annulla
+                            </button>
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          );
+        })()}
+
+        {activeModule === 'missione-libera' && libExec && (() => {
+          const perBancale = {};
+          libRilevazioni.forEach(r => { perBancale[r.bancale] = (perBancale[r.bancale] || 0) + 1; });
+          const segnalate = libRilevazioni.filter(r => r.nota);
+          const fbCls = {
+            success: 'bg-green-50 text-green-800 border-green-200',
+            error: 'bg-red-50 text-red-800 border-red-200',
+            warning: 'bg-amber-100 text-amber-900 border-amber-400',
+            info: 'bg-blue-50 text-blue-800 border-blue-200',
+          };
+          return (
+            <div className="grid grid-cols-1 md:grid-cols-12 gap-6 items-start">
+              <div className="md:col-span-5 space-y-4">
+                <div className="bg-white p-5 rounded-2xl shadow-xs border border-gray-200 space-y-3">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="text-[10px] sm:text-xs bg-blue-50 text-blue-700 font-bold px-2.5 py-1 rounded-md uppercase border border-blue-100">{libMissioneCode(libExec.id)}</span>
+                    <button onClick={esciLibMissione} className="text-xs font-bold text-gray-500 hover:text-gray-800 hover:bg-gray-100 px-2.5 py-1 rounded-lg cursor-pointer transition">← Sospendi</button>
+                  </div>
+                  {libExec.descrizione && <h2 className="text-base sm:text-lg font-black text-gray-800 break-words">{libExec.descrizione}</h2>}
+                  <div className="pt-3 border-t border-gray-100 grid grid-cols-2 gap-2">
+                    <div className="bg-gray-50 border border-gray-100 rounded-xl px-3 py-2 flex justify-between items-center">
+                      <span className="text-[11px] font-bold text-gray-500">🔢 Matricole</span>
+                      <span className="text-xl font-black font-mono text-blue-600">{libRilevazioni.length}</span>
+                    </div>
+                    <div className="bg-gray-50 border border-gray-100 rounded-xl px-3 py-2 flex justify-between items-center">
+                      <span className="text-[11px] font-bold text-gray-500">📦 Bancali</span>
+                      <span className="text-xl font-black font-mono text-gray-800">{libBancali.length}</span>
+                    </div>
+                  </div>
+                </div>
+
+                <div className={`p-4 rounded-2xl border-2 text-center ${libBancale ? 'bg-blue-600 border-blue-600 text-white' : 'bg-amber-50 border-dashed border-amber-300 text-amber-800'}`}>
+                  <span className={`block text-[10px] font-black uppercase tracking-wider ${libBancale ? 'text-blue-100' : ''}`}>Bancale in lavorazione</span>
+                  <span className="block text-2xl font-black font-mono mt-0.5 break-all">{libBancale || 'Spara PLT-GGMMAA-001'}</span>
+                  {libBancale && <span className="block text-xs text-blue-100 mt-0.5">{perBancale[libBancale] || 0} matricole su questo bancale</span>}
+                </div>
+
+                <form onSubmit={handleLibScan} className="space-y-2">
+                  <label className="block text-xs sm:text-sm font-bold text-gray-500 uppercase tracking-wider">Input Terminale / Scanner:</label>
+                  <input
+                    type="text"
+                    ref={libScannerRef}
+                    value={libScanner}
+                    onChange={e => setLibScanner(e.target.value)}
+                    autoComplete="off" autoCorrect="off" autoCapitalize="off" spellCheck="false"
+                    placeholder={libBancale ? 'Spara matricola, QR cartone o nuovo bancale...' : "Spara l'etichetta del bancale..."}
+                    className="w-full bg-white border-2 border-blue-500 text-gray-800 font-mono text-base sm:text-xl p-4 rounded-xl shadow-inner focus:outline-hidden text-center"
+                  />
+                </form>
+
+                {libFeedback.text && (
+                  <div className={`p-4 rounded-xl text-center border-2 ${fbCls[libFeedback.type] || fbCls.info}`}>
+                    <p className={`font-black break-words ${libFeedback.type === 'warning' ? 'text-lg sm:text-xl' : 'text-sm'}`}>
+                      {libFeedback.type === 'warning' ? '⚠ ' : ''}{libFeedback.text}
+                    </p>
+                    {libFeedback.sub && <p className="text-xs mt-1 opacity-80 break-words">{libFeedback.sub}</p>}
+                  </div>
+                )}
+
+                <button onClick={terminaLibMissione} disabled={libLoading}
+                  className="w-full bg-green-600 hover:bg-green-700 disabled:opacity-50 disabled:cursor-not-allowed text-white font-black p-4 rounded-xl text-base shadow-md transition cursor-pointer flex items-center justify-center gap-2">
+                  ✓ Termina missione
+                </button>
+              </div>
+
+              <div className="md:col-span-7 space-y-4">
+                {libBancali.length > 0 && (
+                  <div className="bg-white p-4 rounded-2xl shadow-xs border border-gray-200 space-y-2">
+                    <h3 className="text-xs sm:text-sm font-bold text-gray-400 uppercase tracking-wider">Bancali ({libBancali.length})</h3>
+                    <div className="flex flex-wrap gap-2">
+                      {libBancali.map(b => (
+                        <span key={b} className={`text-xs font-mono font-bold px-2.5 py-1 rounded-lg border ${b === libBancale ? 'bg-blue-600 text-white border-blue-600' : perBancale[b] ? 'bg-gray-50 text-gray-700 border-gray-200' : 'bg-amber-50 text-amber-700 border-amber-200'}`}
+                          title={perBancale[b] ? '' : 'Bancale senza matricole'}>
+                          {b} · {perBancale[b] || 0}
+                        </span>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                {segnalate.length > 0 && (
+                  <div className="bg-amber-50 p-4 rounded-2xl border border-amber-200 space-y-2">
+                    <h3 className="text-xs sm:text-sm font-black text-amber-800 uppercase tracking-wider">⚠ Già presenti in altre missioni ({segnalate.length})</h3>
+                    <ul className="divide-y divide-amber-100 max-h-40 overflow-y-auto">
+                      {segnalate.map(r => (
+                        <li key={r.matricola} className="py-1.5 flex items-center gap-x-3 gap-y-0.5 flex-wrap">
+                          <span className="font-mono font-bold text-amber-900 text-sm">{r.matricola}</span>
+                          <span className="text-[11px] text-amber-700">📦 {r.bancale}</span>
+                          <span className="text-[10px] text-amber-600 ml-auto">{r.nota}</span>
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
+
+                <div className="bg-white p-5 rounded-2xl shadow-xs border border-gray-200 space-y-3">
+                  <div className="flex justify-between items-center border-b border-gray-100 pb-2">
+                    <h3 className="text-xs sm:text-sm font-bold text-gray-400 uppercase tracking-wider">Matricole rilevate</h3>
+                    <span className="text-xs font-bold text-gray-400">{libRilevazioni.length}</span>
+                  </div>
+                  {libRilevazioni.length > 50 && (
+                    <p className="text-[11px] text-gray-400 italic">Mostrate le ultime 50 di {libRilevazioni.length} matricole rilevate.</p>
+                  )}
+                  {libRilevazioni.length === 0 && <p className="text-center py-8 text-gray-400 text-sm">Nessuna matricola rilevata.</p>}
+                  <ul className="divide-y divide-gray-100 max-h-80 md:max-h-[500px] overflow-y-auto font-mono text-sm pr-1">
+                    {libRilevazioni.slice(0, 50).map(r => (
+                      <li key={r.matricola} className="py-2.5 flex items-center gap-3 group">
+                        <div className="flex-grow min-w-0">
+                          <span className={`font-bold text-base truncate block ${r.nota ? 'text-amber-800' : 'text-gray-900'}`}>{r.nota ? '🟠' : '🟢'} {r.matricola}</span>
+                          <div className="text-xs text-gray-400 mt-1 flex gap-x-4 flex-wrap font-sans">
+                            <span><strong>Bancale:</strong> {r.bancale}</span>
+                            {r.modello && <span><strong>Modello:</strong> {r.modello}</span>}
+                            {r.fonte === 'qr' && <span>QR cartone</span>}
+                            {r.operatore && <span>{r.operatore}</span>}
+                            <span className="ml-auto text-[11px] font-medium text-gray-300">{r.rilevata_at ? new Date(r.rilevata_at).toLocaleTimeString('it-IT') : ''}</span>
+                          </div>
+                        </div>
+                        <button onClick={() => eliminaLibRilevazione(r)}
+                          className="shrink-0 text-gray-400 hover:text-red-500 hover:bg-red-50 rounded-lg p-1.5 transition cursor-pointer md:opacity-0 md:group-hover:opacity-100"
+                          title="Elimina questa matricola">
                           ✕
                         </button>
                       </li>
