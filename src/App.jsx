@@ -1844,6 +1844,7 @@ export default function App() {
       else stato = candidati.length > 1 ? 'ambiguo' : 'non_assegnato';
       return {
         pnit, type, candidati, pnUfficiale, isNA, isOrphan, locked, stato,
+        sogliaScorta: saved?.soglia_scorta || 0, lottoAcquisto: saved?.lotto_acquisto || 0,
         refFromType, rplusFromType, refOverride, rplusOverride, refEffective, rplusEffective,
         updatedAt: saved?.updated_at, updatedBy: saved?.updated_by,
       };
@@ -1964,6 +1965,25 @@ export default function App() {
   // Aggiunge (solo additivo, mai toglie) un flag REF/R+ specifico per una combinazione PNIT+SPARE,
   // indipendente dal flag globale del TYPE in Elenco TYPE. field: 'ref_override' | 'rplus_override'.
   async function setDistinteBaseOverride(pnit, type, field, value) {
+    const nowIso = new Date().toISOString();
+    const isNewRow = !distinteBase.some(r => r.pnit === pnit && r.type === type);
+    setDistinteBase(prev => {
+      const key = `${pnit}||${type}`;
+      const idx = prev.findIndex(r => `${r.pnit}||${r.type}` === key);
+      if (idx === -1) return [...prev, { pnit, type, [field]: value, n_a: false, pn_ufficiale: null, updated_at: nowIso, updated_by: currentUser || '' }];
+      const next = [...prev];
+      next[idx] = { ...next[idx], [field]: value, updated_at: nowIso, updated_by: currentUser || '' };
+      return next;
+    });
+    const payload = { pnit, type, [field]: value, updated_at: nowIso, updated_by: currentUser || '' };
+    if (isNewRow) payload.n_a = false; // colonna NOT NULL: va specificata esplicitamente in inserimento
+    const { error } = await supabase.from('distinte_base').upsert(payload, { onConflict: 'pnit,type' });
+    if (error) { alert('Errore salvataggio: ' + error.message); fetchDistinteBase(); }
+  }
+
+  // Soglia di scorta / lotto d'acquisto della combinazione PNIT+SPARE (usati dall'MRP).
+  // field: 'soglia_scorta' | 'lotto_acquisto'. value: intero >= 0 (soglia) / > 0 (lotto); null = non impostato.
+  async function setDistinteBaseSogliaLotto(pnit, type, field, value) {
     const nowIso = new Date().toISOString();
     const isNewRow = !distinteBase.some(r => r.pnit === pnit && r.type === type);
     setDistinteBase(prev => {
@@ -8463,15 +8483,19 @@ export default function App() {
             // Refurb: se R+ (dal TYPE o dall'override specifico per questo PNIT), servono (terminali da refurbishare del PNIT) × % refurbishing
             const refurbQty = r.rplusEffective ? Math.round((refurb[pnit] || 0) * perc) : 0;
             const stima = Math.round(media * mesi + nomaterial + refurbQty);
-            const fabbisogno = stima - stock - inOrdine;
-            // Arrotonda per eccesso a multipli di 100. Se la combinazione è bloccata in Distinte Base, l'ordine resta a 0.
+            // Soglia di scorta (pezzi) e lotto d'acquisto impostati in Distinte Base > Stock & Costo.
+            // Lotto vuoto = 100 (comportamento storico).
+            const soglia = r.sogliaScorta || 0;
+            const lotto = r.lottoAcquisto > 0 ? r.lottoAcquisto : 100;
+            const fabbisogno = stima + soglia - stock - inOrdine;
+            // Arrotonda per eccesso a multipli del lotto. Se la combinazione è bloccata in Distinte Base, l'ordine resta a 0.
             const locked = !!r.locked;
-            const daOrdinare = (locked || fabbisogno <= 0) ? 0 : Math.ceil(fabbisogno / 100) * 100;
+            const daOrdinare = (locked || fabbisogno <= 0) ? 0 : Math.ceil(fabbisogno / lotto) * lotto;
             const prezzo = pn ? (priceByPn[pn] || 0) : 0;
             const valuta = pn ? (valutaByPn[pn] || '') : '';
             const ptot = daOrdinare > 0 ? prezzo * daOrdinare : 0;
             const paxStatus = (paxStatusByPnit[pnit] || '').trim();
-            return { pnit, type, pn, media, nomaterial, refurbQty, stock, inArrivo, inOrdine, stima, daOrdinare, prezzo, valuta, ptot, paxStatus, locked };
+            return { pnit, type, pn, media, nomaterial, refurbQty, stock, inArrivo, inOrdine, stima, soglia, lotto, daOrdinare, prezzo, valuta, ptot, paxStatus, locked };
           });
 
           const uniquePaxStatus = [...new Set(combos.map(c => c.paxStatus).filter(Boolean))].sort();
@@ -8480,7 +8504,7 @@ export default function App() {
           if (q) combos = combos.filter(c => `${c.pnit} ${c.type} ${c.pn}`.toLowerCase().includes(q));
           const q2 = matriceSearch2.trim().toLowerCase();
           if (q2) combos = combos.filter(c => `${c.pnit} ${c.type} ${c.pn}`.toLowerCase().includes(q2));
-          if (matriceSoloStima) combos = combos.filter(c => c.stima > 0);
+          if (matriceSoloStima) combos = combos.filter(c => c.stima > 0 || c.soglia > 0);
           if (matriceSoloDaOrdinare) combos = combos.filter(c => c.daOrdinare > 0);
           if (matriceSoloSenzaPN) combos = combos.filter(c => !c.pn);
           if (matriceFilterPaxStatus) combos = combos.filter(c => c.paxStatus === matriceFilterPaxStatus);
@@ -8514,11 +8538,30 @@ export default function App() {
                     const rows = combos.map(c => ({
                       'PNIT': c.pnit, 'HW Status': c.paxStatus, 'SPARE': c.type, 'PN Ufficiale': c.pn,
                       'Cons. medio/mese': c.media, 'NoMaterial': c.nomaterial,
-                      'Refurb': c.refurbQty, 'Stima necessaria': c.stima, 'Stock': c.stock,
+                      'Refurb': c.refurbQty, 'Stima necessaria': c.stima, 'Soglia scorta': c.soglia, 'Lotto': c.lotto, 'Stock': c.stock,
                       'In arrivo': c.inArrivo, 'In ordine': c.inOrdine, 'Da ordinare': c.daOrdinare,
                       'Locked': c.locked ? 'SI' : '', 'Prezzo unit.': c.prezzo, 'P.tot': c.ptot,
                     }));
                     const ws = XLSX.utils.json_to_sheet(rows);
+                    // Formato contabilità: quantità senza simbolo, prezzi con il simbolo della valuta della riga (se presente)
+                    const ACC_INT = '_-* #,##0_-;-* #,##0_-;_-* "-"_-;_-@_-';
+                    const ACC_DEC = '_-* #,##0.00_-;-* #,##0.00_-;_-* "-"??_-;_-@_-';
+                    const accMoney = (sym) => sym
+                      ? `_-"${sym.replace(/"/g, '')}"* #,##0.00_-;-"${sym.replace(/"/g, '')}"* #,##0.00_-;_-"${sym.replace(/"/g, '')}"* "-"??_-;_-@_-`
+                      : ACC_DEC;
+                    const keys = rows.length ? Object.keys(rows[0]) : [];
+                    const intKeys = ['NoMaterial', 'Refurb', 'Stima necessaria', 'Soglia scorta', 'Lotto', 'Stock', 'In arrivo', 'In ordine', 'Da ordinare'];
+                    rows.forEach((row, i) => {
+                      const sym = currencySymbol(combos[i].valuta);
+                      keys.forEach((k, c) => {
+                        const cell = ws[XLSX.utils.encode_cell({ r: i + 1, c })];
+                        if (!cell || typeof cell.v !== 'number') return;
+                        if (intKeys.includes(k)) cell.z = ACC_INT;
+                        else if (k === 'Cons. medio/mese') cell.z = ACC_DEC;
+                        else if (k === 'Prezzo unit.' || k === 'P.tot') cell.z = accMoney(sym);
+                      });
+                    });
+                    ws['!cols'] = keys.map(k => ({ wch: ['Prezzo unit.', 'P.tot'].includes(k) ? 16 : (k === 'SPARE' || k === 'PN Ufficiale' || k === 'PNIT') ? 24 : 14 }));
                     const wb = XLSX.utils.book_new();
                     XLSX.utils.book_append_sheet(wb, ws, 'MRP');
                     XLSX.writeFile(wb, `mrp_${new Date().toISOString().slice(0, 10)}.xlsx`);
@@ -8549,7 +8592,7 @@ export default function App() {
                     className="min-w-[220px] bg-gray-50 border border-gray-300 rounded-xl p-2.5 text-xs focus:outline-hidden" />
                   <label className="flex items-center gap-2 cursor-pointer">
                     <input type="checkbox" checked={matriceSoloStima} onChange={e => { setMatriceSoloStima(e.target.checked); setMatricePage(0); }} className="w-4 h-4 accent-blue-600 cursor-pointer" />
-                    <span className="text-xs font-semibold text-gray-700">Solo con stima necessaria</span>
+                    <span className="text-xs font-semibold text-gray-700">Solo con stima o soglia</span>
                   </label>
                   <label className="flex items-center gap-2 cursor-pointer">
                     <input type="checkbox" checked={matriceSoloDaOrdinare} onChange={e => { setMatriceSoloDaOrdinare(e.target.checked); setMatricePage(0); }} className="w-4 h-4 accent-blue-600 cursor-pointer" />
@@ -8607,7 +8650,7 @@ export default function App() {
                   <input type="number" min="0" step="1" value={refurbPerc}
                     onChange={e => setRefurbPerc(e.target.value)}
                     className="w-16 bg-gray-50 border border-gray-300 rounded-lg p-1.5 text-xs text-right focus:outline-hidden" />
-                  <span className="text-gray-400">· Stima = consumo × mesi + NoMaterial + Refurb</span>
+                  <span className="text-gray-400">· Stima = consumo × mesi + NoMaterial + Refurb · Fabbisogno = Stima + Soglia − Stock − In ordine · Da ordinare arrotondato al Lotto (vuoto = 100)</span>
                   <span>· {combos.length} combinazioni</span>
                 </div>
                 <span className="font-black text-blue-600">Stock: {tot.stock} · <span className="text-emerald-600">In arrivo: {tot.inArrivo}</span> · <span className="text-amber-600">In ordine: {tot.inOrdine}</span> · <span className="text-gray-800">Valore d&apos;acquisto: {fmtEuro(tot.ptot)}</span></span>
@@ -8631,7 +8674,7 @@ export default function App() {
 
               {combos.length > 0 ? (
                 <div className="bg-white rounded-2xl border border-gray-200 shadow-xs overflow-x-auto">
-                  <table className="w-full min-w-[1400px] text-left border-collapse text-xs">
+                  <table className="w-full min-w-[1550px] text-left border-collapse text-xs">
                     <thead className="bg-gray-50 border-b border-gray-200 text-[10px] font-black text-gray-500 uppercase tracking-wider">
                       <tr>
                         <th className="px-3 py-3 cursor-pointer select-none whitespace-nowrap hover:bg-gray-100 transition" onClick={() => toggleSort('pnit')}>PNIT{arrow('pnit')}</th>
@@ -8642,6 +8685,8 @@ export default function App() {
                         <th className="px-3 py-3 text-right text-rose-600 cursor-pointer select-none whitespace-nowrap hover:bg-gray-100 transition" onClick={() => toggleSort('nomaterial')}>NoMaterial{arrow('nomaterial')}</th>
                         <th className="px-3 py-3 text-right text-orange-600 cursor-pointer select-none whitespace-nowrap hover:bg-gray-100 transition" onClick={() => toggleSort('refurbQty')}>Refurb{arrow('refurbQty')}</th>
                         <th className="px-3 py-3 text-right text-blue-700 cursor-pointer select-none whitespace-nowrap hover:bg-gray-100 transition" onClick={() => toggleSort('stima')}>Stima necessaria{arrow('stima')}</th>
+                        <th className="px-3 py-3 text-right text-teal-700 cursor-pointer select-none whitespace-nowrap hover:bg-gray-100 transition" onClick={() => toggleSort('soglia')}>Soglia{arrow('soglia')}</th>
+                        <th className="px-3 py-3 text-right text-teal-700 cursor-pointer select-none whitespace-nowrap hover:bg-gray-100 transition" onClick={() => toggleSort('lotto')}>Lotto{arrow('lotto')}</th>
                         <th className="px-3 py-3 text-right cursor-pointer select-none whitespace-nowrap hover:bg-gray-100 transition" onClick={() => toggleSort('stock')}>Stock{arrow('stock')}</th>
                         <th className="px-3 py-3 text-right text-emerald-600 cursor-pointer select-none whitespace-nowrap hover:bg-gray-100 transition" onClick={() => toggleSort('inArrivo')}>In arrivo{arrow('inArrivo')}</th>
                         <th className="px-3 py-3 text-right text-amber-600 cursor-pointer select-none whitespace-nowrap hover:bg-gray-100 transition" onClick={() => toggleSort('inOrdine')}>In ordine{arrow('inOrdine')}</th>
@@ -8668,6 +8713,8 @@ export default function App() {
                           <td className="px-3 py-2.5 text-right font-mono text-rose-600">{c.nomaterial || ''}</td>
                           <td className="px-3 py-2.5 text-right font-mono text-orange-600">{c.refurbQty || ''}</td>
                           <td className="px-3 py-2.5 text-right font-mono font-black text-blue-800">{c.stima || ''}</td>
+                          <td className="px-3 py-2.5 text-right font-mono text-teal-700">{c.soglia || ''}</td>
+                          <td className="px-3 py-2.5 text-right font-mono text-teal-700">{c.lotto}</td>
                           <td className="px-3 py-2.5 text-right font-mono font-black text-blue-700">{c.stock}</td>
                           <td className="px-3 py-2.5 text-right font-mono font-black text-emerald-600">{c.inArrivo || ''}</td>
                           <td className="px-3 py-2.5 text-right font-mono font-black text-amber-600">{c.inOrdine || ''}</td>
@@ -8690,6 +8737,26 @@ export default function App() {
         {/* ==================== MODULO DISTINTE BASE ==================== */}
         {activeModule === 'distinte-base' && (() => {
           const dbasePnitOptions = [...new Set(dbaseRows.map(r => r.pnit))].sort();
+
+          // Filtro con suggerimenti: se il testo coincide con un'opzione vale il match esatto (scelta dall'elenco),
+          // altrimenti ricerca parziale mentre si scrive.
+          const matchCombo = (val, filter, optionsList) => {
+            const f = filter.trim().toLowerCase();
+            if (!f) return true;
+            const v = String(val || '').toLowerCase();
+            return optionsList.some(o => o.toLowerCase() === f) ? v === f : v.includes(f);
+          };
+          const comboFilter = (listId, value, onChange, options, placeholder) => (
+            <div className="relative min-w-[190px]">
+              <input list={listId} value={value} onChange={e => onChange(e.target.value)} placeholder={placeholder}
+                className="w-full bg-gray-50 border border-gray-300 rounded-xl p-2.5 pr-8 text-xs focus:outline-hidden" />
+              <datalist id={listId}>{options.map(o => <option key={o} value={o} />)}</datalist>
+              {value && (
+                <button type="button" onClick={() => onChange('')} title="Azzera filtro"
+                  className="absolute right-2 top-1/2 -translate-y-1/2 text-gray-400 hover:text-gray-700 text-sm leading-none cursor-pointer">✕</button>
+              )}
+            </div>
+          );
 
           // Stato PAX (EOL, TESTING, AVAILABLE...) dell'hardware per PNIT: dall'Anagrafica
           const paxStatusByPnit = {};
@@ -8763,6 +8830,7 @@ export default function App() {
               return {
                 pnit: r.pnit, type: r.type, pnUfficiale: r.pnUfficiale, famiglia: famigliaByPnit[r.pnit] || '',
                 paxStatus: paxStatusByPnit[r.pnit] || '', refEffective: r.refEffective, rplusEffective: r.rplusEffective,
+                sogliaScorta: r.sogliaScorta, lottoAcquisto: r.lottoAcquisto,
                 stock, inArrivo, inOrdine, prezzo: c ? c.prezzo : 0, valuta: c ? c.valuta : '',
               };
             });
@@ -8773,8 +8841,8 @@ export default function App() {
           if (sq) dbaseStockRows = dbaseStockRows.filter(r => `${r.pnit} ${r.type} ${r.pnUfficiale}`.toLowerCase().includes(sq));
           const sq2 = dbaseStockSearch2.trim().toLowerCase();
           if (sq2) dbaseStockRows = dbaseStockRows.filter(r => `${r.pnit} ${r.type} ${r.pnUfficiale}`.toLowerCase().includes(sq2));
-          if (dbaseStockFilterPnit) dbaseStockRows = dbaseStockRows.filter(r => r.pnit === dbaseStockFilterPnit);
-          if (dbaseStockFilterFamiglia) dbaseStockRows = dbaseStockRows.filter(r => r.famiglia === dbaseStockFilterFamiglia);
+          if (dbaseStockFilterPnit.trim()) dbaseStockRows = dbaseStockRows.filter(r => matchCombo(r.pnit, dbaseStockFilterPnit, dbasePnitOptions));
+          if (dbaseStockFilterFamiglia.trim()) dbaseStockRows = dbaseStockRows.filter(r => matchCombo(r.famiglia, dbaseStockFilterFamiglia, dbaseStockFamiglie));
           if (dbaseStockSoloRef) dbaseStockRows = dbaseStockRows.filter(r => r.refEffective);
           if (dbaseStockSoloRplus) dbaseStockRows = dbaseStockRows.filter(r => r.rplusEffective);
           dbaseStockRows = [...dbaseStockRows].sort((a, b) => a.pnit.localeCompare(b.pnit) || a.type.localeCompare(b.type));
@@ -8817,7 +8885,7 @@ export default function App() {
           if (q) rows = rows.filter(r => `${r.pnit} ${r.type}`.toLowerCase().includes(q));
           const q2 = dbaseSearch2.trim().toLowerCase();
           if (q2) rows = rows.filter(r => `${r.pnit} ${r.type}`.toLowerCase().includes(q2));
-          if (dbasePnitFilter) rows = rows.filter(r => r.pnit === dbasePnitFilter);
+          if (dbasePnitFilter.trim()) rows = rows.filter(r => matchCombo(r.pnit, dbasePnitFilter, dbasePnitOptions));
           if (dbaseSoloDaAssegnare) rows = rows.filter(r => r.stato === 'ambiguo' || r.stato === 'non_assegnato');
           if (dbaseSoloAmbigui) rows = rows.filter(r => r.stato === 'ambiguo');
           if (dbaseNascondiNA) rows = rows.filter(r => !r.isNA);
@@ -8910,11 +8978,7 @@ export default function App() {
                     <input value={dbaseSearch2} onChange={e => { setDbaseSearch2(e.target.value); setDbasePage(0); }}
                       placeholder="Secondo filtro (AND)..."
                       className="min-w-[220px] bg-gray-50 border border-gray-300 rounded-xl p-2.5 text-xs focus:outline-hidden" />
-                    <select value={dbasePnitFilter} onChange={e => { setDbasePnitFilter(e.target.value); setDbasePage(0); }}
-                      className="min-w-[160px] bg-gray-50 border border-gray-300 rounded-xl p-2.5 text-xs focus:outline-hidden">
-                      <option value="">Tutti i PNIT</option>
-                      {dbasePnitOptions.map(p => <option key={p} value={p}>{p}</option>)}
-                    </select>
+                    {comboFilter('dbase-pnit-list', dbasePnitFilter, v => { setDbasePnitFilter(v); setDbasePage(0); }, dbasePnitOptions, 'Tutti i PNIT (scrivi per cercare)')}
                     <label className="flex items-center gap-2 cursor-pointer">
                       <input type="checkbox" checked={dbaseSoloDaAssegnare} onChange={e => { setDbaseSoloDaAssegnare(e.target.checked); setDbasePage(0); }} className="w-4 h-4 accent-blue-600 cursor-pointer" />
                       <span className="text-xs font-semibold text-gray-700">Solo da assegnare ({nDaAssegnare})</span>
@@ -9137,6 +9201,7 @@ export default function App() {
                         'PNIT': r.pnit, 'Famiglia TML': r.famiglia, 'HW Status': r.paxStatus, 'SPARE': r.type, 'PN Ufficiale': r.pnUfficiale,
                         'REF': r.refEffective ? 'SI' : '', 'R+': r.rplusEffective ? 'SI' : '',
                         'Stock': r.stock, 'In arrivo': r.inArrivo, 'In ordine': r.inOrdine,
+                        'Soglia scorta': r.sogliaScorta || '', 'Lotto acquisto': r.lottoAcquisto || '',
                         'Costo': r.prezzo || '', 'Valuta': r.valuta || '',
                       }));
                       const ws = XLSX.utils.json_to_sheet(out);
@@ -9155,16 +9220,8 @@ export default function App() {
                     <input value={dbaseStockSearch2} onChange={e => { setDbaseStockSearch2(e.target.value); setDbaseStockPage(0); }}
                       placeholder="Secondo filtro (AND)..."
                       className="min-w-[220px] bg-gray-50 border border-gray-300 rounded-xl p-2.5 text-xs focus:outline-hidden" />
-                    <select value={dbaseStockFilterPnit} onChange={e => { setDbaseStockFilterPnit(e.target.value); setDbaseStockPage(0); }}
-                      className="min-w-[160px] bg-gray-50 border border-gray-300 rounded-xl p-2.5 text-xs focus:outline-hidden">
-                      <option value="">Tutti i terminali (TML)</option>
-                      {dbasePnitOptions.map(p => <option key={p} value={p}>{p}</option>)}
-                    </select>
-                    <select value={dbaseStockFilterFamiglia} onChange={e => { setDbaseStockFilterFamiglia(e.target.value); setDbaseStockPage(0); }}
-                      className="min-w-[160px] bg-gray-50 border border-gray-300 rounded-xl p-2.5 text-xs focus:outline-hidden">
-                      <option value="">Tutte le famiglie TML</option>
-                      {dbaseStockFamiglie.map(f => <option key={f} value={f}>{f}</option>)}
-                    </select>
+                    {comboFilter('dbase-stock-pnit-list', dbaseStockFilterPnit, v => { setDbaseStockFilterPnit(v); setDbaseStockPage(0); }, dbasePnitOptions, 'Terminale TML (scrivi per cercare)')}
+                    {comboFilter('dbase-stock-famiglia-list', dbaseStockFilterFamiglia, v => { setDbaseStockFilterFamiglia(v); setDbaseStockPage(0); }, dbaseStockFamiglie, 'Famiglia TML (scrivi per cercare)')}
                     <label className="flex items-center gap-2 cursor-pointer">
                       <input type="checkbox" checked={dbaseStockSoloRef} onChange={e => { setDbaseStockSoloRef(e.target.checked); setDbaseStockPage(0); }} className="w-4 h-4 accent-blue-600 cursor-pointer" />
                       <span className="text-xs font-semibold text-gray-700">Solo REF</span>
@@ -9209,6 +9266,8 @@ export default function App() {
                             <th className="px-3 py-3 text-right">Stock</th>
                             <th className="px-3 py-3 text-right">In arrivo</th>
                             <th className="px-3 py-3 text-right">In ordine</th>
+                            <th className="px-3 py-3 text-right text-teal-700" title="Scorta di sicurezza (pezzi): si somma alla stima nel fabbisogno MRP">Soglia scorta</th>
+                            <th className="px-3 py-3 text-right text-teal-700" title="Lotto d'acquisto: l'MRP arrotonda il Da ordinare a multipli del lotto (vuoto = 100)">Lotto acquisto</th>
                           </tr>
                         </thead>
                         <tbody className="divide-y divide-gray-100">
@@ -9224,6 +9283,29 @@ export default function App() {
                               <td className="px-3 py-2.5 text-right font-mono font-black text-blue-700">{r.stock || ''}</td>
                               <td className="px-3 py-2.5 text-right font-mono font-black text-emerald-600">{r.inArrivo || ''}</td>
                               <td className="px-3 py-2.5 text-right font-mono font-black text-amber-600">{r.inOrdine || ''}</td>
+                              {[
+                                { field: 'soglia_scorta', value: r.sogliaScorta, min: 0, ph: '0' },
+                                { field: 'lotto_acquisto', value: r.lottoAcquisto, min: 1, ph: '100' },
+                              ].map(f => (
+                                <td key={f.field} className="px-3 py-1.5 text-right">
+                                  {canEdit('distinte-base') ? (
+                                    <input type="number" min={f.min} step="1" placeholder={f.ph}
+                                      key={`${r.pnit}||${r.type}||${f.field}||${f.value}`}
+                                      defaultValue={f.value || ''}
+                                      onBlur={e => {
+                                        const raw = e.target.value.trim();
+                                        const n = raw === '' ? null : Math.floor(Number(raw));
+                                        if (n !== null && (!Number.isFinite(n) || n < f.min)) { e.target.value = f.value || ''; return; }
+                                        if ((n || 0) === (f.value || 0)) return;
+                                        setDistinteBaseSogliaLotto(r.pnit, r.type, f.field, n);
+                                      }}
+                                      onKeyDown={e => { if (e.key === 'Enter') e.target.blur(); }}
+                                      className="w-20 bg-gray-50 border border-gray-300 rounded-lg p-1.5 text-[11px] font-mono text-right focus:outline-hidden focus:border-teal-500" />
+                                  ) : (
+                                    <span className="font-mono text-teal-700">{f.value || ''}</span>
+                                  )}
+                                </td>
+                              ))}
                             </tr>
                           ))}
                         </tbody>
