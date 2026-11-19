@@ -450,7 +450,7 @@ export default function App() {
   const [spFilterRef, setSpFilterRef] = useState(false);
   const [spFilterRplus, setSpFilterRplus] = useState(false);
   const [spFilterNoMatch, setSpFilterNoMatch] = useState(false);
-  const [spStaleImportRows, setSpStaleImportRows] = useState([]); // righe pre-import il cui PN+Terminal PN non compare più nel file appena caricato (probabile PN rinominato)
+  const [spStaleImportRows, setSpStaleImportRows] = useState([]); // righe pre-import il cui PN+Terminal PN non compare più nel file appena caricato (PN, PNIT o SPARE rinominato?)
   const [spFilterStale, setSpFilterStale] = useState(false);
 
   // Stock
@@ -1048,7 +1048,8 @@ export default function App() {
       const seen = new Set();
       const toUpsert = rows
         .filter(r => {
-          const key = `${String(r['PN']).trim()}__${String(r['Terminal PN']).trim()}`;
+          // Riga = PN + Terminal PN + PNIT + TYPE: lo stesso PN può comparire sullo stesso Terminal PN con SPARE o PNIT diversi
+          const key = [r['PN'], r['Terminal PN'], r['PNIT'], r['TYPE']].map(v => String(v ?? '').trim()).join('__');
           if (!String(r['PN']).trim() || seen.has(key)) return false;
           seen.add(key);
           return true;
@@ -1068,17 +1069,18 @@ export default function App() {
           };
         });
 
-      const { error } = await supabase.from('spare_parts').upsert(toUpsert, { onConflict: 'pn,terminal_pn' });
+      const { error } = await supabase.from('spare_parts').upsert(toUpsert, { onConflict: 'pn,terminal_pn,pnit,type' });
       if (error) { alert("Errore salvataggio: " + error.message); }
       else {
         await fetchSpareParts();
         await recordImportMeta('spare_parts');
-        // Righe presenti prima dell'import il cui PN+Terminal PN non compare nel nuovo file: l'upsert è
-        // solo additivo (non cancella), quindi restano a DB come orfane — es. quando si rinomina un PN
-        // nel file, la vecchia riga con il PN precedente non viene toccata dall'import.
-        const newKeys = new Set(toUpsert.map(r => `${r.pn}__${r.terminal_pn}`));
-        const stale = previousRows.filter(p => !newKeys.has(`${(p.pn || '').trim()}__${(p.terminal_pn || '').trim()}`));
-        setSpStaleImportRows(stale.map(p => ({ pn: p.pn, terminal_pn: p.terminal_pn, pnit: p.pnit, type: p.type })));
+        // Righe presenti prima dell'import la cui chiave (PN+Terminal PN+PNIT+TYPE) non compare nel nuovo file:
+        // l'upsert è solo additivo (non cancella), quindi restano a DB come orfane — es. quando si rinomina
+        // un PN, un PNIT o uno SPARE nel file, la vecchia riga non viene toccata dall'import.
+        const keyOf = p => [p.pn, p.terminal_pn, p.pnit, p.type].map(v => String(v ?? '').trim()).join('__');
+        const newKeys = new Set(toUpsert.map(keyOf));
+        const stale = previousRows.filter(p => !newKeys.has(keyOf(p)));
+        setSpStaleImportRows(stale.map(p => ({ id: p.id, pn: p.pn, terminal_pn: p.terminal_pn, pnit: p.pnit, type: p.type })));
         alert(`${toUpsert.length} ricambi caricati.`);
       }
     };
@@ -1087,12 +1089,12 @@ export default function App() {
 
   async function removeStaleSparePart(row) {
     if (myRole !== 'admin') return;
-    if (!window.confirm(`Eliminare definitivamente PN ${row.pn} — Terminal PN ${row.terminal_pn}?`)) return;
+    if (!window.confirm(`Eliminare definitivamente PN ${row.pn} — Terminal PN ${row.terminal_pn} (PNIT ${row.pnit}, SPARE ${row.type})?`)) return;
     setSpLoading(true);
-    const { error } = await supabase.from('spare_parts').delete().eq('pn', row.pn).eq('terminal_pn', row.terminal_pn);
+    const { error } = await supabase.from('spare_parts').delete().eq('id', row.id);
     if (error) { alert('Errore: ' + error.message); setSpLoading(false); return; }
     await fetchSpareParts();
-    const remaining = spStaleImportRows.filter(r => !(r.pn === row.pn && r.terminal_pn === row.terminal_pn));
+    const remaining = spStaleImportRows.filter(r => r.id !== row.id);
     setSpStaleImportRows(remaining);
     if (remaining.length === 0) setSpFilterStale(false);
     setSpLoading(false);
@@ -1110,7 +1112,7 @@ export default function App() {
     for (let i = 0; i < spStaleImportRows.length; i += CONCURRENCY) {
       const batch = spStaleImportRows.slice(i, i + CONCURRENCY);
       const results = await Promise.all(batch.map(r =>
-        supabase.from('spare_parts').delete().eq('pn', r.pn).eq('terminal_pn', r.terminal_pn)
+        supabase.from('spare_parts').delete().eq('id', r.id)
       ));
       results.forEach(({ error }) => { if (error) errors.push(error.message); });
     }
@@ -1139,19 +1141,22 @@ export default function App() {
     if (!entries.length && validNewRows.length === 0) return;
     setSpLoading(true);
     const errors = [];
-    // Compatibilità è solo anagrafica tecnica: si modificano solo PNIT e TYPE (PN/Terminal PN sono la chiave,
-    // impostabile solo in inserimento). Tutto il resto è ereditato da Anagrafica/Elenco TYPE, non più scritto qui.
+    // Compatibilità è solo anagrafica tecnica: si modificano solo PNIT e TYPE (PN/Terminal PN sono impostabili
+    // solo in inserimento). Le righe esistenti si aggiornano per id; se PNIT/TYPE modificati coincidono con
+    // un'altra riga (stessa chiave PN+Terminal PN+PNIT+TYPE) il DB rifiuta l'update e l'errore viene mostrato.
+    // Tutto il resto è ereditato da Anagrafica/Elenco TYPE, non più scritto qui.
     const calcCodice = (pnit, type) => [pnit, type].filter(Boolean).join('');
 
     // 1. Aggiornamenti righe esistenti
     for (const [rowKey, changes] of entries) {
-      const original = spareParts.find(p => `${p.pn}_${p.terminal_pn}` === rowKey);
+      const original = spareParts.find(p => String(p.id) === rowKey);
+      if (!original) continue;
       const pnit = (changes.pnit ?? original.pnit ?? '').trim();
       const type = (changes.type ?? original.type ?? '').trim();
       const { error } = await supabase.from('spare_parts').update({
         pnit, type, codice: calcCodice(pnit, type), modified_by: user,
-      }).eq('pn', original.pn).eq('terminal_pn', original.terminal_pn);
-      if (error) errors.push(error.message);
+      }).eq('id', original.id);
+      if (error) errors.push(`${original.pn} / ${original.terminal_pn}: ${error.message}`);
     }
 
     // 2. Inserimento righe nuove
@@ -1164,7 +1169,7 @@ export default function App() {
       };
     });
     if (toInsert.length > 0) {
-      const { error } = await supabase.from('spare_parts').upsert(toInsert, { onConflict: 'pn,terminal_pn' });
+      const { error } = await supabase.from('spare_parts').upsert(toInsert, { onConflict: 'pn,terminal_pn,pnit,type' });
       if (error) errors.push('Nuove righe: ' + error.message);
     }
 
@@ -5762,7 +5767,7 @@ export default function App() {
           const noMatchCount = enrichedSp.filter(p => !p.hasAnagMatch).length;
 
           // Righe rimaste orfane dopo l'ultimo import (PN+Terminal PN non più nel file, es. PN rinominato)
-          const staleKeySet = new Set(spStaleImportRows.map(r => `${r.pn}__${r.terminal_pn}`));
+          const staleIdSet = new Set(spStaleImportRows.map(r => r.id));
 
           // Estrazione PN senza riscontro in Anagrafica, raggruppati per PN univoco
           // (un PN può comparire su più Terminal PN/modelli e SPARE diversi in Compatibilità)
@@ -5815,7 +5820,7 @@ export default function App() {
             const matchRef        = !spFilterRef        || p.ref;
             const matchRplus      = !spFilterRplus      || p.rplus;
             const matchNoMatch    = !spFilterNoMatch    || !p.hasAnagMatch;
-            const matchStale      = !spFilterStale      || staleKeySet.has(`${p.pn}__${p.terminal_pn}`);
+            const matchStale      = !spFilterStale      || staleIdSet.has(p.id);
             return matchSearch && matchSearch2 && matchType && matchTerminalPN && matchRef && matchRplus && matchNoMatch && matchStale;
           }).sort((a, b) => {
             const getVal = (row) => String(row[spSortCol] ?? '').toLowerCase();
@@ -5842,7 +5847,7 @@ export default function App() {
                 </div>
                 )}
                 <div className="flex-grow">
-                  <p className="text-xs text-gray-400">Importa il file Excel ufficiale (foglio "Elenco spare parts"): legge solo PN, Terminal PN, PNIT, SPARE — tutto il resto è ereditato da Anagrafica/Elenco SPARE. L&apos;import aggiorna i record esistenti per PN + Terminal PN.</p>
+                  <p className="text-xs text-gray-400">Importa il file Excel ufficiale (foglio "Elenco spare parts"): legge solo PN, Terminal PN, PNIT, SPARE — tutto il resto è ereditato da Anagrafica/Elenco SPARE. Ogni riga è identificata da PN + Terminal PN + PNIT + SPARE: lo stesso PN può comparire più volte con SPARE o PNIT diversi.</p>
                   {importMeta.spare_parts && <p className="text-[11px] text-gray-400">Ultimo aggiornamento: {new Date(importMeta.spare_parts).toLocaleString('it-IT')}</p>}
                 </div>
                 {spareParts.length > 0 && (
@@ -5898,7 +5903,7 @@ export default function App() {
                         <button
                           onClick={() => { setSpFilterStale(v => !v); setSpPage(0); }}
                           className={`flex-grow text-left text-xs font-bold px-3 py-2 rounded-xl border transition cursor-pointer ${spFilterStale ? 'bg-amber-500 text-white border-amber-600' : 'bg-amber-50 text-amber-700 border-amber-200 hover:bg-amber-100'}`}>
-                          ⚠ {spStaleImportRows.length} righe non più nell&apos;ultimo file importato (probabile PN rinominato)
+                          ⚠ {spStaleImportRows.length} righe non più nell&apos;ultimo file importato (PN, PNIT o SPARE rinominato?)
                           {spFilterStale ? ' — clicca per mostrare tutti' : ' — clicca per filtrare'}
                         </button>
                         {isAdmin && (
@@ -6049,7 +6054,7 @@ export default function App() {
                         );
                       })}
                       {filtered.slice(spPage * 100, spPage * 100 + 100).map((p, rowIndex) => {
-                        const rowKey = `${p.pn}_${p.terminal_pn}`;
+                        const rowKey = String(p.id);
                         const pending = spPendingChanges[rowKey];
                         const d = pending ? { ...p, ...pending } : p;
                         const iCls = `w-full rounded px-1 py-0.5 text-xs focus:outline-none border ${pending ? 'bg-amber-50 border-amber-300' : 'bg-transparent border-transparent hover:border-gray-300 focus:border-blue-400 focus:bg-white'}`;
