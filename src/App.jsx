@@ -6206,9 +6206,10 @@ export default function App() {
 
               {stockTab === 'inventario' && (<div className="space-y-5">
 
-              {/* Upload + contatore */}
+              {/* Upload + contatore — questi due import SOSTITUISCONO l'intero inventario:
+                  riservati all'admin, il permesso stock:upload non basta (resta valido per la verifica NetSuite) */}
               <div className="bg-white p-4 rounded-2xl border border-gray-200 shadow-xs flex flex-col sm:flex-row sm:items-center gap-4">
-                {canUpload('stock') && (
+                {isAdmin && (
                 <div className="relative flex-shrink-0">
                   <button className="bg-blue-600 hover:bg-blue-700 text-white text-sm font-bold px-4 py-2.5 rounded-xl cursor-pointer shadow-xs transition">
                     📥 Importa Stock Excel
@@ -6216,7 +6217,7 @@ export default function App() {
                   <input type="file" accept=".xls,.xlsx" className="absolute inset-0 w-full h-full opacity-0 cursor-pointer" onChange={handleStockUpload} />
                 </div>
                 )}
-                {canUpload('stock') && (
+                {isAdmin && (
                 <div className="relative flex-shrink-0">
                   <button className="bg-teal-600 hover:bg-teal-700 text-white text-sm font-bold px-4 py-2.5 rounded-xl cursor-pointer shadow-xs transition">
                     📥 Importa Accessori
