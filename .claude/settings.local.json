@@ -21,7 +21,8 @@
       "Bash(node sim.js)",
       "Bash(node --check client_sim.js)",
       "Bash(cd \"C:/Users/gabriele.maccali/Downloads/progetti/netsuite-sw-inventory\" && grep -n \"btn-group\\\\|var names\\\\|var descs\\\\|sfx\" pax_sw_inventory_suitelet.js)",
-      "Bash(node --input-type=module -e ' *)"
+      "Bash(node --input-type=module -e ' *)",
+      "Bash(cd \"C:\\\\Users\\\\gabriele.maccali\\\\Downloads\" && ls -t *.xls* 2>/dev/null | head -15)"
     ]
   }
 }

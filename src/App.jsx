@@ -77,27 +77,29 @@ function splitCsvLine(line, sep) {
 
 // Catalogazione: esiti per matricola e tipi di errore bloccante
 const CAT_ESITI = {
-  IT: { label: 'Transfer (IT)', cls: 'bg-blue-50 text-blue-700 border-blue-200' },
-  RA: { label: 'Return (RA)', cls: 'bg-purple-50 text-purple-700 border-purple-200' },
-  nessuna: { label: 'Nessuna azione', cls: 'bg-green-50 text-green-700 border-green-200' },
-  ignorata: { label: 'Ignorata (regola)', cls: 'bg-gray-100 text-gray-500 border-gray-200' },
-  esclusa: { label: 'Esclusa (nessun prodotto)', cls: 'bg-gray-100 text-gray-500 border-gray-200' },
-  scartata: { label: 'Doppione scartato', cls: 'bg-gray-100 text-gray-400 border-gray-200' },
-  gia_caricata: { label: 'Già caricata su NS', cls: 'bg-gray-100 text-gray-500 border-gray-200' },
+  RA: { label: 'Da caricare (RA)', cls: 'bg-purple-50 text-purple-700 border-purple-200' },
+  nessuna: { label: 'Già in NS', cls: 'bg-green-50 text-green-700 border-green-200' },
+  disallineata: { label: 'Disallineata', cls: 'bg-amber-50 text-amber-700 border-amber-200' },
+  esclusa: { label: 'Esclusa', cls: 'bg-gray-100 text-gray-500 border-gray-200' },
 };
 const CAT_ERRORI = {
-  doppione: 'Matricola ripetuta',
+  cliente: 'Cliente del backlog senza Internal ID',
+  prodotto: 'Part Number senza prodotto in Anagrafica',
   scelta: 'Configurazione da scegliere',
-  transcodifica: 'pot_ senza prodotto in Anagrafica',
-  anagrafica: 'Prodotto non in Anagrafica',
-  cliente: 'Cliente ≠ Customer ID Anagrafica',
-  articolo: 'Articolo ≠ articolo in giacenza NS',
-  regola: 'Trasferimento da verificare (regola)',
-  rma_mancante: 'RMA (External ID) assente nel catalogato',
+  magazzino: 'In NS su un magazzino diverso dalla destinazione',
+  deposito: 'In NS su conto deposito o irreparabili',
 };
 const catDataCompatta = (d) => d.replace(/\//g, ''); // 10/09/2026 -> 10092026
 // Il confronto delle matricole ignora gli zeri iniziali: un catalogato passato da Excel li perde
 const catSerialNorm = (s) => String(s || '').toUpperCase().replace(/^0+/, '');
+// Nel backlog le matricole dei clienti interni hanno un prefisso di una lettera (T = TOREF, D = DOA) che in
+// NetSuite non esiste: nessuna matricola NS inizia per lettera. Si confronta anche la forma senza prefisso,
+// ed è quella che va nei file, altrimenti si creerebbero matricole doppie.
+const catSerialNS = (s) => {
+  const v = String(s || '').toUpperCase().trim();
+  return /^[A-Z]\d+$/.test(v) ? v.slice(1) : v;
+};
+const catSerialVarianti = (s) => [...new Set([catSerialNorm(s), catSerialNorm(catSerialNS(s))])];
 const catDataIso = (d) => { const [g, m, a] = d.split('/'); return `${a}-${m}-${g}`; };
 const invMissioneCode = (id) => `INV-${String(id).padStart(5, '0')}`;
 const INV_STATI = {
@@ -649,6 +651,7 @@ export default function App() {
 
   // Controlli Inventariali: giacenza matricolare NS (snapshot CSV) e missioni di verifica per codice su singolo magazzino
   const [invRiepilogo, setInvRiepilogo] = useState([]); // [{location, item, qty}] aggregato dello snapshot
+  const [invMagMeta, setInvMagMeta] = useState([]); // [{location, file_at, caricato_at, caricato_da}] provenienza per magazzino
   const [invSnapshotLoading, setInvSnapshotLoading] = useState(false);
   const [invImportProgress, setInvImportProgress] = useState('');
   const [invTab, setInvTab] = useState('lancia'); // 'lancia' | 'missioni'
@@ -683,30 +686,29 @@ export default function App() {
   const [libScanner, setLibScanner] = useState('');
   const [libFeedback, setLibFeedback] = useState({ text: '', type: '', sub: '' });
 
-  // Catalogazione (catalogato vs giacenza NS → Inventory Transfer / Return Authorization)
-  const [catTab, setCatTab] = useState('analisi'); // 'analisi' | 'storico' | 'impostazioni'
-  const [catRighe, setCatRighe] = useState([]); // righe del catalogato caricato (non persistite)
+  // Catalogazione: backlog repair contro giacenza NS (RIP/RIPAX) → Return Authorization
+  const [catTab, setCatTab] = useState('analisi'); // 'analisi' | 'anomalie' | 'storico' | 'impostazioni'
+  const [catSubTab, setCatSubTab] = useState('carico'); // dentro l'analisi: 'carico' | 'errori'
+  const [catRighe, setCatRighe] = useState([]); // righe del backlog caricato (non persistite)
   const [catFile, setCatFile] = useState('');
-  const [catGiacenza, setCatGiacenza] = useState(new Map()); // matricola -> { item, location } dalla giacenza NS
-  const [catGiacenzaAt, setCatGiacenzaAt] = useState(null); // data file giacenza usata per l'analisi
+  const [catFileAt, setCatFileAt] = useState(null); // data del file backlog: è la data dei documenti RA
+  const [catGiacenza, setCatGiacenza] = useState(new Map()); // matricola -> { item, location } dai magazzini repair
+  const [catGiacenzaAt, setCatGiacenzaAt] = useState(null); // data della giacenza NS usata per l'analisi
+  const [catNonNelBacklog, setCatNonNelBacklog] = useState([]); // matricole in RIP/RIPAX assenti dal backlog
   const [catLoading, setCatLoading] = useState(false);
+  const [catProgress, setCatProgress] = useState('');
   const [catImpostazioni, setCatImpostazioni] = useState({ clienti_ripax: [], magazzino_ripax: '', magazzino_rip: '' });
-  const [catRegole, setCatRegole] = useState([]);
-  const [catTranscodifiche, setCatTranscodifiche] = useState([]);
-  const [catStorico, setCatStorico] = useState([]); // testate export (tutte, servono al controllo IDext)
-  const [catDupScelte, setCatDupScelte] = useState({}); // matricola doppia -> indice riga scelta
-  const [catFiltro, setCatFiltro] = useState('tutte');
-  const [catSubTab, setCatSubTab] = useState('carico'); // dentro l'analisi: 'carico' (cosa va su NS) | 'errori' (cosa manca per andarci)
+  const [catImpDraft, setCatImpDraft] = useState({ clienti: '', magazzino_ripax: '', magazzino_rip: '' });
+  const [catClienti, setCatClienti] = useState([]); // nome backlog -> Internal ID del cliente NetSuite
+  const [catTranscodifiche, setCatTranscodifiche] = useState([]); // Internal ID + Part Number -> prodotto (eccezioni)
+  const [catStorico, setCatStorico] = useState([]); // testate RA esportate
   const [catSearch, setCatSearch] = useState('');
-  const [catNuovaRegola, setCatNuovaRegola] = useState({ magazzino_origine: '', magazzino_destinazione: '', azione: 'da_verificare' });
-  const [catImpDraft, setCatImpDraft] = useState({ clienti: '', magazzino_ripax: '', magazzino_rip: '' }); // impostazioni in modifica
-  const [catRmaGestiti, setCatRmaGestiti] = useState(new Map()); // RMA -> Set matricole già caricate su NS (solo quelli del catalogato in esame)
-  const [catRmaTotale, setCatRmaTotale] = useState(null); // { rma, aggiornato_at, aggiornato_by } dello storico a DB
-  const [catRmaProgress, setCatRmaProgress] = useState('');
-  const [catSospese, setCatSospese] = useState([]); // righe messe da parte perché in errore: rientrano nelle analisi successive
-  const [catClientiAlias, setCatClientiAlias] = useState([]); // cliente catalogato -> cliente Anagrafica (es. 1355 -> 44)
   const [catSceltaProdotto, setCatSceltaProdotto] = useState({}); // matricola -> prodotto scelto tra più configurazioni (non memorizzata)
-  const [catNuovoAlias, setCatNuovoAlias] = useState({ cliente: '', cliente_anagrafica: '' });
+  const [catNuovoCliente, setCatNuovoCliente] = useState({ nome_backlog: '', customer_id: '' });
+  const [catClientiNs, setCatClientiNs] = useState([]); // anagrafica clienti NetSuite: internal_id, nome, gruppo
+  const [catClienteDraft, setCatClienteDraft] = useState({}); // nome backlog -> testo digitato nel campo cliente NetSuite
+  const [catLineeAperte, setCatLineeAperte] = useState({}); // righe del carico con il dettaglio matricole aperto
+  const [catClientiAperti, setCatClientiAperti] = useState({}); // clienti del carico espansi
   const invExecSetRef = useRef(new Map()); // matricola -> ubicazione: guardia sincrona anti-duplicati
   const invExecUbicazioneRef = useRef(''); // ubicazione corrente letta dallo scanner (non attende il render)
   const invExecScannerRef = useRef(null);
@@ -1426,6 +1428,10 @@ export default function App() {
     const map = {};
     (data || []).forEach(r => { map[r.chiave] = r.updated_at; map[`${r.chiave}__by`] = r.updated_by; });
     setImportMeta(map);
+    // Provenienza dei singoli magazzini della giacenza NS: il caricamento è additivo,
+    // quindi convivono estrazioni diverse con date diverse
+    const { data: mag } = await supabase.from('inv_snapshot_magazzini').select('*').order('location');
+    setInvMagMeta(mag || []);
   }
   async function recordImportMeta(chiave) {
     const now = new Date().toISOString();
@@ -4197,9 +4203,18 @@ export default function App() {
     const { rows, duplicati } = parsed;
     if (rows.length === 0) { alert('Nessuna matricola valida nel file.'); return; }
     const dataFile = new Date(file.lastModified);
+    // Caricamento additivo: le estrazioni NS coprono magazzini diversi (PAX NUOVO, repair…),
+    // quindi il file sostituisce solo i propri magazzini e lascia intatti gli altri
+    const magFile = [...new Set(rows.map(r => r.location))].sort();
+    const magAltri = [...new Set(invRiepilogo.map(r => r.location))].filter(l => !magFile.includes(l)).sort();
+    const elenco = (m) => m.map(x => `• ${x}`).join('\n');
     if (!window.confirm(
       `Caricare la giacenza NS: ${rows.length.toLocaleString('it-IT')} matricole (file del ${dataFile.toLocaleString('it-IT')})?\n\n` +
-      `La giacenza attuale verrà SOSTITUITA per tutti i moduli (Controlli Inventariali e Catalogazione). Le missioni già lanciate non cambiano: conservano le matricole attese al momento del lancio.` +
+      `Vengono SOSTITUITI questi ${magFile.length} magazzini:\n${elenco(magFile)}\n\n` +
+      (magAltri.length > 0
+        ? `Restano invariati:\n${elenco(magAltri)}\n\n`
+        : '') +
+      'Le missioni già lanciate non cambiano: conservano le matricole attese al momento del lancio.' +
       (duplicati ? `\n\n${duplicati} matricole ripetute nel file: viene tenuta l'ultima occorrenza.` : '')
     )) return;
 
@@ -4227,9 +4242,9 @@ export default function App() {
         done += batch.reduce((s, c) => s + c.length, 0);
         setInvImportProgress(`${done.toLocaleString('it-IT')}/${rows.length.toLocaleString('it-IT')}`);
       }
-      // Sostituzione atomica di inv_snapshot + ricostruzione del riepilogo (una transazione)
+      // Sostituzione atomica dei soli magazzini del file + ricostruzione del riepilogo (una transazione)
       setInvImportProgress('attivazione');
-      const { error: swapErr } = await supabase.rpc('inv_snapshot_swap');
+      const { error: swapErr } = await supabase.rpc('inv_snapshot_swap_additivo', { p_file_at: dataFile.toISOString(), p_by: currentUser || 'import' });
       if (swapErr) throw swapErr;
       await recordImportMeta('inv_snapshot');
       // Data della giacenza = data del file esportato da NS
@@ -4907,20 +4922,22 @@ export default function App() {
   }
 
   // ==================== CATALOGAZIONE ====================
-  // Il catalogato (CSV del sistema di catalogazione) viene confrontato con la giacenza NS condivisa (inv_snapshot):
-  // destinazione RIPAX per i clienti RIPAX, RIP per gli altri; matricola in giacenza fuori destinazione → Inventory
-  // Transfer, assente → Return Authorization. Qualsiasi errore blocca l'intero export. Storico solo di testata.
+  // Il backlog repair (tutte le matricole in lavorazione) viene confrontato con la giacenza NS dei magazzini
+  // di riparazione: presente nel magazzino giusto → nulla, assente → Return Authorization, presente altrove
+  // o presente in NS ma non nel backlog → disallineamento da verificare.
+  // Il cliente nel backlog è un nome: la transcodifica dà l'Internal ID del cliente NetSuite, che decide la destinazione
+  // (RIPAX per i clienti RIPAX, RIP per gli altri) e permette di trovare il prodotto in Anagrafica.
 
   async function fetchCatConfig() {
     try {
-      const [imp, regole, transc, storico] = await Promise.all([
+      const [imp, clienti, transc, storico] = await Promise.all([
         supabase.from('cat_impostazioni').select('*'),
-        supabase.from('cat_regole_magazzino').select('*').order('magazzino_origine'),
+        supabase.from('cat_clienti_transcodifica').select('*').order('nome_backlog'),
         invFetchAll('cat_transcodifiche', '*', q => q, ['customer_id', 'main_component']),
         invFetchAll('cat_export_testate', '*', q => q, ['id']),
       ]);
       if (imp.error) throw imp.error;
-      if (regole.error) throw regole.error;
+      if (clienti.error) throw clienti.error;
       const map = {};
       (imp.data || []).forEach(r => { map[r.chiave] = r.valore; });
       const conf = {
@@ -4930,22 +4947,15 @@ export default function App() {
       };
       setCatImpostazioni(conf);
       setCatImpDraft({ clienti: conf.clienti_ripax.join(', '), magazzino_ripax: conf.magazzino_ripax, magazzino_rip: conf.magazzino_rip });
-      setCatRegole(regole.data || []);
+      setCatClienti(clienti.data || []);
       setCatTranscodifiche(transc);
       setCatStorico(storico.reverse());
-      const [{ count }, ultimo] = await Promise.all([
-        supabase.from('cat_rma_gestiti').select('rma', { count: 'exact', head: true }),
-        supabase.from('cat_rma_gestiti').select('aggiornato_at, aggiornato_by').order('aggiornato_at', { ascending: false }).limit(1).maybeSingle(),
-      ]);
-      setCatRmaTotale({ rma: count || 0, aggiornato_at: ultimo.data?.aggiornato_at || null, aggiornato_by: ultimo.data?.aggiornato_by || null });
-      const { data: sospese } = await supabase.from('cat_sospese').select('*').order('messa_at');
-      setCatSospese(sospese || []);
-      const { data: aliasCli } = await supabase.from('cat_clienti_alias').select('*').order('cliente');
-      setCatClientiAlias(aliasCli || []);
+      const { data: clientiNs } = await supabase.from('cat_clienti_ns').select('*').order('nome');
+      setCatClientiNs(clientiNs || []);
     } catch (err) { alert('Errore caricamento configurazione Catalogazione: ' + err.message); }
   }
 
-  async function handleCatalogatoUpload(event) {
+  async function handleBacklogUpload(event) {
     const file = event.target.files[0];
     if (!file) return;
     event.target.value = '';
@@ -4955,181 +4965,184 @@ export default function App() {
     const sep = csvSeparator(lines[0]);
     const norm = s => s.toLowerCase().replace(/[^a-z0-9]/g, '');
     const headers = splitCsvLine(lines[0], sep).map(norm);
-    const col = (h) => headers.indexOf(h);
-    const iExt = col('externalid'), iCust = col('customer'), iDate = col('date'), iRef = col('yourref'), iItem = col('item'), iSerial = col('serial');
-    if (iCust < 0 || iDate < 0 || iItem < 0 || iSerial < 0) { alert("Colonne mancanti: servono almeno 'Customer', 'Date', 'Item' e 'Serial'."); return; }
+    const col = (...cands) => headers.findIndex(h => cands.includes(h));
+    const iSerial = col('serialnumber', 'serial', 'matricola');
+    const iRma = col('rma');
+    const iCliente = col('cliente', 'customer');
+    const iPn = col('partnumber', 'pn');
+    const iDesc = col('descrizione', 'description');
+    const iStato = col('stato');
+    const iBin = col('bin');
+    const iDdt = col('ddt');
+    if (iSerial < 0 || iCliente < 0 || iPn < 0) { alert("Colonne mancanti: servono almeno 'Serial Number', 'Cliente' e 'Part Number'."); return; }
     const righe = [];
+    const visti = new Set();
+    let doppie = 0;
     lines.slice(1).forEach(line => {
       const c = splitCsvLine(line, sep);
       const serial = (c[iSerial] || '').toUpperCase();
       if (!serial) return;
+      if (visti.has(catSerialNorm(serial))) { doppie++; return; }
+      visti.add(catSerialNorm(serial));
       righe.push({
-        externalId: iExt >= 0 ? c[iExt] || '' : '', customer: c[iCust] || '', date: c[iDate] || '',
-        ref: iRef >= 0 ? c[iRef] || '' : '', item: c[iItem] || '', serial,
+        serial, rma: iRma >= 0 ? c[iRma] || '' : '', cliente: c[iCliente] || '', pn: c[iPn] || '',
+        descrizione: iDesc >= 0 ? c[iDesc] || '' : '', stato: iStato >= 0 ? c[iStato] || '' : '',
+        bin: iBin >= 0 ? c[iBin] || '' : '', ddt: iDdt >= 0 ? c[iDdt] || '' : '',
       });
     });
-    if (righe.length === 0) { alert('Nessuna matricola nel file.'); return; }
-    const dataNonValida = righe.find(r => !/^\d{2}\/\d{2}\/\d{4}$/.test(r.date));
-    if (dataNonValida) { alert(`Data non valida (atteso gg/mm/aaaa): "${dataNonValida.date}" sulla matricola ${dataNonValida.serial}.`); return; }
+    if (righe.length === 0) { alert('Nessuna matricola nel backlog.'); return; }
     setCatRighe(righe);
     setCatFile(file.name);
-    setCatDupScelte({});
-    setCatFiltro('tutte');
+    setCatFileAt(new Date(file.lastModified));
+    setCatSceltaProdotto({});
     setCatSearch('');
-    await analizzaCatalogato(righe);
+    if (doppie > 0) alert(`${doppie} matricole ripetute nel backlog: tenuta la prima occorrenza.`);
+    await analizzaBacklog(righe);
   }
 
-  // Legge dalla giacenza NS solo le matricole del catalogato (e la data del file giacenza a cui si riferiscono).
-  // Si analizzano anche le righe messe da parte in precedenza: se nel frattempo sono state sistemate, escono dall'elenco.
-  async function analizzaCatalogato(righeFile = catRighe) {
+  // Legge la giacenza dei magazzini di riparazione: le matricole del backlog e, al contrario,
+  // quelle presenti in RIP/RIPAX che il backlog non conosce
+  async function analizzaBacklog(righe = catRighe) {
+    if (righe.length === 0) return;
     setCatLoading(true);
     try {
-      const { data: sospese, error: sospErr } = await supabase.from('cat_sospese').select('*').order('messa_at');
-      if (sospErr) throw sospErr;
-      setCatSospese(sospese || []);
-      const righe = [...righeFile, ...(sospese || []).map(s => ({ externalId: s.rma || '', serial: s.serial }))];
-      if (righe.length === 0) { setCatLoading(false); return; }
+      await fetchCatConfig();
+      await fetchAnagrafica();
+      // Si rilegge anche import_meta: l'avviso "la giacenza è cambiata" confronta la data usata
+      // dall'analisi con quella tenuta nello stato, e con lo stato vecchio resterebbe accesa per sempre
+      await fetchImportMeta();
       const { data: meta } = await supabase.from('import_meta').select('*').in('chiave', ['inv_snapshot_file', 'inv_snapshot']);
       const metaMap = {};
       (meta || []).forEach(m => { metaMap[m.chiave] = m.updated_at; });
-      const serials = [...new Set(righe.map(r => r.serial))];
-      const chunks = [];
-      for (let i = 0; i < serials.length; i += 200) chunks.push(serials.slice(i, i + 200));
+      setCatGiacenzaAt(metaMap.inv_snapshot_file || metaMap.inv_snapshot || null);
+
+      // Giacenza completa dei magazzini di riparazione (RIP, RIPAX e i conti deposito/irreparabili).
+      // L'elenco si legge dal DB qui, non dallo stato: all'apertura del modulo potrebbe non essere ancora arrivato.
+      setCatProgress('lettura giacenza…');
+      const riep = await invFetchAll('inv_snapshot_riepilogo', '*', q => q, ['location', 'item']);
+      setInvRiepilogo(riep);
+      const magRepair = [...new Set(riep.map(r => r.location).filter(l => /^(RIP|RIPAX|DEP|IRREP)/i.test(l)))];
       const giacenza = new Map();
-      for (let i = 0; i < chunks.length; i += 5) {
-        const res = await Promise.all(chunks.slice(i, i + 5).map(c => supabase.from('inv_snapshot').select('numero, item, location').in('numero', c)));
-        const err = res.find(r => r.error)?.error;
-        if (err) throw err;
-        res.forEach(r => (r.data || []).forEach(d => giacenza.set(d.numero, { item: d.item, location: d.location })));
+      for (const loc of magRepair) {
+        const rows = await invFetchAll('inv_snapshot', 'numero, item, location', q => q.eq('location', loc), ['numero']);
+        rows.forEach(r => giacenza.set(catSerialNorm(r.numero), { numero: r.numero, item: r.item, location: r.location }));
+        setCatProgress(`lettura giacenza… ${giacenza.size.toLocaleString('it-IT')}`);
       }
       setCatGiacenza(giacenza);
-      setCatGiacenzaAt(metaMap.inv_snapshot_file || metaMap.inv_snapshot || null);
-      // Storico RMA + seriali già caricati su NS: si leggono solo gli RMA presenti nel catalogato in esame
-      const rmaList = [...new Set(righe.map(r => r.externalId.toUpperCase()).filter(Boolean))];
-      const gestiti = new Map();
-      for (let i = 0; i < rmaList.length; i += 200) {
-        const { data, error } = await supabase.from('cat_rma_gestiti').select('rma, serials').in('rma', rmaList.slice(i, i + 200));
-        if (error) throw error;
-        (data || []).forEach(d => gestiti.set(d.rma, new Set((d.serials || []).map(catSerialNorm))));
-      }
-      setCatRmaGestiti(gestiti);
-      await fetchCatConfig();
-      await fetchImportMeta();
-      await fetchAnagrafica(); // ricaricata anche lei: gli errori di cliente/prodotto si risolvono modificandola
-    } catch (err) { alert('Errore analisi catalogato: ' + err.message); }
+
+      // Matricole in RIP/RIPAX che il backlog non conosce: disallineamenti
+      const nelBacklog = new Set(righe.flatMap(r => catSerialVarianti(r.serial)));
+      const soloNs = [];
+      giacenza.forEach((g, k) => {
+        const mag = g.location.split(' - ')[0].trim();
+        if ((mag === 'RIP' || mag === 'RIPAX') && !nelBacklog.has(k)) soloNs.push(g);
+      });
+      setCatNonNelBacklog(soloNs.sort((a, b) => a.location.localeCompare(b.location) || a.item.localeCompare(b.item)));
+    } catch (err) { alert('Errore analisi backlog: ' + err.message); }
+    setCatProgress('');
     setCatLoading(false);
   }
 
-  // Righe da analizzare: quelle del file più quelle messe da parte in precedenza (chiave RMA + matricola)
-  const catRigheTutte = useMemo(() => {
-    const nelFile = new Set(catRighe.map(r => `${r.externalId.toUpperCase()}|${catSerialNorm(r.serial)}`));
-    const daSospese = catSospese
-      .filter(s => !nelFile.has(`${(s.rma || '').toUpperCase()}|${catSerialNorm(s.serial)}`))
-      .map(s => ({
-        externalId: s.rma || '', customer: s.customer || '', date: s.data_catalogazione || '',
-        ref: s.your_ref || '', item: s.item || '', serial: s.serial, daSospese: true,
-      }));
-    return [...catRighe, ...daSospese];
-  }, [catRighe, catSospese]);
-
   const catAnalisi = useMemo(() => {
-    if (catRigheTutte.length === 0) return null;
+    if (catRighe.length === 0) return null;
     const clientiRipax = new Set(catImpostazioni.clienti_ripax);
+    const clienteDi = new Map(catClienti.map(c => [c.nome_backlog, c]));
+    const transc = new Map(catTranscodifiche.map(t => [`${t.customer_id}|${t.main_component}`, t.prodotto]));
     const anagByCodice = new Map(anagrafica.map(a => [a.codice, a]));
-    // Alcuni clienti hanno i prodotti intestati al capogruppo (1355 → 44): la corrispondenza salvata vale per
-    // il controllo sul Customer ID e per la ricerca dei prodotti pot_
-    const alias = new Map(catClientiAlias.map(a => [a.cliente, a.cliente_anagrafica]));
-    // Cliente + Main Component: di norma individuano un solo prodotto, che si usa senza chiedere nulla
     const anagPerClienteMc = new Map();
     anagrafica.forEach(a => {
       if (!a.main_component) return;
       const k = `${a.customer_id || ''}|${a.main_component}`;
       anagPerClienteMc.set(k, [...(anagPerClienteMc.get(k) || []), a.codice]);
     });
-    const transc = new Map(catTranscodifiche.map(t => [`${t.customer_id}|${t.main_component}`, t.prodotto]));
-    const regole = new Map(catRegole.map(r => [`${r.magazzino_origine}|${r.magazzino_destinazione}`, r.azione]));
-    const perMatricola = new Map();
-    catRigheTutte.forEach((r, i) => perMatricola.set(r.serial, [...(perMatricola.get(r.serial) || []), i]));
 
-    const righe = catRigheTutte.map((r, i) => {
-      const base = { ...r, i, errori: [], prodotto: '', origine: '', idext: '' };
-      const occorrenze = perMatricola.get(r.serial);
-      if (occorrenze.length > 1) {
-        const scelta = catDupScelte[r.serial];
-        if (scelta == null) base.errori.push({ tipo: 'doppione', msg: `Matricola presente ${occorrenze.length} volte nel catalogato: scegliere la riga corretta` });
-        else if (scelta !== i) return { ...base, esito: 'scartata' };
+    const righe = catRighe.map((r, i) => {
+      const base = { ...r, i, errori: [], note: [], prodotto: '', candidati: [], customer: '', destinazione: '', origine: '', serialNs: catSerialNS(r.serial) };
+      const cliente = clienteDi.get(r.cliente);
+      const customer = cliente?.customer_id;
+      if (!customer) {
+        base.errori.push({ tipo: 'cliente', msg: `“${r.cliente}”: manca la transcodifica verso l'Internal ID del cliente NetSuite` });
+      } else {
+        base.customer = customer;
+        base.ripax = clientiRipax.has(customer);
+        base.destinazione = base.ripax ? catImpostazioni.magazzino_ripax : catImpostazioni.magazzino_rip;
       }
-      const destinazione = clientiRipax.has(r.customer) ? catImpostazioni.magazzino_ripax : catImpostazioni.magazzino_rip;
-      base.destinazione = destinazione;
-      base.ripax = clientiRipax.has(r.customer);
 
-      // Combinazione RMA + matricola già caricata su NetSuite: non si ripresenta, esce dall'elenco di lavoro
-      if (!r.externalId) base.errori.push({ tipo: 'rma_mancante', msg: 'Riga senza External ID: impossibile verificare se è già stata caricata' });
-      else if (catRmaGestiti.get(r.externalId.toUpperCase())?.has(catSerialNorm(r.serial))) return { ...base, esito: 'gia_caricata' };
-
-      // Articolo: il catalogato riporta già il prodotto, tranne i pot_ (Main Component da transcodificare)
-      const clienteAnag = alias.get(r.customer) || r.customer;
-      base.clienteAnag = clienteAnag;
-      const pot = r.item.toLowerCase().startsWith('pot_');
-      if (pot) {
-        const mc = r.item.slice(4);
-        base.mc = mc;
-        const k = `${clienteAnag}|${mc}`;
+      // Alcuni clienti (tipicamente gli interni) non hanno un prodotto intestato: si carica il Main Component
+      if (customer && cliente.usa_main_component) {
+        base.prodotto = r.pn;
+        base.mainComponent = true;
+        if (!r.pn) base.errori.push({ tipo: 'prodotto', msg: 'Part Number vuoto nel backlog' });
+        else if (!anagByCodice.has(r.pn)) base.errori.push({ tipo: 'prodotto', msg: `${r.pn} non esiste in Anagrafica come articolo` });
+      } else if (customer) {
+        // Prodotto: Internal ID + Part Number. Una sola corrispondenza si usa senza chiedere.
+        const k = `${customer}|${r.pn}`;
         const candidati = anagPerClienteMc.get(k) || [];
         base.candidati = candidati;
         if (transc.has(k)) {
-          // Scelta salvata: vale anche quando l'Anagrafica avrebbe una risposta sua
           if (transc.get(k) == null) return { ...base, esito: 'esclusa' };
           base.prodotto = transc.get(k);
         } else if (candidati.length === 1) {
           base.prodotto = candidati[0];
-          base.transcAuto = true;
         } else if (candidati.length === 0) {
-          base.errori.push({ tipo: 'transcodifica', msg: `${mc}: nessun prodotto in Anagrafica per il cliente ${clienteAnag}` });
-        } else if (catSceltaProdotto[r.serial] && candidati.includes(catSceltaProdotto[r.serial])) {
-          // Più configurazioni: si sceglie per la singola matricola, senza memorizzare nulla
-          base.prodotto = catSceltaProdotto[r.serial];
+          base.errori.push({ tipo: 'prodotto', msg: `${r.pn}: nessun prodotto in Anagrafica per il cliente ${customer}` });
+        } else if (catSceltaProdotto[base.gruppoScelta = `${customer}|${r.pn}|${r.ddt}`] && candidati.includes(catSceltaProdotto[base.gruppoScelta])) {
+          // La scelta vale per il gruppo cliente + Part Number + DDT: i terminali dello stesso DDT
+          // hanno la stessa configurazione, quindi si decide una volta e non matricola per matricola
+          base.prodotto = catSceltaProdotto[base.gruppoScelta];
         } else {
-          base.errori.push({ tipo: 'scelta', msg: `${mc}: scegliere la configurazione tra ${candidati.join(', ')}` });
+          base.errori.push({ tipo: 'scelta', msg: `${r.pn}: scegliere la configurazione tra ${candidati.join(', ')}` });
         }
-      } else base.prodotto = r.item;
-      if (base.prodotto) {
-        const a = anagByCodice.get(base.prodotto);
-        if (!a) base.errori.push({ tipo: 'anagrafica', msg: `${base.prodotto} non presente in Anagrafica` });
-        // Per i pot_ la scelta dell'utente vale come conferma del cliente
-        else if (!pot && String(a.customer_id || '') !== clienteAnag) {
-          base.customerAnag = String(a.customer_id || '');
-          base.errori.push({ tipo: 'cliente', msg: `Cliente ${r.customer}, ma ${base.prodotto} in Anagrafica ha Customer ID ${a.customer_id || '(vuoto)'}` });
+        if (base.prodotto && !anagByCodice.has(base.prodotto)) {
+          base.errori.push({ tipo: 'prodotto', msg: `${base.prodotto} non presente in Anagrafica` });
         }
       }
 
-      const g = catGiacenza.get(r.serial);
+      const g = catSerialVarianti(r.serial).map(k => catGiacenza.get(k)).find(Boolean);
       if (!g) return { ...base, esito: 'RA' };
+      // Matricola già in NetSuite: niente da caricare, quindi gli errori di codifica diventano note
+      const declassaCodifica = () => {
+        const codifica = base.errori.filter(e => e.tipo === 'prodotto' || e.tipo === 'scelta');
+        if (codifica.length === 0) return;
+        base.errori = base.errori.filter(e => e.tipo !== 'prodotto' && e.tipo !== 'scelta');
+        base.note.push(...codifica.map(e => `${e.msg} (non serve: la matricola è già in NS come ${g.item})`));
+      };
       base.origine = g.location;
-      if (base.prodotto && g.item !== base.prodotto) base.errori.push({ tipo: 'articolo', msg: `In giacenza NS la matricola è su ${g.item}, non su ${base.prodotto}` });
-      if (g.location === destinazione) return { ...base, esito: 'nessuna' };
-      const azione = regole.get(`${g.location}|${destinazione}`);
-      if (azione === 'ignora') return { ...base, esito: 'ignorata' };
-      if (azione === 'da_verificare') base.errori.push({ tipo: 'regola', msg: `Regola: trasferimento ${g.location} → ${destinazione} da verificare` });
-      return { ...base, esito: 'IT' };
+      const mag = g.location.split(' - ')[0].trim();
+      const magDest = (base.destinazione || '').split(' - ')[0].trim();
+      if (mag !== 'RIP' && mag !== 'RIPAX') {
+        declassaCodifica();
+        base.errori.push({ tipo: 'deposito', msg: `In NS risulta su ${g.location}: riparazione chiusa, non dovrebbe essere nel backlog` });
+        return { ...base, esito: 'disallineata' };
+      }
+      if (customer && mag !== magDest) {
+        declassaCodifica();
+        base.errori.push({ tipo: 'magazzino', msg: `In NS è su ${mag}, per il cliente ${customer} è attesa su ${magDest}` });
+        return { ...base, esito: 'disallineata' };
+      }
+      // Articolo diverso da quello calcolato: solo una nota, non un errore. La matricola è già in NetSuite,
+      // quindi non si carica nulla e l'item buono è quello che ha in NS (capita con i codici -OLD o tra
+      // anagrafiche dello stesso gruppo). Per i clienti a Main Component il confronto non si fa affatto.
+      if (base.prodotto && !base.mainComponent && g.item !== base.prodotto) {
+        base.note.push(`In NS la matricola è registrata su ${g.item}, non su ${base.prodotto}`);
+      }
+      declassaCodifica();
+      return { ...base, esito: 'nessuna' };
     });
 
-    // Documenti: nei file finiscono solo le matricole mai caricate. Se la base IDext è già nello storico
-    // (es. un seriale aggiunto oggi su un RMA già esportato) il documento prende un progressivo: -2, -3…
+    // Un documento RA per cliente: la data è quella del file backlog, le righe sono raggruppate per prodotto
+    const dataRa = catFileAt ? `${String(catFileAt.getDate()).padStart(2, '0')}/${String(catFileAt.getMonth() + 1).padStart(2, '0')}/${catFileAt.getFullYear()}` : '';
     const usati = new Set(catStorico.map(s => s.idext));
     const docs = new Map();
-    // Solo le righe pulite entrano nei file: quelle in errore vengono messe da parte e riprese quando sono sistemate
-    righe.filter(r => (r.esito === 'IT' || r.esito === 'RA') && r.errori.length === 0).forEach(r => {
-      const base = r.esito === 'RA'
-        ? `${r.customer}-RA-${catDataCompatta(r.date)}`
-        : `${r.customer}-IT-${catDataCompatta(r.date)}-${r.origine.split(' - ')[0].trim()}`;
-      if (!docs.has(base)) {
-        let idext = base;
-        for (let k = 2; usati.has(idext); k++) idext = `${base}-${k}`;
+    righe.filter(r => r.esito === 'RA' && r.errori.length === 0).forEach(r => {
+      if (!docs.has(r.customer)) {
+        const b = `${r.customer}-RA-${catDataCompatta(dataRa)}`;
+        let idext = b;
+        for (let k = 2; usati.has(idext); k++) idext = `${b}-${k}`;
         usati.add(idext);
-        docs.set(base, { idext, tipo: r.esito, cliente: r.customer, data: r.date, origine: r.esito === 'IT' ? r.origine : '', destinazione: r.destinazione, righe: [] });
+        docs.set(r.customer, { idext, tipo: 'RA', cliente: r.customer, data: dataRa, destinazione: r.destinazione, righe: [] });
       }
-      const d = docs.get(base);
+      const d = docs.get(r.customer);
       r.idext = d.idext;
       d.righe.push(r);
     });
@@ -5142,35 +5155,94 @@ export default function App() {
     const conErrori = righe.filter(r => r.errori.length > 0);
     const erroriPerTipo = {};
     conErrori.forEach(r => new Set(r.errori.map(e => e.tipo)).forEach(t => { erroriPerTipo[t] = (erroriPerTipo[t] || 0) + 1; }));
-    // Coppie cliente + Main Component senza nessun prodotto: la scelta si salva e vale per tutte le matricole
-    const transcMancanti = new Map();
-    righe.forEach(r => r.errori.filter(e => e.tipo === 'transcodifica').forEach(() => {
-      const k = `${r.clienteAnag}|${r.mc}`;
-      const t = transcMancanti.get(k) || { customer: r.clienteAnag, mc: r.mc, n: 0 };
-      t.n++;
-      transcMancanti.set(k, t);
-    }));
-    // Corrispondenze cliente catalogato → cliente Anagrafica proposte dagli errori (1355 → 44)
-    const aliasProposti = new Map();
-    righe.forEach(r => r.errori.filter(e => e.tipo === 'cliente').forEach(() => {
-      const k = `${r.customer}|${r.customerAnag}`;
-      const a = aliasProposti.get(k) || { cliente: r.customer, clienteAnag: r.customerAnag, n: 0, prodotti: new Set() };
-      a.n++;
-      a.prodotti.add(r.prodotto);
-      aliasProposti.set(k, a);
-    }));
-    const doppioni = [...perMatricola.entries()].filter(([, idx]) => idx.length > 1).map(([serial, idx]) => ({ serial, righe: idx.map(i => catRigheTutte[i]), indici: idx }));
+    // Nomi cliente da transcodificare, con l'Internal ID suggerito dai prodotti già in giacenza
+    const clientiMancanti = new Map();
+    righe.filter(r => r.errori.some(e => e.tipo === 'cliente')).forEach(r => {
+      const c = clientiMancanti.get(r.cliente) || { nome: r.cliente, n: 0, suggeriti: new Map() };
+      c.n++;
+      const g = catGiacenza.get(catSerialNorm(r.serial));
+      const a = g && anagByCodice.get(g.item);
+      if (a?.customer_id) c.suggeriti.set(a.customer_id, (c.suggeriti.get(a.customer_id) || 0) + 1);
+      clientiMancanti.set(r.cliente, c);
+    });
+    // Configurazioni da scegliere, raggruppate per cliente + Part Number + DDT: una scelta per gruppo
+    const sceltaGruppi = new Map();
+    righe.filter(r => r.errori.some(e => e.tipo === 'scelta')).forEach(r => {
+      const k = r.gruppoScelta;
+      const s = sceltaGruppi.get(k) || { key: k, customer: r.customer, cliente: r.cliente, pn: r.pn, ddt: r.ddt, descrizione: r.descrizione, n: 0, candidati: r.candidati, rma: new Set() };
+      s.n++;
+      s.rma.add(r.rma);
+      sceltaGruppi.set(k, s);
+    });
+    const prodottiMancanti = new Map();
+    righe.filter(r => r.errori.some(e => e.tipo === 'prodotto')).forEach(r => {
+      const k = `${r.customer}|${r.pn}`;
+      const p = prodottiMancanti.get(k) || { customer: r.customer, pn: r.pn, descrizione: r.descrizione, n: 0 };
+      p.n++;
+      prodottiMancanti.set(k, p);
+    });
     const conta = (esito) => righe.filter(r => r.esito === esito).length;
     return {
-      righe, docs: [...docs.values()], conErrori, erroriPerTipo, doppioni,
-      transcMancanti: [...transcMancanti.values()], aliasProposti: [...aliasProposti.values()],
-      n: {
-        IT: conta('IT'), RA: conta('RA'), nessuna: conta('nessuna'), ignorata: conta('ignorata'),
-        esclusa: conta('esclusa'), scartata: conta('scartata'), gia_caricata: conta('gia_caricata'),
-      },
+      righe, docs: [...docs.values()], conErrori, erroriPerTipo,
+      clientiMancanti: [...clientiMancanti.values()].sort((a, b) => b.n - a.n),
+      prodottiMancanti: [...prodottiMancanti.values()].sort((a, b) => b.n - a.n),
+      sceltaGruppi: [...sceltaGruppi.values()].sort((a, b) => b.n - a.n),
+      n: { RA: conta('RA'), nessuna: conta('nessuna'), disallineata: conta('disallineata'), esclusa: conta('esclusa') },
     };
-  }, [catRigheTutte, catGiacenza, catImpostazioni, catRegole, catTranscodifiche, catStorico, catRmaGestiti,
-    catDupScelte, catClientiAlias, catSceltaProdotto, anagrafica]);
+  }, [catRighe, catGiacenza, catFileAt, catImpostazioni, catClienti, catTranscodifiche, catStorico, catSceltaProdotto, anagrafica]);
+
+  async function salvaCatCliente(nome_backlog, customer_id, usa_main_component = false) {
+    const riga = { nome_backlog, customer_id, usa_main_component, updated_at: new Date().toISOString(), updated_by: currentUser || null };
+    const { error } = await supabase.from('cat_clienti_transcodifica').upsert(riga, { onConflict: 'nome_backlog' });
+    if (error) { alert('Errore salvataggio cliente: ' + error.message); return; }
+    setCatClienti(prev => [...prev.filter(c => c.nome_backlog !== nome_backlog), riga]);
+  }
+
+  // Anagrafica clienti NetSuite: export Customers (Internal ID, ID, Name, [PAX] GROUP), xlsx o csv
+  async function handleCatClientiNsUpload(event) {
+    const file = event.target.files[0];
+    if (!file) return;
+    event.target.value = '';
+    setCatLoading(true);
+    try {
+      const wb = XLSX.read(await file.arrayBuffer(), { type: 'array' });
+      const rows = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]], { defval: '' });
+      const norm = s => String(s).toLowerCase().replace(/[^a-z0-9]/g, '');
+      const key = (r, ...cands) => Object.keys(r).find(k => cands.includes(norm(k)));
+      const r0 = rows[0] || {};
+      const kInt = key(r0, 'internalid'), kNome = key(r0, 'name', 'nome'), kCod = key(r0, 'id'), kGr = key(r0, 'paxgroup', 'group', 'gruppo');
+      if (!kInt || !kNome) { alert("Colonne mancanti: servono 'Internal ID' e 'Name'."); setCatLoading(false); return; }
+      const clienti = [];
+      const visti = new Set();
+      rows.forEach(r => {
+        const id = String(r[kInt] || '').trim();
+        const nome = String(r[kNome] || '').trim();
+        if (!id || !nome || visti.has(id)) return;
+        visti.add(id);
+        clienti.push({
+          internal_id: id, nome, codice: kCod ? String(r[kCod] || '').trim() : null,
+          gruppo: kGr ? String(r[kGr] || '').trim() : null,
+          updated_at: new Date().toISOString(), updated_by: currentUser || null,
+        });
+      });
+      if (clienti.length === 0) { alert('Nessun cliente valido nel file.'); setCatLoading(false); return; }
+      if (!window.confirm(`Caricare ${clienti.length.toLocaleString('it-IT')} clienti NetSuite?\n\nI nomi servono a leggere gli Internal ID e a proporre gli abbinamenti con il backlog.`)) { setCatLoading(false); return; }
+      for (let i = 0; i < clienti.length; i += 500) {
+        const { error } = await supabase.from('cat_clienti_ns').upsert(clienti.slice(i, i + 500), { onConflict: 'internal_id' });
+        if (error) throw error;
+      }
+      await fetchCatConfig();
+      alert(`${clienti.length.toLocaleString('it-IT')} clienti caricati.`);
+    } catch (err) { alert('Errore caricamento clienti NetSuite: ' + err.message); }
+    setCatLoading(false);
+  }
+
+  async function eliminaCatCliente(c) {
+    if (!window.confirm(`Eliminare la transcodifica “${c.nome_backlog}” → ${c.customer_id}?`)) return;
+    const { error } = await supabase.from('cat_clienti_transcodifica').delete().eq('nome_backlog', c.nome_backlog);
+    if (error) { alert('Errore eliminazione: ' + error.message); return; }
+    setCatClienti(prev => prev.filter(x => x.nome_backlog !== c.nome_backlog));
+  }
 
   async function salvaCatTranscodifica(customer_id, main_component, prodotto) {
     const { error } = await supabase.from('cat_transcodifiche').upsert(
@@ -5181,24 +5253,8 @@ export default function App() {
     setCatTranscodifiche(prev => [...prev.filter(t => !(t.customer_id === customer_id && t.main_component === main_component)), { customer_id, main_component, prodotto, updated_by: currentUser || null, updated_at: new Date().toISOString() }]);
   }
 
-  async function salvaCatClienteAlias(cliente, cliente_anagrafica) {
-    const { error } = await supabase.from('cat_clienti_alias').upsert(
-      { cliente, cliente_anagrafica, updated_at: new Date().toISOString(), updated_by: currentUser || null },
-      { onConflict: 'cliente' },
-    );
-    if (error) { alert('Errore salvataggio corrispondenza cliente: ' + error.message); return; }
-    setCatClientiAlias(prev => [...prev.filter(a => a.cliente !== cliente), { cliente, cliente_anagrafica, updated_by: currentUser || null, updated_at: new Date().toISOString() }]);
-  }
-
-  async function eliminaCatClienteAlias(a) {
-    if (!window.confirm(`Eliminare la corrispondenza ${a.cliente} → ${a.cliente_anagrafica}? I prodotti di quel cliente torneranno a essere segnalati.`)) return;
-    const { error } = await supabase.from('cat_clienti_alias').delete().eq('cliente', a.cliente);
-    if (error) { alert('Errore eliminazione corrispondenza: ' + error.message); return; }
-    setCatClientiAlias(prev => prev.filter(x => x.cliente !== a.cliente));
-  }
-
   async function eliminaCatTranscodifica(t) {
-    if (!window.confirm(`Eliminare la transcodifica ${t.customer_id} + ${t.main_component}? Alla prossima analisi verrà richiesta di nuovo.`)) return;
+    if (!window.confirm(`Eliminare la transcodifica ${t.customer_id} + ${t.main_component}?`)) return;
     const { error } = await supabase.from('cat_transcodifiche').delete().eq('customer_id', t.customer_id).eq('main_component', t.main_component);
     if (error) { alert('Errore eliminazione transcodifica: ' + error.message); return; }
     setCatTranscodifiche(prev => prev.filter(x => !(x.customer_id === t.customer_id && x.main_component === t.main_component)));
@@ -5218,89 +5274,6 @@ export default function App() {
     alert('Impostazioni salvate.');
   }
 
-  async function aggiungiCatRegola() {
-    const { magazzino_origine, magazzino_destinazione, azione } = catNuovaRegola;
-    if (!magazzino_origine || !magazzino_destinazione) return;
-    if (magazzino_origine === magazzino_destinazione) { alert('Origine e destinazione coincidono: la matricola è già a destinazione, nessuna regola necessaria.'); return; }
-    const { error } = await supabase.from('cat_regole_magazzino').upsert(
-      { magazzino_origine, magazzino_destinazione, azione, updated_at: new Date().toISOString(), updated_by: currentUser || null },
-      { onConflict: 'magazzino_origine,magazzino_destinazione' },
-    );
-    if (error) { alert('Errore salvataggio regola: ' + error.message); return; }
-    setCatNuovaRegola(prev => ({ ...prev, magazzino_origine: '' }));
-    await fetchCatConfig();
-  }
-
-  async function eliminaCatRegola(r) {
-    if (!window.confirm(`Eliminare la regola ${r.magazzino_origine} → ${r.magazzino_destinazione}? Tornerà a generare un trasferimento.`)) return;
-    const { error } = await supabase.from('cat_regole_magazzino').delete().eq('id', r.id);
-    if (error) { alert('Errore eliminazione regola: ' + error.message); return; }
-    setCatRegole(prev => prev.filter(x => x.id !== r.id));
-  }
-
-  // Registra su cat_rma_gestiti le combinazioni RMA + matricola caricate su NS (RPC: fonde i seriali in modo atomico)
-  async function registraCatRma(righe) {
-    const perRma = new Map();
-    righe.forEach(r => {
-      if (!r.externalId) return;
-      const rma = r.externalId.toUpperCase();
-      perRma.set(rma, [...(perRma.get(rma) || []), r.serial]);
-    });
-    const voci = [...perRma.entries()].map(([rma, serials]) => ({ rma, serials: [...new Set(serials)] }));
-    for (let i = 0; i < voci.length; i += 200) {
-      const { error } = await supabase.rpc('cat_rma_registra', { p: voci.slice(i, i + 200), p_by: currentUser || null });
-      if (error) throw error;
-    }
-    return voci.length;
-  }
-
-  // Carica lo storico iniziale (CSV RMA;Serial delle combinazioni già gestite prima dell'app)
-  async function handleCatStoricoRmaUpload(event) {
-    const file = event.target.files[0];
-    if (!file) return;
-    event.target.value = '';
-    const text = await file.text();
-    const lines = (text.charCodeAt(0) === 0xFEFF ? text.slice(1) : text).split(/\r?\n/).filter(l => l.trim());
-    if (lines.length < 2) { alert('File vuoto.'); return; }
-    const sep = csvSeparator(lines[0]);
-    const norm = s => s.toLowerCase().replace(/[^a-z0-9]/g, '');
-    const headers = splitCsvLine(lines[0], sep).map(norm);
-    const iRma = headers.findIndex(h => ['rma', 'externalid'].includes(h));
-    const iSer = headers.findIndex(h => ['serial', 'serialnumber', 'matricola'].includes(h));
-    if (iRma < 0 || iSer < 0) { alert("Colonne mancanti: servono 'RMA' (o 'External ID') e 'Serial'."); return; }
-    const perRma = new Map();
-    let combinazioni = 0;
-    lines.slice(1).forEach(line => {
-      const c = splitCsvLine(line, sep);
-      const rma = (c[iRma] || '').toUpperCase();
-      const ser = (c[iSer] || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
-      if (!rma || ser.length < 4) return;
-      if (!perRma.has(rma)) perRma.set(rma, new Set());
-      perRma.get(rma).add(ser);
-      combinazioni++;
-    });
-    if (perRma.size === 0) { alert('Nessuna combinazione valida nel file.'); return; }
-    if (!window.confirm(
-      `Caricare ${combinazioni.toLocaleString('it-IT')} combinazioni su ${perRma.size.toLocaleString('it-IT')} RMA?\n\n` +
-      'Le combinazioni si aggiungono a quelle già presenti: nulla viene cancellato.'
-    )) return;
-    const voci = [...perRma.entries()].map(([rma, s]) => ({ rma, serials: [...s] }));
-    setCatLoading(true);
-    try {
-      let fatti = 0;
-      for (let i = 0; i < voci.length; i += 200) {
-        const { error } = await supabase.rpc('cat_rma_registra', { p: voci.slice(i, i + 200), p_by: currentUser || null });
-        if (error) throw error;
-        fatti += voci.slice(i, i + 200).length;
-        setCatRmaProgress(`${fatti.toLocaleString('it-IT')}/${voci.length.toLocaleString('it-IT')} RMA`);
-      }
-      await fetchCatConfig();
-      alert(`Storico aggiornato: ${voci.length.toLocaleString('it-IT')} RMA.`);
-    } catch (err) { alert('Errore caricamento storico RMA: ' + err.message); }
-    setCatRmaProgress('');
-    setCatLoading(false);
-  }
-
   const catDownloadCsv = (header, rows, nome) => {
     const blob = new Blob(['﻿' + [header, ...rows].join('\r\n')], { type: 'text/csv;charset=utf-8;' });
     const url = URL.createObjectURL(blob);
@@ -5311,138 +5284,103 @@ export default function App() {
 
   async function esportaCatalogazione() {
     const an = catAnalisi;
-    if (!an || an.conErrori.length > 0) return;
-    // La giacenza può essere stata ricaricata da un altro utente dopo l'analisi: verifica sul DB, non sullo stato locale
+    if (!an || an.docs.length === 0) { alert('Nessun documento da esportare.'); return; }
+    // La giacenza può essere stata ricaricata dopo l'analisi: verifica sul DB, non sullo stato locale
     const { data: meta } = await supabase.from('import_meta').select('*').in('chiave', ['inv_snapshot_file', 'inv_snapshot', INV_SNAPSHOT_LOCK]);
     const metaMap = {};
     (meta || []).forEach(m => { metaMap[m.chiave] = m.updated_at; });
-    const giacenzaAttuale = metaMap.inv_snapshot_file || metaMap.inv_snapshot || null;
-    if (metaMap[INV_SNAPSHOT_LOCK] || giacenzaAttuale !== catGiacenzaAt) {
+    if (metaMap[INV_SNAPSHOT_LOCK] || (metaMap.inv_snapshot_file || metaMap.inv_snapshot || null) !== catGiacenzaAt) {
       alert('La giacenza NS è stata ricaricata (o è in caricamento) dopo l\'analisi: rianalizza prima di esportare.');
       await fetchImportMeta();
       return;
     }
-    const docs = an.docs;
-    // Le matricole già a destinazione non generano documenti, ma sono su NS: vanno comunque registrate
-    const giaNS = an.righe.filter(r => r.esito === 'nessuna');
-    const inErrore = an.conErrori;
-    if (docs.length === 0 && giaNS.length === 0 && inErrore.length === 0) { alert('Niente da esportare.'); return; }
-    const it = docs.filter(d => d.tipo === 'IT');
-    const ra = docs.filter(d => d.tipo === 'RA');
-    const nMat = ds => ds.reduce((s, d) => s + d.righe.length, 0);
-    const codaErrori = inErrore.length > 0
-      ? `\n\n${inErrore.length.toLocaleString('it-IT')} righe con errori vengono messe da parte in “Da sistemare”: rientreranno da sole nelle prossime analisi.`
-      : '';
-    const conferma = docs.length === 0 && giaNS.length === 0
-      ? `Mettere da parte ${inErrore.length.toLocaleString('it-IT')} righe con errori?\n\nNon c'è niente da caricare su NetSuite: non verrà generato nessun file.`
-      : docs.length === 0
-        ? `Registrare ${giaNS.length.toLocaleString('it-IT')} combinazioni RMA + matricola già a destinazione su NetSuite?\n\n` +
-          'Non c\'è nessun documento da caricare: non verrà generato nessun file.\n' +
-          'Le combinazioni non rientreranno nelle prossime analisi.' + codaErrori
-        : `Esportare ${docs.length} documenti?\n\n` +
-          `Inventory Transfer: ${it.length} documenti, ${nMat(it)} matricole\n` +
-          `Return Authorization: ${ra.length} documenti, ${nMat(ra)} matricole\n\n` +
-          `Verranno registrate come caricate su NetSuite ${(nMat(docs) + giaNS.length).toLocaleString('it-IT')} combinazioni RMA + matricola ` +
-          `(${giaNS.length.toLocaleString('it-IT')} già a destinazione, senza documento): non rientreranno nelle prossime analisi.` + codaErrori;
-    if (!window.confirm(conferma)) return;
+    const nMat = an.docs.reduce((s, d) => s + d.righe.length, 0);
+    if (!window.confirm(
+      `Esportare ${an.docs.length} Return Authorization (${nMat.toLocaleString('it-IT')} matricole)?\n\n` +
+      `Un documento per cliente, data ${an.docs[0].data}.` +
+      (an.conErrori.length > 0 ? `\n\n${an.conErrori.length.toLocaleString('it-IT')} matricole con errori restano fuori: le ritrovi nella scheda Errori al prossimo caricamento del backlog.` : '')
+    )) return;
 
-    // Prima lo storico (idext univoco): se un altro utente ha già esportato lo stesso documento l'export si ferma
     setCatLoading(true);
-    const testate = docs.map(d => ({
-      idext: d.idext, tipo: d.tipo, cliente: d.cliente, data_catalogazione: catDataIso(d.data),
-      magazzino_origine: d.origine || null, magazzino_destinazione: d.destinazione,
+    const testate = an.docs.map(d => ({
+      idext: d.idext, tipo: 'RA', cliente: d.cliente, data_catalogazione: catDataIso(d.data),
+      magazzino_origine: null, magazzino_destinazione: d.destinazione,
       n_righe: d.linee.length, n_matricole: d.righe.length, giacenza_at: catGiacenzaAt,
       file_catalogato: catFile, esportato_da: currentUser || null,
     }));
-    if (testate.length > 0) {
-      const { error } = await supabase.from('cat_export_testate').insert(testate);
-      if (error) {
-        alert('Export annullato, nessun file generato: ' + error.message + '\n\nProbabilmente un documento è già stato esportato da un altro utente: rianalizza.');
-        await fetchCatConfig();
-        setCatLoading(false);
-        return;
-      }
+    const { error } = await supabase.from('cat_export_testate').insert(testate);
+    if (error) {
+      alert('Export annullato, nessun file generato: ' + error.message + '\n\nProbabilmente un documento è già stato esportato: rianalizza.');
+      await fetchCatConfig();
+      setCatLoading(false);
+      return;
     }
-    // Combinazioni RMA + matricola: registrate prima dello scarico, così non si ripresentano
-    try {
-      await registraCatRma([...docs.flatMap(d => d.righe), ...giaNS]);
-    } catch (err) {
-      alert('Attenzione: i documenti sono stati registrati ma la registrazione delle combinazioni RMA + matricola è fallita (' + err.message + ').\n\nI file vengono comunque generati: riesegui l\'analisi per verificare.');
-    }
-
-    // Righe in errore messe da parte; quelle sistemate (tutte le altre) escono dall'elenco
-    try {
-      if (inErrore.length > 0) {
-        const daSalvare = inErrore.map(r => ({
-          rma: (r.externalId || '').toUpperCase(), serial: r.serial, customer: r.customer,
-          data_catalogazione: r.date, your_ref: r.ref, item: r.item,
-          esito: CAT_ESITI[r.esito]?.label || r.esito, errori: r.errori.map(e => e.msg).join(' · '),
-          file_catalogato: catFile, messa_at: new Date().toISOString(), messa_da: currentUser || null,
-        }));
-        for (let i = 0; i < daSalvare.length; i += 500) {
-          const { error } = await supabase.from('cat_sospese').upsert(daSalvare.slice(i, i + 500), { onConflict: 'rma,serial' });
-          if (error) throw error;
-        }
-      }
-      const risolte = an.righe.filter(r => r.errori.length === 0 && catSospese.some(s => (s.rma || '').toUpperCase() === (r.externalId || '').toUpperCase() && s.serial === r.serial));
-      for (const r of risolte) {
-        const { error } = await supabase.from('cat_sospese').delete().eq('rma', (r.externalId || '').toUpperCase()).eq('serial', r.serial);
-        if (error) throw error;
-      }
-    } catch (err) {
-      alert('Attenzione: le righe da sistemare non sono state aggiornate (' + err.message + ').');
-    }
-
-    const stamp = new Date().toISOString().slice(0, 16).replace(/[-:]/g, '').replace('T', '_');
-    const memo = d => `catalogazione ${d.data}`;
-    if (it.length > 0) {
-      const rows = [];
-      it.forEach(d => d.linee.forEach(l => l.righe.forEach(r => rows.push(
-        [d.idext, l.surrogate, d.data, l.item, l.righe.length, r.serial, d.origine, d.destinazione, memo(d)].join(';'),
-      ))));
-      catDownloadCsv('IDextIT;Surrogate Line;Date;Item;Quantity;Serial;Magazzino di origine;Magazzino di destinazione;memo', rows, `catalogazione_IT_${stamp}.csv`);
-    }
-    if (ra.length > 0) {
-      const rows = [];
-      ra.forEach(d => d.linee.forEach(l => l.righe.forEach(r => rows.push(
-        [d.idext, l.surrogate, d.data, d.cliente, r.serial, l.item, l.righe.length, d.destinazione, memo(d)].join(';'),
-      ))));
-      catDownloadCsv('External ID;Surrogate Line;Date;Customer;Serial;Item;Quantity;Magazzino di destinazione;memo', rows, `catalogazione_RA_${stamp}.csv`);
-    }
+    const rows = [];
+    an.docs.forEach(d => d.linee.forEach(l => l.righe.forEach(r => rows.push(
+      // Serial senza il prefisso interno del backlog: è la forma con cui NetSuite conosce le matricole
+      [d.idext, l.surrogate, d.data, d.cliente, r.serialNs || r.serial, l.item, l.righe.length, d.destinazione, `catalogazione ${d.data}`].join(';'),
+    ))));
+    catDownloadCsv('External ID;Surrogate Line;Date;Customer;Serial;Item;Quantity;Magazzino di destinazione;memo', rows,
+      `catalogazione_RA_${new Date().toISOString().slice(0, 16).replace(/[-:]/g, '').replace('T', '_')}.csv`);
+    await fetchCatConfig();
     setCatLoading(false);
-    // Rianalisi: le combinazioni appena registrate passano a "già caricata" e spariscono dall'elenco di lavoro
-    await analizzaCatalogato();
+  }
+
+  // Elenco completo delle matricole che in NS stanno su RIP/RIPAX ma non sono nel backlog
+  function scaricaCatNonNelBacklog() {
+    if (catNonNelBacklog.length === 0) return;
+    const perGruppo = new Map();
+    catNonNelBacklog.forEach(g => {
+      const k = `${g.location}|${g.item}`;
+      const x = perGruppo.get(k) || { Magazzino: g.location, Articolo: g.item, Matricole: 0 };
+      x.Matricole++;
+      perGruppo.set(k, x);
+    });
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(
+      [...perGruppo.values()].sort((a, b) => b.Matricole - a.Matricole),
+      { header: ['Magazzino', 'Articolo', 'Matricole'] }), 'Per articolo');
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(
+      catNonNelBacklog.map(g => ({ Matricola: g.numero, Articolo: g.item, Magazzino: g.location })),
+      { header: ['Matricola', 'Articolo', 'Magazzino'] }), 'Matricole');
+    XLSX.writeFile(wb, `catalogazione_non_nel_backlog_${new Date().toISOString().slice(0, 10)}.xlsx`);
   }
 
   function scaricaCatDettaglio() {
     const an = catAnalisi;
     if (!an) return;
     const dettaglio = an.righe.map(r => ({
-      Matricola: r.serial, Customer: r.customer, 'Data catalogazione': r.date, 'External ID catalogato': r.externalId, 'Your Ref': r.ref,
-      'Item catalogato': r.item, Prodotto: r.prodotto, 'Magazzino NS': r.origine, Destinazione: r.destinazione || '',
-      Esito: CAT_ESITI[r.esito]?.label || r.esito, IDext: r.idext, Errori: r.errori.map(e => e.msg).join(' | '),
+      Matricola: r.serial, 'Matricola NS': r.serialNs !== r.serial ? r.serialNs : '', RMA: r.rma,
+      'Cliente backlog': r.cliente, 'Internal ID': r.customer, Stato: r.stato, BIN: r.bin,
+      'Part Number': r.pn, Descrizione: r.descrizione, Prodotto: r.prodotto, 'Magazzino NS': r.origine,
+      Destinazione: r.destinazione, Esito: CAT_ESITI[r.esito]?.label || r.esito, IDext: r.idext || '',
+      Errori: r.errori.map(e => e.msg).join(' | '), Note: (r.note || []).join(' | '),
     }));
     const cols = Object.keys(dettaglio[0]);
-    const documenti = an.docs.map(d => ({
-      IDext: d.idext, Tipo: d.tipo, Cliente: d.cliente, Data: d.data, Origine: d.origine, Destinazione: d.destinazione,
-      Righe: d.linee.length, Matricole: d.righe.length,
-    }));
     const riepilogo = [
-      ['File catalogato', catFile], ['Giacenza NS del', catGiacenzaAt ? new Date(catGiacenzaAt).toLocaleString('it-IT') : ''],
+      ['File backlog', catFile], ['Data backlog', catFileAt ? catFileAt.toLocaleString('it-IT') : ''],
+      ['Giacenza NS del', catGiacenzaAt ? new Date(catGiacenzaAt).toLocaleString('it-IT') : ''],
       [],
-      ['Matricole', an.righe.length],
-      ...Object.entries(CAT_ESITI).map(([k, v]) => [v.label, an.n[k]]),
-      ['Con errori bloccanti', an.conErrori.length],
+      ['Matricole nel backlog', an.righe.length],
+      ...Object.entries(CAT_ESITI).map(([k, v]) => [v.label, an.n[k] ?? 0]),
+      ['Con errori', an.conErrori.length],
       ...Object.entries(an.erroriPerTipo).map(([k, v]) => [`  ${CAT_ERRORI[k]}`, v]),
+      [],
+      ['In RIP/RIPAX ma non nel backlog', catNonNelBacklog.length],
       [],
       ['Scaricato da', currentUser || ''], ['Scaricato il', new Date().toLocaleString('it-IT')],
     ];
     const wb = XLSX.utils.book_new();
     XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(riepilogo), 'Riepilogo');
-    XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(dettaglio, { header: cols }), 'Dettaglio');
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(dettaglio, { header: cols }), 'Backlog');
     XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(dettaglio.filter(r => r.Errori), { header: cols }), 'Errori');
-    XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(documenti), 'Documenti');
-    XLSX.writeFile(wb, `catalogazione_dettaglio_${new Date().toISOString().slice(0, 10)}.xlsx`);
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(
+      catNonNelBacklog.map(g => ({ Matricola: g.numero, Item: g.item, Magazzino: g.location })),
+      { header: ['Matricola', 'Item', 'Magazzino'] }), 'Non nel backlog');
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(an.docs.map(d => ({
+      IDext: d.idext, Cliente: d.cliente, Data: d.data, Destinazione: d.destinazione, Righe: d.linee.length, Matricole: d.righe.length,
+    }))), 'Documenti RA');
+    XLSX.writeFile(wb, `catalogazione_backlog_${new Date().toISOString().slice(0, 10)}.xlsx`);
   }
 
   // ==================== PERMESSI DI RUOLO ====================
@@ -5457,18 +5395,43 @@ export default function App() {
   const isSper = (mod) => moduliSper.has(mod);                    // modulo sperimentale (SP)
 
   // Giacenza NS condivisa (Controlli Inventariali + Catalogazione): stessa informazione e stesso caricamento in entrambi i moduli
-  const renderGiacenzaNS = (mod, onRefresh) => {
+  const renderGiacenzaNS = (mod, onRefresh, extra = null) => {
     const fmt = iso => iso ? new Date(iso).toLocaleString('it-IT') : '—';
+    const fmtD = iso => iso ? new Date(iso).toLocaleDateString('it-IT') : '—';
     const lockAt = importMeta[INV_SNAPSHOT_LOCK];
     const lockAttivo = lockAt && Date.now() - new Date(lockAt).getTime() < 30 * 60 * 1000;
+    // Il caricamento è additivo: ogni estrazione copre i suoi magazzini. Si raggruppano
+    // i magazzini per file di provenienza, così si vede cosa è aggiornato e cosa no.
+    const qtyPerLoc = {};
+    invRiepilogo.forEach(r => { qtyPerLoc[r.location] = (qtyPerLoc[r.location] || 0) + (r.qty || 0); });
+    const gruppi = new Map();
+    invMagMeta.forEach(m => {
+      const k = `${m.file_at || ''}|${m.caricato_at || ''}|${m.caricato_da || ''}`;
+      const g = gruppi.get(k) || { file_at: m.file_at, caricato_at: m.caricato_at, caricato_da: m.caricato_da, magazzini: [], qty: 0 };
+      g.magazzini.push(m.location.split(' - ')[0].trim());
+      g.qty += qtyPerLoc[m.location] || 0;
+      gruppi.set(k, g);
+    });
+    const elenco = [...gruppi.values()].sort((a, b) => new Date(b.caricato_at || 0) - new Date(a.caricato_at || 0));
     return (
-      <div className="flex items-center justify-between flex-wrap gap-3 bg-white border border-gray-200 rounded-xl px-4 py-3">
+      <div className="flex items-start justify-between flex-wrap gap-3 bg-white border border-gray-200 rounded-xl px-4 py-3">
         <div>
-          <p className="text-[10px] font-black uppercase tracking-wider text-gray-400">Giacenza NS (condivisa)</p>
-          {importMeta.inv_snapshot_file || importMeta.inv_snapshot ? (
+          <p className="text-[10px] font-black uppercase tracking-wider text-gray-400">Giacenza NS · condivisa tra i moduli, additiva per magazzino</p>
+          {elenco.length > 0 ? (
+            <div className="space-y-0.5">
+              {elenco.map((g, k) => (
+                <p key={k} className="text-sm font-bold text-gray-800">
+                  {g.magazzini.sort().join(', ')}
+                  <span className="font-normal text-gray-500">
+                    {' '}· {g.qty.toLocaleString('it-IT')} matricole · file del {fmtD(g.file_at)} · caricato il {fmt(g.caricato_at)}{g.caricato_da ? ` da ${g.caricato_da}` : ''}
+                  </span>
+                </p>
+              ))}
+            </div>
+          ) : importMeta.inv_snapshot_file || importMeta.inv_snapshot ? (
             <p className="text-sm font-bold text-gray-800">
               File del {fmt(importMeta.inv_snapshot_file)}
-              <span className="font-normal text-gray-500"> · caricato il {fmt(importMeta.inv_snapshot)}{importMeta.inv_snapshot__by ? ` da ${importMeta.inv_snapshot__by}` : ''}</span>
+              <span className="font-normal text-gray-500"> · caricato il {fmt(importMeta.inv_snapshot)}{importMeta.inv_snapshot__by ? ` da ${importMeta.inv_snapshot__by}` : ''} · provenienza per magazzino non ancora registrata</span>
             </p>
           ) : (
             <p className="text-sm font-bold text-amber-700">Nessuna giacenza NS caricata</p>
@@ -5477,17 +5440,25 @@ export default function App() {
             <p className="text-xs font-bold text-amber-700">⏳ Caricamento in corso da {importMeta[`${INV_SNAPSHOT_LOCK}__by`] || 'un altro utente'}: fino al termine resta attiva la giacenza precedente</p>
           )}
         </div>
-        <div className="flex gap-2">
+        <div className="flex gap-2 items-start">
           <button onClick={() => { fetchImportMeta(); onRefresh?.(); }}
             className="bg-gray-100 hover:bg-gray-200 text-gray-600 text-sm font-bold px-3 py-2.5 rounded-xl cursor-pointer transition" title="Aggiorna">
             ↻
           </button>
           {canUpload(mod) && (
-            <label className={`bg-blue-600 hover:bg-blue-700 text-white text-sm font-bold px-4 py-2.5 rounded-xl cursor-pointer transition shadow-xs ${invSnapshotLoading ? 'opacity-50 pointer-events-none' : ''}`}>
-              {invImportProgress ? `Caricamento ${invImportProgress}…` : '📂 Carica giacenza NS (CSV)'}
+            <label className={`bg-blue-600 hover:bg-blue-700 text-white text-sm font-bold px-4 py-2 rounded-xl cursor-pointer transition shadow-xs text-center ${invSnapshotLoading ? 'opacity-50 pointer-events-none' : ''}`}>
+              {invImportProgress ? `Caricamento ${invImportProgress}…` : (
+                <>
+                  📂 Giacenza NS
+                  <span className="block text-[10px] font-bold opacity-80">
+                    {importMeta.inv_snapshot_file ? `file del ${fmtD(importMeta.inv_snapshot_file)}` : 'mai caricata'}
+                  </span>
+                </>
+              )}
               <input type="file" accept=".csv,text/csv" className="hidden" onChange={handleInvSnapshotUpload} />
             </label>
           )}
+          {extra}
         </div>
       </div>
     );
@@ -9648,26 +9619,90 @@ export default function App() {
           const an = catAnalisi;
           const fmt = iso => iso ? new Date(iso).toLocaleString('it-IT') : '—';
           const giacenzaCambiata = an && catGiacenzaAt !== (importMeta.inv_snapshot_file || importMeta.inv_snapshot || null);
-          const daEsportare = an ? an.docs : [];
-          // Gli errori non bloccano più: le righe interessate vengono messe da parte e riprese alla prossima analisi
-          const bloccato = !an || giacenzaCambiata || (daEsportare.length === 0 && an.n.nessuna === 0 && an.conErrori.length === 0);
           const q = catSearch.trim().toLowerCase();
-          // Sotto-scheda "Errori": si vedono solo le righe da sistemare, indipendentemente dal contatore selezionato
-          const righeVis = !an ? [] : an.righe.filter(r =>
-            (catSubTab === 'errori'
-              ? r.errori.length > 0
-              : catFiltro === 'tutte' || (catFiltro === 'errori' ? r.errori.length > 0 : r.esito === catFiltro)) &&
-            (!q || [r.serial, r.customer, r.item, r.prodotto, r.idext, r.origine].some(v => (v || '').toLowerCase().includes(q))));
-          const anagByMC = new Map();
-          anagrafica.forEach(a => { if (a.main_component) anagByMC.set(a.main_component, [...(anagByMC.get(a.main_component) || []), a]); });
-          const magazzini = [...new Set(invRiepilogo.map(r => r.location))].sort();
-          const destinazioni = [catImpostazioni.magazzino_ripax, catImpostazioni.magazzino_rip].filter(Boolean);
+          const cerca = r => !q || [r.serial, r.rma, r.cliente, r.customer, r.pn, r.prodotto, r.origine].some(v => (v || '').toLowerCase().includes(q));
+          const magazziniRepair = [...new Set(invRiepilogo.map(r => r.location).filter(l => /^(RIP|RIPAX|DEP|IRREP)/i.test(l)))].sort();
+          // Nome del cliente accanto all'Internal ID: arriva dall'anagrafica clienti NetSuite, se caricata
+          const nsById = new Map(catClientiNs.map(c => [c.internal_id, c]));
+          const nomeCliente = (id) => nsById.get(String(id))?.nome || '';
+          const etichettaCliente = (id) => (nomeCliente(id) ? `${id} · ${nomeCliente(id)}` : String(id || ''));
+          // La configurazione da scegliere non è un errore: è un passo del carico, quindi sta sotto il carico.
+          // Disallineate: sotto-scheda a parte. Errori: ciò che va corretto altrove (clienti, Anagrafica).
+          const soloScelta = r => r.errori.length > 0 && r.errori.every(e => e.tipo === 'scelta');
+          const daSistemare = r => r.errori.length > 0 && r.esito !== 'disallineata' && !soloScelta(r);
+          const righeVis = !an ? [] : an.righe.filter(r => daSistemare(r) && cerca(r));
+          const righeDisall = !an ? [] : an.righe.filter(r => r.esito === 'disallineata' && cerca(r));
+          // Disallineate raggruppate per segnalazione: stesso messaggio, stesse matricole sotto
+          const gruppiDisall = [...righeDisall.reduce((m, r) => {
+            r.errori.filter(e => e.tipo === 'deposito' || e.tipo === 'magazzino').forEach(e => {
+              const x = m.get(e.msg) || { key: e.msg, msg: e.msg, tipo: e.tipo, righe: [], clienti: new Set() };
+              x.righe.push(r);
+              if (r.customer) x.clienti.add(r.customer);
+              m.set(e.msg, x);
+            });
+            return m;
+          }, new Map()).values()].sort((a, b) => b.righe.length - a.righe.length);
+          const nErrori = !an ? 0 : an.righe.filter(daSistemare).length;
+          const docsVis = !an ? [] : an.docs.filter(d => !q
+            || [d.idext, d.cliente, nomeCliente(d.cliente), d.destinazione].some(v => (v || '').toLowerCase().includes(q))
+            || d.linee.some(l => l.item.toLowerCase().includes(q) || l.righe.some(cerca)));
+          // Primo livello del carico: un cliente per riga, con i totali dei suoi documenti
+          const clientiCarico = [...docsVis.reduce((m, d) => {
+            const c = m.get(d.cliente) || { cliente: d.cliente, docs: [], nMatricole: 0, nArticoli: 0, destinazioni: new Set() };
+            c.docs.push(d);
+            c.nMatricole += d.righe.length;
+            c.nArticoli += d.linee.length;
+            c.destinazioni.add(d.destinazione.split(' - ')[0].trim());
+            return m.set(d.cliente, c);
+          }, new Map()).values()]
+            .map(c => ({ ...c, destinazioni: [...c.destinazioni] }))
+            .sort((a, b) => b.nMatricole - a.nMatricole);
+          // Clienti NetSuite che portano lo stesso nome del backlog (l'asterisco finale si ignora):
+          // è l'abbinamento più affidabile, più forte del cliente dedotto dai prodotti in giacenza
+          const nomeNorm = s => String(s || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+          // Campo cliente NetSuite scrivibile: la datalist filtra da sé mentre si digita.
+          // Nelle opzioni il valore è "internal id · nome", così la ricerca prende anche il nome.
+          const opzioneCliente = (c) => `${c.internal_id} · ${c.nome}`;
+          const clienteDaTesto = (testo) => {
+            const t = String(testo || '').trim();
+            if (!t) return null;
+            const perId = catClientiNs.find(c => c.internal_id === t || opzioneCliente(c) === t);
+            if (perId) return perId;
+            const esatto = catClientiNs.filter(c => nomeNorm(c.nome) === nomeNorm(t));
+            if (esatto.length === 1) return esatto[0];
+            return null;
+          };
+          const campoCliente = (chiave, onSalva) => {
+            const testo = catClienteDraft[chiave] ?? '';
+            const scelto = clienteDaTesto(testo);
+            return (
+              <span className="flex items-center gap-2">
+                <input value={testo} list="cat-clienti-ns-combo" placeholder="scrivi nome o Internal ID…"
+                  onChange={e => setCatClienteDraft(p => ({ ...p, [chiave]: e.target.value }))}
+                  onKeyDown={e => { if (e.key === 'Enter' && scelto) { onSalva(scelto); setCatClienteDraft(p => ({ ...p, [chiave]: '' })); } }}
+                  className="text-xs border border-gray-300 rounded-lg px-2 py-1.5 w-72" />
+                <button onClick={() => { onSalva(scelto); setCatClienteDraft(p => ({ ...p, [chiave]: '' })); }} disabled={!scelto}
+                  className="bg-blue-600 hover:bg-blue-700 text-white text-xs font-bold px-3 py-1.5 rounded-lg cursor-pointer transition disabled:opacity-40">
+                  Assegna
+                </button>
+                {testo.trim() && !scelto && <span className="text-[11px] text-amber-700">nessun cliente corrisponde</span>}
+                {scelto?.gruppo && <span className="text-[11px] text-gray-400">gruppo {scelto.gruppo}</span>}
+              </span>
+            );
+          };
+          const perNome = (nome) => {
+            const base = nomeNorm(nome.replace(/\*+$/, ''));
+            if (!base) return [];
+            const esatti = catClientiNs.filter(c => nomeNorm(c.nome) === base);
+            return esatti.length > 0 ? esatti : catClientiNs.filter(c => nomeNorm(c.nome).startsWith(base));
+          };
+
           const tabellaRighe = (righe) => (
             <div className="bg-white border border-gray-200 rounded-xl overflow-x-auto">
               <table className="w-full text-xs">
                 <thead className="bg-gray-50 text-gray-500 uppercase text-[10px]">
                   <tr>
-                    {['Matricola', 'Cliente', 'Data', 'Item catalogato', 'Prodotto', 'Magazzino NS', 'Destinazione', 'Esito', 'IDext', 'Errori'].map(h => (
+                    {['Matricola', 'RMA', 'Cliente', 'Stato', 'Part Number', 'Prodotto', 'Magazzino NS', 'Destinazione', 'Esito', 'Errori e note'].map(h => (
                       <th key={h} className="px-3 py-2 text-left font-black whitespace-nowrap">{h}</th>
                     ))}
                   </tr>
@@ -9676,17 +9711,20 @@ export default function App() {
                   {righe.slice(0, 500).map(r => (
                     <tr key={r.i} className={`border-t border-gray-100 ${r.errori.length ? 'bg-amber-50/50' : ''}`}>
                       <td className="px-3 py-1.5 font-mono">{r.serial}</td>
-                      <td className="px-3 py-1.5">{r.customer}{r.ripax && <span className="ml-1 text-[9px] font-black text-amber-600">RIPAX</span>}</td>
-                      <td className="px-3 py-1.5 whitespace-nowrap">{r.date}</td>
-                      <td className="px-3 py-1.5 font-mono">{r.item}</td>
+                      <td className="px-3 py-1.5 font-mono whitespace-nowrap">{r.rma}</td>
+                      <td className="px-3 py-1.5">{r.cliente}{r.customer && <span className="text-gray-400"> · {r.customer}</span>}{r.ripax && <span className="ml-1 text-[9px] font-black text-amber-600">RIPAX</span>}</td>
+                      <td className="px-3 py-1.5 text-[10px] text-gray-500">{r.stato.replace('DEVICE_IN_REPAIR_', '')}</td>
+                      <td className="px-3 py-1.5 font-mono">{r.pn}</td>
                       <td className="px-3 py-1.5 font-mono">{r.prodotto}</td>
-                      <td className="px-3 py-1.5 whitespace-nowrap">{r.origine || <span className="text-gray-300">non in giacenza</span>}</td>
+                      <td className="px-3 py-1.5 whitespace-nowrap">{r.origine || <span className="text-gray-300">non in NS</span>}</td>
                       <td className="px-3 py-1.5 whitespace-nowrap">{r.destinazione}</td>
                       <td className="px-3 py-1.5">
                         <span className={`text-[10px] font-bold border rounded px-1.5 py-0.5 whitespace-nowrap ${CAT_ESITI[r.esito]?.cls || ''}`}>{CAT_ESITI[r.esito]?.label}</span>
                       </td>
-                      <td className="px-3 py-1.5 font-mono whitespace-nowrap">{r.idext}</td>
-                      <td className="px-3 py-1.5 text-amber-800">{r.errori.map(e => e.msg).join(' · ')}</td>
+                      <td className="px-3 py-1.5">
+                        {r.errori.length > 0 && <span className="text-amber-800">{r.errori.map(e => e.msg).join(' · ')}</span>}
+                        {r.note?.length > 0 && <span className="text-gray-400">{r.errori.length > 0 ? ' · ' : ''}{r.note.join(' · ')}</span>}
+                      </td>
                     </tr>
                   ))}
                 </tbody>
@@ -9694,38 +9732,45 @@ export default function App() {
             </div>
           );
 
-          // Si possono scegliere solo i prodotti di QUEL cliente: uno di un altro cliente sarebbe una codifica sbagliata.
-          // Se non ce ne sono, l'unica strada è creare il prodotto in Anagrafica; qui resta solo l'esclusione.
-          const selectTranscodifica = (customer, mc, valore) => {
-            const candidati = (anagByMC.get(mc) || []).filter(a => a.customer_id === customer).sort((a, b) => a.codice.localeCompare(b.codice));
-            return (
-              <select value={valore === undefined ? '' : valore === null ? '__null__' : valore} disabled={!canEdit('catalogazione')}
-                onChange={e => e.target.value && salvaCatTranscodifica(customer, mc, e.target.value === '__null__' ? null : e.target.value)}
-                className="text-xs border border-gray-300 rounded-lg px-2 py-1.5 bg-white max-w-xs">
-                <option value="">{candidati.length === 0 ? '— nessun prodotto per questo cliente —' : '— scegli prodotto —'}</option>
-                <option value="__null__">Escludi dagli export</option>
-                {candidati.map(a => <option key={a.codice} value={a.codice}>{a.codice}</option>)}
-              </select>
-            );
-          };
           return (
             <div className="space-y-5">
               <div>
                 <h2 className="text-lg font-black text-gray-800">🏷️ Catalogazione</h2>
-                <p className="text-xs text-gray-500">Confronto del catalogato con la giacenza NS: Inventory Transfer per le matricole presenti fuori destinazione, Return Authorization per quelle assenti.</p>
+                <p className="text-xs text-gray-500">
+                  Confronto del backlog repair con la giacenza NS dei magazzini di riparazione: le matricole assenti da NetSuite
+                  diventano Return Authorization, i disallineamenti vanno verificati.
+                </p>
               </div>
-              {renderGiacenzaNS('catalogazione', () => { fetchInvRiepilogo(); fetchCatConfig(); })}
+              {/* Giacenza e backlog si caricano dallo stesso punto, con la data del file su ciascun pulsante */}
+              {renderGiacenzaNS('catalogazione', () => { fetchInvRiepilogo(); fetchCatConfig(); },
+                canUpload('catalogazione') && (
+                  <label className={`bg-blue-600 hover:bg-blue-700 text-white text-sm font-bold px-4 py-2 rounded-xl cursor-pointer transition shadow-xs text-center ${catLoading ? 'opacity-50 pointer-events-none' : ''}`}>
+                    {catLoading ? (catProgress || 'Analisi in corso…') : (
+                      <>
+                        📂 Backlog repair
+                        <span className="block text-[10px] font-bold opacity-80">
+                          {catFileAt ? `file del ${catFileAt.toLocaleDateString('it-IT')}` : 'da caricare'}
+                        </span>
+                      </>
+                    )}
+                    <input type="file" accept=".csv,text/csv" className="hidden" onChange={handleBacklogUpload} />
+                  </label>
+                ))}
+              {/* Lista dei clienti NetSuite usata da tutti i campi scrivibili: il browser la filtra mentre si digita */}
+              <datalist id="cat-clienti-ns-combo">
+                {catClientiNs.map(c => <option key={c.internal_id} value={opzioneCliente(c)}>{c.gruppo ? `gruppo ${c.gruppo}` : ''}</option>)}
+              </datalist>
 
               <div className="flex gap-1 bg-gray-100 p-1 rounded-xl w-fit">
                 {[
                   { id: 'analisi', label: '🔍 Analisi' },
-                  { id: 'sospese', label: '🛠️ Da sistemare', n: catSospese.length },
-                  { id: 'storico', label: '📜 Storico export', n: catStorico.length },
+                  { id: 'anomalie', label: '🧭 Non nel backlog', n: catNonNelBacklog.length },
+                  { id: 'storico', label: '📜 Storico RA', n: catStorico.length },
                   { id: 'impostazioni', label: '⚙️ Impostazioni' },
                 ].map(t => (
                   <button key={t.id} onClick={() => setCatTab(t.id)}
                     className={`text-xs font-bold px-4 py-2 rounded-lg cursor-pointer transition ${catTab === t.id ? 'bg-white text-gray-800 shadow-xs' : 'text-gray-500 hover:text-gray-700'}`}>
-                    {t.label}{t.n != null && <span className="ml-1 text-[10px] opacity-70">({t.n})</span>}
+                    {t.label}{t.n != null && <span className="ml-1 text-[10px] opacity-70">({t.n.toLocaleString('it-IT')})</span>}
                   </button>
                 ))}
               </div>
@@ -9733,50 +9778,42 @@ export default function App() {
               {catTab === 'analisi' && (
                 <div className="space-y-4">
                   <div className="flex items-center gap-2 flex-wrap">
-                    <label className={`bg-blue-600 hover:bg-blue-700 text-white text-sm font-bold px-4 py-2.5 rounded-xl cursor-pointer transition shadow-xs ${catLoading ? 'opacity-50 pointer-events-none' : ''}`}>
-                      {catLoading ? 'Analisi in corso…' : '📂 Carica catalogato (CSV)'}
-                      <input type="file" accept=".csv,text/csv" className="hidden" onChange={handleCatalogatoUpload} />
-                    </label>
                     {an && (
                       <>
-                        <button onClick={() => analizzaCatalogato()} disabled={catLoading}
+                        <button onClick={() => analizzaBacklog()} disabled={catLoading}
                           className="bg-gray-100 hover:bg-gray-200 text-gray-700 text-sm font-bold px-4 py-2.5 rounded-xl cursor-pointer transition disabled:opacity-50">
                           ↻ Rianalizza
                         </button>
-                        <button onClick={scaricaCatDettaglio}
-                          className="bg-gray-100 hover:bg-gray-200 text-gray-700 text-sm font-bold px-4 py-2.5 rounded-xl cursor-pointer transition">
-                          ⬇️ Dettaglio Excel
-                        </button>
-                        <button onClick={esportaCatalogazione} disabled={bloccato || catLoading}
-                          title={bloccato ? 'Export bloccato: risolvere gli errori' : ''}
+                        <button onClick={esportaCatalogazione} disabled={catLoading || giacenzaCambiata || an.docs.length === 0}
+                          title={an.docs.length === 0 ? 'Nessun documento da esportare' : ''}
                           className="bg-green-600 hover:bg-green-700 text-white text-sm font-bold px-4 py-2.5 rounded-xl cursor-pointer transition shadow-xs disabled:opacity-40 disabled:cursor-not-allowed">
-                          {daEsportare.length > 0
-                            ? `📤 Esporta IT + RA (${daEsportare.length} documenti)`
-                            : an.n.nessuna > 0
-                              ? `✔️ Registra ${an.n.nessuna.toLocaleString('it-IT')} già su NS`
-                              : `📥 Metti da parte ${an.conErrori.length.toLocaleString('it-IT')} righe`}
+                          📤 Esporta RA ({an.docs.length} documenti)
                         </button>
                       </>
                     )}
                   </div>
 
                   {!an ? (
-                    <div className="text-center py-16 text-gray-400 text-sm">Carica il CSV del catalogato per avviare il confronto con la giacenza NS.</div>
+                    <div className="text-center py-16 text-gray-400 text-sm">Carica il backlog repair col pulsante in alto per avviare il confronto con la giacenza NS.</div>
                   ) : (
                     <>
-                      <p className="text-xs text-gray-500">
-                        <strong>{catFile}</strong> · {an.righe.length.toLocaleString('it-IT')} matricole · analizzato sulla giacenza NS del {fmt(catGiacenzaAt)}
-                      </p>
                       {giacenzaCambiata && (
                         <div className="bg-amber-50 border border-amber-200 text-amber-800 text-sm font-bold rounded-xl px-4 py-3">
                           La giacenza NS è cambiata dopo l'analisi: premi “Rianalizza” prima di esportare.
                         </div>
                       )}
+                      {catGiacenza.size === 0 && (
+                        <div className="bg-red-50 border border-red-200 text-red-700 text-sm font-bold rounded-xl px-4 py-3">
+                          Nella giacenza NS non c'è nessun magazzino di riparazione (RIP, RIPAX, DEP*, IRREP): carica l'estrazione repair,
+                          altrimenti ogni matricola risulterebbe da caricare.
+                        </div>
+                      )}
 
                       <div className="flex gap-1 bg-gray-100 p-1 rounded-xl w-fit">
                         {[
-                          { id: 'carico', label: '📦 Carico', n: an.n.IT + an.n.RA },
-                          { id: 'errori', label: '⚠️ Errori', n: an.conErrori.length },
+                          { id: 'carico', label: '📦 Carico', n: an.n.RA },
+                          { id: 'errori', label: '⚠️ Errori', n: nErrori },
+                          { id: 'disallineate', label: '🧭 Disallineate', n: an.n.disallineata },
                         ].map(s => (
                           <button key={s.id} onClick={() => setCatSubTab(s.id)}
                             className={`text-xs font-bold px-4 py-2 rounded-lg cursor-pointer transition ${catSubTab === s.id ? 'bg-white text-gray-800 shadow-xs' : 'text-gray-500 hover:text-gray-700'}`}>
@@ -9785,241 +9822,425 @@ export default function App() {
                         ))}
                       </div>
 
-                      <div className={`grid grid-cols-2 md:grid-cols-4 lg:grid-cols-8 gap-2 ${catSubTab === 'errori' ? 'hidden' : ''}`}>
-                        {[
-                          { id: 'IT', label: 'Transfer (IT)', n: an.n.IT, sub: `${an.docs.filter(d => d.tipo === 'IT').length} doc`, cls: 'text-blue-700' },
-                          { id: 'RA', label: 'Return (RA)', n: an.n.RA, sub: `${an.docs.filter(d => d.tipo === 'RA').length} doc`, cls: 'text-purple-700' },
-                          { id: 'nessuna', label: 'Nessuna azione', n: an.n.nessuna, cls: 'text-green-700' },
-                          { id: 'gia_caricata', label: 'Già caricate su NS', n: an.n.gia_caricata, cls: 'text-gray-500' },
-                          { id: 'ignorata', label: 'Ignorate', n: an.n.ignorata, cls: 'text-gray-500' },
-                          { id: 'esclusa', label: 'Escluse', n: an.n.esclusa, cls: 'text-gray-500' },
-                          { id: 'scartata', label: 'Doppioni scartati', n: an.n.scartata, cls: 'text-gray-400' },
-                          { id: 'errori', label: 'Da sistemare', n: an.conErrori.length, cls: an.conErrori.length ? 'text-amber-700' : 'text-gray-400' },
-                          { id: 'tutte', label: 'Totale', n: an.righe.length, cls: 'text-gray-800' },
-                        ].map(c => (
-                          <button key={c.id} onClick={() => setCatFiltro(c.id)}
-                            className={`text-left bg-white border rounded-xl px-3 py-2.5 cursor-pointer transition ${catFiltro === c.id ? 'border-blue-500 ring-2 ring-blue-100' : 'border-gray-200 hover:border-gray-300'}`}>
-                            <p className="text-[10px] font-bold uppercase text-gray-400">{c.label}</p>
-                            <p className={`text-xl font-black ${c.cls}`}>{c.n.toLocaleString('it-IT')}</p>
-                            {c.sub && <p className="text-[10px] text-gray-400">{c.sub}</p>}
-                          </button>
-                        ))}
-                      </div>
+                      {catSubTab === 'carico' && (
+                        <div className="grid grid-cols-3 gap-2 max-w-2xl">
+                          {[
+                            { label: 'Da caricare (RA)', n: an.n.RA, sub: `${an.docs.length} ${an.docs.length === 1 ? 'documento' : 'documenti'}`, cls: 'text-purple-700' },
+                            { label: 'Già in NS', n: an.n.nessuna, cls: 'text-green-700' },
+                            { label: 'Totale backlog', n: an.righe.length, cls: 'text-gray-800' },
+                          ].map(c => (
+                            <div key={c.label} className="bg-white border border-gray-200 rounded-xl px-3 py-2.5">
+                              <p className="text-[10px] font-bold uppercase text-gray-400">{c.label}</p>
+                              <p className={`text-xl font-black ${c.cls}`}>{c.n.toLocaleString('it-IT')}</p>
+                              {c.sub && <p className="text-[10px] text-gray-400">{c.sub}</p>}
+                            </div>
+                          ))}
+                        </div>
+                      )}
 
                       {catSubTab === 'carico' && (
-                        an.conErrori.length > 0 ? (
+                        nErrori > 0 ? (
                           <div className="bg-white border border-gray-200 text-gray-600 text-sm rounded-xl px-4 py-3">
-                            {daEsportare.length.toLocaleString('it-IT')} documenti pronti.
+                            {an.docs.length} documenti pronti con {an.n.RA.toLocaleString('it-IT')} matricole.
                             <button onClick={() => setCatSubTab('errori')} className="ml-1 font-bold text-amber-700 hover:underline cursor-pointer">
-                              {an.conErrori.length.toLocaleString('it-IT')} matricole restano fuori, da sistemare →
+                              {nErrori.toLocaleString('it-IT')} matricole restano fuori, da sistemare →
                             </button>
                           </div>
                         ) : (
                           <div className="bg-green-50 border border-green-200 text-green-800 text-sm font-bold rounded-xl px-4 py-3">
-                            ✓ Nessun errore · {daEsportare.length} documenti da esportare{an.n.gia_caricata > 0 ? ` · ${an.n.gia_caricata.toLocaleString('it-IT')} matricole già caricate su NS (saltate)` : ''}
+                            ✓ Nessun errore · {an.docs.length} documenti pronti
                           </div>
                         )
                       )}
 
-                      {catSubTab === 'errori' && (an.conErrori.length > 0 ? (
-                        <div className="bg-amber-50 border border-amber-200 rounded-xl px-4 py-3 space-y-1">
-                          <p className="text-sm font-black text-amber-800">
-                            {an.conErrori.length.toLocaleString('it-IT')} matricole da sistemare: restano fuori dai file e vengono messe da parte all'export
-                          </p>
-                          <div className="flex flex-wrap gap-2">
-                            {Object.entries(an.erroriPerTipo).map(([t, n]) => (
-                              <span key={t} className="text-xs font-bold bg-white border border-amber-200 text-amber-800 rounded-lg px-2 py-1">{CAT_ERRORI[t]}: {n}</span>
-                            ))}
-                          </div>
-                        </div>
-                      ) : (
-                        <div className="bg-green-50 border border-green-200 text-green-800 text-sm font-bold rounded-xl px-4 py-3">
-                          ✓ Nessuna matricola da sistemare.
-                        </div>
-                      ))}
-
-                      {catSubTab === 'errori' && an.transcMancanti.length > 0 && (
-                        <div className="bg-white border border-gray-200 rounded-xl p-4 space-y-2">
-                          <p className="text-sm font-black text-gray-800">Articoli pot_ senza prodotto in Anagrafica</p>
-                          <p className="text-xs text-gray-500">
-                            Per questi clienti non esiste nessun prodotto con quel Main Component: <strong>il prodotto va creato in Anagrafica</strong> e
-                            l'Anagrafica va reimportata, poi basta rianalizzare. Non si può usare il prodotto di un altro cliente, sarebbe una codifica sbagliata.
-                            L'unica alternativa è escludere quelle matricole dagli export.
-                          </p>
-                          {an.transcMancanti.map(t => (
-                            <div key={`${t.customer}|${t.mc}`} className="flex items-center gap-3 flex-wrap border-t border-gray-100 pt-2">
-                              <span className="text-xs font-bold text-gray-700 min-w-[16rem]">
-                                Cliente {t.customer} · <span className="font-mono">{t.mc}</span>
-                                <span className="text-gray-400 font-normal"> ({t.n} matricole)</span>
-                              </span>
-                              {selectTranscodifica(t.customer, t.mc, undefined)}
-                            </div>
-                          ))}
-                        </div>
-                      )}
-
-                      {catSubTab === 'errori' && an.erroriPerTipo.scelta > 0 && (
-                        <div className="bg-white border border-gray-200 rounded-xl p-4 space-y-2">
-                          <p className="text-sm font-black text-gray-800">Configurazione da scegliere, matricola per matricola</p>
-                          <p className="text-xs text-gray-500">
-                            Stesso cliente e stesso Main Component, ma più prodotti possibili: la configurazione cambia da terminale a terminale,
-                            quindi la scelta vale <strong>solo per quella matricola</strong> e non viene memorizzata.
-                          </p>
-                          <div className="overflow-x-auto">
-                            <table className="w-full text-xs">
-                              <thead className="bg-gray-50 text-gray-500 uppercase text-[10px]">
-                                <tr>
-                                  {['Matricola', 'Cliente', 'Data', 'Main Component', 'Configurazione'].map(h => (
-                                    <th key={h} className="px-3 py-2 text-left font-black whitespace-nowrap">{h}</th>
-                                  ))}
-                                </tr>
-                              </thead>
-                              <tbody>
-                                {an.righe.filter(r => r.errori.some(e => e.tipo === 'scelta')).slice(0, 500).map(r => (
-                                  <tr key={r.i} className="border-t border-gray-100">
-                                    <td className="px-3 py-1.5 font-mono">{r.serial}</td>
-                                    <td className="px-3 py-1.5">{r.customer}</td>
-                                    <td className="px-3 py-1.5 whitespace-nowrap">{r.date}</td>
-                                    <td className="px-3 py-1.5 font-mono">{r.mc}</td>
-                                    <td className="px-3 py-1.5">
-                                      <select value={catSceltaProdotto[r.serial] || ''}
-                                        onChange={e => setCatSceltaProdotto(prev => ({ ...prev, [r.serial]: e.target.value }))}
-                                        className="text-xs border border-gray-300 rounded-lg px-2 py-1 bg-white">
-                                        <option value="">— scegli —</option>
-                                        {r.candidati.map(c => <option key={c} value={c}>{c}</option>)}
-                                      </select>
-                                    </td>
-                                  </tr>
-                                ))}
-                              </tbody>
-                            </table>
-                          </div>
-                        </div>
-                      )}
-
-                      {catSubTab === 'errori' && an.aliasProposti.length > 0 && (
-                        <div className="bg-white border border-gray-200 rounded-xl p-4 space-y-2">
-                          <p className="text-sm font-black text-gray-800">Clienti con i prodotti intestati a un altro Customer ID</p>
-                          <p className="text-xs text-gray-500">
-                            Se è corretto che i prodotti di questo cliente stiano sotto un altro Customer ID, salva la corrispondenza:
-                            da quel momento non verrà più segnalata, qui e nelle analisi successive.
-                          </p>
-                          {an.aliasProposti.map(a => (
-                            <div key={`${a.cliente}|${a.clienteAnag}`} className="flex items-center gap-3 flex-wrap border-t border-gray-100 pt-2">
-                              <span className="text-xs font-bold text-gray-700 min-w-[20rem]">
-                                Cliente <span className="font-mono">{a.cliente}</span> → Anagrafica <span className="font-mono">{a.clienteAnag || '(vuoto)'}</span>
-                                <span className="text-gray-400 font-normal"> ({a.n} matricole · {[...a.prodotti].slice(0, 3).join(', ')}{a.prodotti.size > 3 ? '…' : ''})</span>
-                              </span>
-                              {canEdit('catalogazione') && a.clienteAnag && (
-                                <button onClick={() => salvaCatClienteAlias(a.cliente, a.clienteAnag)}
-                                  className="bg-blue-600 hover:bg-blue-700 text-white text-xs font-bold px-3 py-1.5 rounded-lg cursor-pointer transition">
-                                  Usa sempre {a.clienteAnag} per {a.cliente}
-                                </button>
-                              )}
-                            </div>
-                          ))}
-                        </div>
-                      )}
-
-                      {catSubTab === 'errori' && an.doppioni.length > 0 && (
-                        <div className="bg-white border border-gray-200 rounded-xl p-4 space-y-2">
-                          <p className="text-sm font-black text-gray-800">Matricole ripetute nel catalogato: scegli la riga corretta</p>
-                          {an.doppioni.map(d => (
-                            <div key={d.serial} className="border-t border-gray-100 pt-2">
-                              <p className="text-xs font-mono font-bold text-gray-700">{d.serial}</p>
-                              {d.righe.map((r, k) => (
-                                <label key={d.indici[k]} className="flex items-center gap-2 text-xs text-gray-600 cursor-pointer py-0.5">
-                                  <input type="radio" name={`dup-${d.serial}`} checked={catDupScelte[d.serial] === d.indici[k]}
-                                    onChange={() => setCatDupScelte(prev => ({ ...prev, [d.serial]: d.indici[k] }))} className="accent-blue-600" />
-                                  {r.externalId} · {r.date} · cliente {r.customer} · {r.item} · {r.ref}
-                                </label>
+                      {catSubTab === 'errori' && (
+                        <>
+                          <div className={`${nErrori ? 'bg-amber-50 border-amber-200' : 'bg-green-50 border-green-200'} border rounded-xl px-4 py-3 space-y-1`}>
+                            <p className={`text-sm font-black ${nErrori ? 'text-amber-800' : 'text-green-800'}`}>
+                              {nErrori === 0 ? '✓ Nessuna matricola da sistemare.' : `${nErrori.toLocaleString('it-IT')} matricole da sistemare: restano fuori dai documenti RA`}
+                            </p>
+                            <div className="flex flex-wrap gap-2">
+                              {Object.entries(an.erroriPerTipo).filter(([t]) => !['deposito', 'magazzino', 'scelta'].includes(t)).map(([t, n]) => (
+                                <span key={t} className="text-xs font-bold bg-white border border-amber-200 text-amber-800 rounded-lg px-2 py-1">{CAT_ERRORI[t]}: {n.toLocaleString('it-IT')}</span>
                               ))}
                             </div>
-                          ))}
-                        </div>
+                          </div>
+
+                          {an.clientiMancanti.length > 0 && (
+                            <div className="bg-white border border-gray-200 rounded-xl p-4 space-y-2">
+                              <p className="text-sm font-black text-gray-800">Clienti del backlog da transcodificare</p>
+                              <p className="text-xs text-gray-500">
+                                Il backlog scrive il nome del cliente, mentre serve l'Internal ID del cliente NetSuite. L'Internal ID decide anche
+                                la destinazione: RIPAX se è tra i clienti RIPAX delle impostazioni, altrimenti RIP.
+                                Dove possibile è suggerito quello dei prodotti già presenti in giacenza.
+                              </p>
+                              {an.clientiMancanti.map(c => (
+                                <div key={c.nome} className="flex items-center gap-3 flex-wrap border-t border-gray-100 pt-2">
+                                  <span className="text-xs font-bold text-gray-700 min-w-[18rem]">
+                                    {c.nome} <span className="text-gray-400 font-normal">({c.n.toLocaleString('it-IT')} matricole)</span>
+                                  </span>
+                                  {canEdit('catalogazione') && (
+                                    <>
+                                      {campoCliente(c.nome, ns => salvaCatCliente(c.nome, ns.internal_id))}
+                                      {perNome(c.nome).map(ns => (
+                                        <button key={`ns-${ns.internal_id}`} onClick={() => salvaCatCliente(c.nome, ns.internal_id)}
+                                          className="bg-green-50 hover:bg-green-100 text-green-800 text-xs font-bold px-2.5 py-1.5 rounded-lg cursor-pointer transition"
+                                          title="Trovato per nome nell'anagrafica clienti NetSuite">
+                                          usa {ns.internal_id} · {ns.nome} <span className="opacity-60">(stesso nome{ns.gruppo ? `, gruppo ${ns.gruppo}` : ''})</span>
+                                        </button>
+                                      ))}
+                                      {[...c.suggeriti.entries()].sort((a, b) => b[1] - a[1]).slice(0, 3).map(([id, n]) => (
+                                        <button key={id} onClick={() => salvaCatCliente(c.nome, id)}
+                                          className="bg-blue-50 hover:bg-blue-100 text-blue-700 text-xs font-bold px-2.5 py-1.5 rounded-lg cursor-pointer transition">
+                                          usa {etichettaCliente(id)} <span className="opacity-60">({n} in giacenza)</span>
+                                        </button>
+                                      ))}
+                                    </>
+                                  )}
+                                </div>
+                              ))}
+                            </div>
+                          )}
+
+                          {an.prodottiMancanti.length > 0 && (
+                            <div className="bg-white border border-gray-200 rounded-xl p-4 space-y-2">
+                              <p className="text-sm font-black text-gray-800">Part Number senza prodotto in Anagrafica</p>
+                              <p className="text-xs text-gray-500">
+                                Per questi clienti non esiste nessun prodotto con quel Part Number: <strong>va creato in Anagrafica</strong> e
+                                l'Anagrafica va reimportata. In alternativa si escludono quelle matricole dagli export.
+                              </p>
+                              <div className="overflow-x-auto">
+                                <table className="w-full text-xs">
+                                  <thead className="bg-gray-50 text-gray-500 uppercase text-[10px]">
+                                    <tr>{['Cliente', 'Part Number', 'Descrizione', 'Matricole', ''].map(h => <th key={h} className="px-3 py-2 text-left font-black whitespace-nowrap">{h}</th>)}</tr>
+                                  </thead>
+                                  <tbody>
+                                    {an.prodottiMancanti.map(p => (
+                                      <tr key={`${p.customer}|${p.pn}`} className="border-t border-gray-100">
+                                        <td className="px-3 py-1.5 whitespace-nowrap"><span className="font-mono">{p.customer}</span>{nomeCliente(p.customer) && <span className="text-gray-500"> · {nomeCliente(p.customer)}</span>}</td>
+                                        <td className="px-3 py-1.5 font-mono">{p.pn}</td>
+                                        <td className="px-3 py-1.5 text-gray-500">{p.descrizione}</td>
+                                        <td className="px-3 py-1.5 text-right">{p.n.toLocaleString('it-IT')}</td>
+                                        <td className="px-3 py-1.5 text-right">
+                                          {canEdit('catalogazione') && (
+                                            <button onClick={() => salvaCatTranscodifica(p.customer, p.pn, null)}
+                                              className="text-gray-500 hover:text-gray-700 font-bold cursor-pointer">Escludi</button>
+                                          )}
+                                        </td>
+                                      </tr>
+                                    ))}
+                                  </tbody>
+                                </table>
+                              </div>
+                            </div>
+                          )}
+
+                        </>
                       )}
 
                       <div className="flex items-center gap-2 flex-wrap">
-                        <input value={catSearch} onChange={e => setCatSearch(e.target.value)} placeholder="Cerca matricola, cliente, articolo, IDext…"
+                        <input value={catSearch} onChange={e => setCatSearch(e.target.value)} placeholder="Cerca matricola, RMA, cliente, Part Number…"
                           className="text-sm border border-gray-300 rounded-xl px-3 py-2 w-80 max-w-full" />
+                        <button onClick={scaricaCatDettaglio} title="Scarica l'analisi completa in Excel"
+                          className="bg-green-50 hover:bg-green-100 text-green-800 border border-green-200 text-sm font-bold px-3 py-2 rounded-xl cursor-pointer transition whitespace-nowrap">
+                          🟩 Excel
+                        </button>
                         <span className="text-xs text-gray-400">
-                          {righeVis.length.toLocaleString('it-IT')} righe{righeVis.length > 500 ? ' (visualizzate le prime 500, tutte nel dettaglio Excel)' : ''}
+                          {catSubTab === 'carico'
+                            ? `${docsVis.length} ${docsVis.length === 1 ? 'documento' : 'documenti'} · ${docsVis.reduce((s, d) => s + d.righe.length, 0).toLocaleString('it-IT')} matricole`
+                            : (() => {
+                              const n = catSubTab === 'disallineate' ? righeDisall.length : righeVis.length;
+                              return `${n.toLocaleString('it-IT')} matricole${n > 500 ? ' (visualizzate le prime 500, tutte nel dettaglio Excel)' : ''}`;
+                            })()}
                         </span>
                       </div>
-                      {catSubTab === 'carico'
-                        ? tabellaRighe(righeVis)
-                        // I tipi con un pannello dedicato sopra (doppioni, scelta configurazione, pot_ senza prodotto) non si ripetono qui
-                        : Object.keys(an.erroriPerTipo).filter(t => !['doppione', 'scelta', 'transcodifica'].includes(t)).map(tipo => {
-                          const righeTipo = righeVis.filter(r => r.errori.some(e => e.tipo === tipo));
-                          if (righeTipo.length === 0) return null;
-                          return (
-                            <div key={tipo} className="space-y-1">
-                              <p className="text-sm font-black text-gray-800">
-                                {CAT_ERRORI[tipo]} <span className="text-gray-400 font-bold">· {righeTipo.length.toLocaleString('it-IT')} matricole</span>
+
+                      {/* Carico: una riga per documento e una per articolo, con il conteggio delle matricole.
+                          Il dettaglio per matricola si apre solo su richiesta: qui serve leggere cosa va in NetSuite. */}
+                      {/* Carico a tre livelli: cliente → carichi (una riga per articolo) → matricole */}
+                      {catSubTab === 'carico' && (clientiCarico.length === 0 ? (
+                        <div className="text-center py-12 text-gray-400 text-sm">Nessun documento da caricare.</div>
+                      ) : (
+                        <div className="bg-white border border-gray-200 rounded-xl overflow-hidden">
+                          {clientiCarico.map(c => {
+                            const aperto = !!catClientiAperti[c.cliente];
+                            return (
+                              <div key={c.cliente} className="border-b border-gray-200 last:border-b-0">
+                                <button onClick={() => setCatClientiAperti(p => ({ ...p, [c.cliente]: !p[c.cliente] }))}
+                                  className="w-full flex items-center justify-between gap-3 px-4 py-3 hover:bg-gray-50 cursor-pointer text-left transition">
+                                  <span className="flex items-center gap-2 min-w-0">
+                                    <span className={`text-gray-400 text-xs transition-transform ${aperto ? 'rotate-90' : ''}`}>▶</span>
+                                    <span className="min-w-0">
+                                      <span className="text-sm font-black text-gray-800">
+                                        {c.cliente}{nomeCliente(c.cliente) && <span className="font-bold text-gray-500"> · {nomeCliente(c.cliente)}</span>}
+                                      </span>
+                                      {catImpostazioni.clienti_ripax.includes(c.cliente) && <span className="ml-2 text-[9px] font-black text-amber-600">RIPAX</span>}
+                                      <span className="block text-[11px] text-gray-400">
+                                        {c.docs.length === 1 ? c.docs[0].idext : `${c.docs.length} documenti`} · {c.destinazioni.join(', ')}
+                                      </span>
+                                    </span>
+                                  </span>
+                                  <span className="flex items-center gap-4 shrink-0">
+                                    <span className="text-xs text-gray-500">{c.nArticoli} {c.nArticoli === 1 ? 'articolo' : 'articoli'}</span>
+                                    <span className="text-right">
+                                      <span className="text-lg font-black text-purple-700">{c.nMatricole.toLocaleString('it-IT')}</span>
+                                      <span className="text-[10px] font-bold uppercase text-gray-400"> matricole</span>
+                                    </span>
+                                  </span>
+                                </button>
+
+                                {aperto && c.docs.map(d => (
+                                  <div key={d.idext} className="bg-gray-50/60 border-t border-gray-200">
+                                    {c.docs.length > 1 && (
+                                      <p className="px-10 pt-2 text-[11px] font-mono text-gray-500">{d.idext} · {d.data} · {d.destinazione}</p>
+                                    )}
+                                    <table className="w-full text-xs">
+                                      <thead className="text-gray-400 uppercase text-[10px]">
+                                        <tr>
+                                          <th className="pl-10 pr-3 py-1.5 text-left font-black w-16">Riga</th>
+                                          <th className="px-3 py-1.5 text-left font-black">Articolo</th>
+                                          <th className="px-3 py-1.5 text-left font-black">Part Number</th>
+                                          <th className="px-3 py-1.5 text-right font-black w-28">Matricole</th>
+                                          <th className="px-4 py-1.5 text-right font-black w-24"></th>
+                                        </tr>
+                                      </thead>
+                                      <tbody>
+                                        {d.linee.map(l => {
+                                          const kl = `${d.idext}|${l.item}`;
+                                          return (
+                                            <Fragment key={kl}>
+                                              <tr className="border-t border-gray-200/70">
+                                                <td className="pl-10 pr-3 py-1.5 text-gray-400">{l.surrogate}</td>
+                                                <td className="px-3 py-1.5 font-mono font-bold text-gray-800">{l.item}</td>
+                                                <td className="px-3 py-1.5 font-mono text-gray-500">{[...new Set(l.righe.map(r => r.pn))].join(', ')}</td>
+                                                <td className="px-3 py-1.5 text-right font-bold">{l.righe.length.toLocaleString('it-IT')}</td>
+                                                <td className="px-4 py-1.5 text-right">
+                                                  <button onClick={() => setCatLineeAperte(p => ({ ...p, [kl]: !p[kl] }))}
+                                                    className="text-[11px] font-bold text-blue-600 hover:underline cursor-pointer">
+                                                    {catLineeAperte[kl] ? 'nascondi' : 'matricole'}
+                                                  </button>
+                                                </td>
+                                              </tr>
+                                              {catLineeAperte[kl] && (
+                                                <tr className="border-t border-gray-200/70 bg-white">
+                                                  <td />
+                                                  <td colSpan={4} className="px-3 py-2 font-mono text-[11px] text-gray-600 break-all">
+                                                    {l.righe.slice(0, 300).map(r => r.serialNs || r.serial).join(' · ')}
+                                                    {l.righe.length > 300 && ` … e altre ${l.righe.length - 300}`}
+                                                  </td>
+                                                </tr>
+                                              )}
+                                            </Fragment>
+                                          );
+                                        })}
+                                      </tbody>
+                                    </table>
+                                  </div>
+                                ))}
+                              </div>
+                            );
+                          })}
+                        </div>
+                      ))}
+
+                          {catSubTab === 'carico' && an.sceltaGruppi.length > 0 && (
+                            <div className="bg-white border border-gray-200 rounded-xl p-4 space-y-2">
+                              <p className="text-sm font-black text-gray-800">Configurazione da scegliere ({an.sceltaGruppi.length} {an.sceltaGruppi.length === 1 ? 'gruppo' : 'gruppi'})</p>
+                              <p className="text-xs text-gray-500">
+                                Questi carichi aspettano solo la configurazione: stesso cliente e stesso Part Number con più prodotti possibili. La scelta vale per il gruppo
+                                <strong> cliente + Part Number + DDT</strong>, perché i terminali arrivati con lo stesso DDT hanno la stessa configurazione,
+                                e non viene memorizzata. Appena scegli, il gruppo sparisce da qui ed entra nel carico sopra.
                               </p>
-                              {tabellaRighe(righeTipo)}
+                              <div className="overflow-x-auto">
+                                <table className="w-full text-xs">
+                                  <thead className="bg-gray-50 text-gray-500 uppercase text-[10px]">
+                                    <tr>{['Cliente', 'Part Number', 'Descrizione', 'DDT', 'RMA', 'Matricole', 'Configurazione'].map(h => <th key={h} className="px-3 py-2 text-left font-black whitespace-nowrap">{h}</th>)}</tr>
+                                  </thead>
+                                  <tbody>
+                                    {an.sceltaGruppi.map(s => (
+                                      <tr key={s.key} className="border-t border-gray-100">
+                                        <td className="px-3 py-1.5 whitespace-nowrap">{s.cliente} <span className="text-gray-400 font-mono">· {s.customer}</span></td>
+                                        <td className="px-3 py-1.5 font-mono">{s.pn}</td>
+                                        <td className="px-3 py-1.5 text-gray-500">{s.descrizione}</td>
+                                        <td className="px-3 py-1.5 whitespace-nowrap">{s.ddt || <span className="text-gray-300">(vuoto)</span>}</td>
+                                        <td className="px-3 py-1.5 text-gray-500 whitespace-nowrap">{[...s.rma].slice(0, 2).join(', ')}{s.rma.size > 2 ? ` +${s.rma.size - 2}` : ''}</td>
+                                        <td className="px-3 py-1.5 text-right font-bold">{s.n.toLocaleString('it-IT')}</td>
+                                        <td className="px-3 py-1.5">
+                                          <select value={catSceltaProdotto[s.key] || ''}
+                                            onChange={e => setCatSceltaProdotto(prev => ({ ...prev, [s.key]: e.target.value }))}
+                                            className="text-xs border border-gray-300 rounded-lg px-2 py-1 bg-white">
+                                            <option value="">— scegli —</option>
+                                            {s.candidati.map(c => <option key={c} value={c}>{c}</option>)}
+                                          </select>
+                                        </td>
+                                      </tr>
+                                    ))}
+                                  </tbody>
+                                </table>
+                              </div>
                             </div>
-                          );
-                        })}
+                          )}
+
+                      {/* Dettaglio delle matricole da sistemare: i pannelli sopra dicono cosa fare, qui si vede su quali */}
+                      {catSubTab === 'errori' && righeVis.length > 0 && (
+                        <div className="space-y-1">
+                          <p className="text-sm font-black text-gray-800">
+                            Matricole da sistemare <span className="text-gray-400 font-bold">· {righeVis.length.toLocaleString('it-IT')}</span>
+                          </p>
+                          {tabellaRighe(righeVis)}
+                        </div>
+                      )}
+
+                      {catSubTab === 'disallineate' && (
+                        <div className="space-y-3">
+                          <div className={`${an.n.disallineata ? 'bg-amber-50 border-amber-200 text-amber-800' : 'bg-green-50 border-green-200 text-green-800'} border rounded-xl px-4 py-3 text-sm font-bold`}>
+                            {an.n.disallineata === 0
+                              ? '✓ Nessun disallineamento: ogni matricola del backlog è nel magazzino che le spetta.'
+                              : `${an.n.disallineata.toLocaleString('it-IT')} matricole da verificare: in NetSuite sono su un magazzino che non corrisponde al backlog.`}
+                          </div>
+                          {an.n.disallineata > 0 && (
+                            <>
+                              <p className="text-xs text-gray-500">
+                                Due casi: la matricola è su un magazzino diverso dalla destinazione attesa per quel cliente,
+                                oppure è su un conto deposito o tra gli irreparabili, quindi con la riparazione chiusa, e non dovrebbe stare nel backlog.
+                                Restano fuori dai documenti RA: va corretto il magazzino in NetSuite o lo stato nel backlog.
+                              </p>
+                              {/* Raggruppate per segnalazione, con il dettaglio matricole a richiesta, come carico ed errori */}
+                              <div className="bg-white border border-gray-200 rounded-xl overflow-x-auto">
+                                <table className="w-full text-xs">
+                                  <thead className="bg-gray-50 text-gray-500 uppercase text-[10px]">
+                                    <tr>
+                                      <th className="px-3 py-2 text-left font-black">Segnalazione</th>
+                                      <th className="px-3 py-2 text-left font-black w-28">Clienti</th>
+                                      <th className="px-3 py-2 text-right font-black w-28">Matricole</th>
+                                      <th className="px-4 py-2 text-right font-black w-24"></th>
+                                    </tr>
+                                  </thead>
+                                  <tbody>
+                                    {gruppiDisall.map(g => (
+                                      <Fragment key={g.key}>
+                                        <tr className="border-t border-gray-100">
+                                          <td className="px-3 py-1.5 text-amber-800">{g.msg}</td>
+                                          <td className="px-3 py-1.5 font-mono text-gray-500">{[...g.clienti].slice(0, 3).join(', ')}{g.clienti.size > 3 ? ` +${g.clienti.size - 3}` : ''}</td>
+                                          <td className="px-3 py-1.5 text-right font-bold">{g.righe.length.toLocaleString('it-IT')}</td>
+                                          <td className="px-4 py-1.5 text-right">
+                                            <button onClick={() => setCatLineeAperte(p => ({ ...p, [`dis|${g.key}`]: !p[`dis|${g.key}`] }))}
+                                              className="text-[11px] font-bold text-blue-600 hover:underline cursor-pointer">
+                                              {catLineeAperte[`dis|${g.key}`] ? 'nascondi' : 'matricole'}
+                                            </button>
+                                          </td>
+                                        </tr>
+                                        {catLineeAperte[`dis|${g.key}`] && (
+                                          <tr className="border-t border-gray-100 bg-gray-50/60">
+                                            <td colSpan={4} className="px-3 py-2 font-mono text-[11px] text-gray-600 break-all">
+                                              {g.righe.slice(0, 300).map(r => r.serialNs || r.serial).join(' · ')}
+                                              {g.righe.length > 300 && ` … e altre ${g.righe.length - 300}`}
+                                            </td>
+                                          </tr>
+                                        )}
+                                      </Fragment>
+                                    ))}
+                                  </tbody>
+                                </table>
+                              </div>
+                            </>
+                          )}
+                        </div>
+                      )}
                     </>
                   )}
                 </div>
               )}
 
-              {catTab === 'sospese' && (
-                <div className="space-y-3">
-                  <div className="flex items-center gap-2 flex-wrap">
-                    <button onClick={() => analizzaCatalogato()} disabled={catLoading || catSospese.length === 0}
-                      className="bg-blue-600 hover:bg-blue-700 text-white text-sm font-bold px-4 py-2.5 rounded-xl cursor-pointer transition disabled:opacity-40">
-                      {catLoading ? 'Analisi in corso…' : '↻ Rianalizza le righe da sistemare'}
-                    </button>
-                    <p className="text-xs text-gray-500">
-                      Rientrano da sole in ogni analisi, anche senza ricaricare il catalogato. Quando l'errore è risolto, escono da qui ed entrano nei file.
-                    </p>
-                  </div>
-                  <div className="bg-white border border-gray-200 rounded-xl overflow-x-auto">
-                    {catSospese.length === 0 ? (
-                      <div className="text-center py-16 text-gray-400 text-sm">Nessuna riga da sistemare.</div>
-                    ) : (
-                      <table className="w-full text-xs">
-                        <thead className="bg-gray-50 text-gray-500 uppercase text-[10px]">
-                          <tr>
-                            {['Messa da parte', 'Da', 'RMA', 'Matricola', 'Cliente', 'Data cat.', 'Item', 'Esito', 'Motivo', 'File'].map(h => (
-                              <th key={h} className="px-3 py-2 text-left font-black whitespace-nowrap">{h}</th>
-                            ))}
-                          </tr>
-                        </thead>
-                        <tbody>
-                          {catSospese.map(s => (
-                            <tr key={`${s.rma}|${s.serial}`} className="border-t border-gray-100">
-                              <td className="px-3 py-1.5 whitespace-nowrap">{fmt(s.messa_at)}</td>
-                              <td className="px-3 py-1.5">{s.messa_da || ''}</td>
-                              <td className="px-3 py-1.5 font-mono whitespace-nowrap">{s.rma}</td>
-                              <td className="px-3 py-1.5 font-mono">{s.serial}</td>
-                              <td className="px-3 py-1.5">{s.customer}</td>
-                              <td className="px-3 py-1.5 whitespace-nowrap">{s.data_catalogazione}</td>
-                              <td className="px-3 py-1.5 font-mono">{s.item}</td>
-                              <td className="px-3 py-1.5">{s.esito}</td>
-                              <td className="px-3 py-1.5 text-amber-800">{s.errori}</td>
-                              <td className="px-3 py-1.5">{s.file_catalogato || ''}</td>
+              {catTab === 'anomalie' && (() => {
+                // Raggruppate per magazzino e articolo, con la quantità: il dettaglio matricole si apre su richiesta
+                const filtrate = catNonNelBacklog.filter(g => !q || [g.numero, g.item, g.location].some(v => (v || '').toLowerCase().includes(q)));
+                const gruppi = [...filtrate.reduce((m, g) => {
+                  const k = `${g.location}|${g.item}`;
+                  const x = m.get(k) || { key: k, location: g.location, item: g.item, matricole: [] };
+                  x.matricole.push(g.numero);
+                  return m.set(k, x);
+                }, new Map()).values()].sort((a, b) => b.matricole.length - a.matricole.length || a.item.localeCompare(b.item));
+                return (
+                  <div className="space-y-3">
+                    <div className="flex items-center justify-between flex-wrap gap-3">
+                      <p className="text-xs text-gray-500 max-w-3xl">
+                        Matricole che in NetSuite risultano su RIP o RIPAX ma non compaiono nel backlog: sono situazioni disallineate.
+                        {catNonNelBacklog.length > 0 && ` Sono ${catNonNelBacklog.length.toLocaleString('it-IT')}, raggruppate per magazzino e articolo.`}
+                      </p>
+                    </div>
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <input value={catSearch} onChange={e => setCatSearch(e.target.value)} placeholder="Cerca matricola, articolo, magazzino…"
+                        className="text-sm border border-gray-300 rounded-xl px-3 py-2 w-80 max-w-full" />
+                      {catNonNelBacklog.length > 0 && (
+                        <button onClick={scaricaCatNonNelBacklog} title="Scarica l'elenco completo in Excel"
+                          className="bg-green-50 hover:bg-green-100 text-green-800 border border-green-200 text-sm font-bold px-3 py-2 rounded-xl cursor-pointer transition whitespace-nowrap">
+                          🟩 Excel
+                        </button>
+                      )}
+                      <span className="text-xs text-gray-400">
+                        {gruppi.length.toLocaleString('it-IT')} {gruppi.length === 1 ? 'articolo' : 'articoli'} · {filtrate.length.toLocaleString('it-IT')} matricole
+                      </span>
+                    </div>
+                    <div className="bg-white border border-gray-200 rounded-xl overflow-x-auto">
+                      {gruppi.length === 0 ? (
+                        <div className="text-center py-16 text-gray-400 text-sm">
+                          {!an ? 'Carica il backlog per calcolare il confronto.'
+                            : catNonNelBacklog.length === 0 ? 'Nessuna: la giacenza di RIP e RIPAX coincide con il backlog.'
+                              : 'Nessun risultato per questa ricerca.'}
+                        </div>
+                      ) : (
+                        <table className="w-full text-xs">
+                          <thead className="bg-gray-50 text-gray-500 uppercase text-[10px]">
+                            <tr>
+                              <th className="px-3 py-2 text-left font-black">Magazzino</th>
+                              <th className="px-3 py-2 text-left font-black">Articolo</th>
+                              <th className="px-3 py-2 text-right font-black w-28">Matricole</th>
+                              <th className="px-4 py-2 text-right font-black w-24"></th>
                             </tr>
-                          ))}
-                        </tbody>
-                      </table>
-                    )}
+                          </thead>
+                          <tbody>
+                            {gruppi.map(g => (
+                              <Fragment key={g.key}>
+                                <tr className="border-t border-gray-100">
+                                  <td className="px-3 py-1.5 whitespace-nowrap">{g.location.split(' - ')[0]}</td>
+                                  <td className="px-3 py-1.5 font-mono font-bold text-gray-800">{g.item}</td>
+                                  <td className="px-3 py-1.5 text-right font-bold">{g.matricole.length.toLocaleString('it-IT')}</td>
+                                  <td className="px-4 py-1.5 text-right">
+                                    <button onClick={() => setCatLineeAperte(p => ({ ...p, [`nb|${g.key}`]: !p[`nb|${g.key}`] }))}
+                                      className="text-[11px] font-bold text-blue-600 hover:underline cursor-pointer">
+                                      {catLineeAperte[`nb|${g.key}`] ? 'nascondi' : 'matricole'}
+                                    </button>
+                                  </td>
+                                </tr>
+                                {catLineeAperte[`nb|${g.key}`] && (
+                                  <tr className="border-t border-gray-100 bg-gray-50/60">
+                                    <td />
+                                    <td colSpan={3} className="px-3 py-2 font-mono text-[11px] text-gray-600 break-all">
+                                      {g.matricole.slice(0, 300).join(' · ')}
+                                      {g.matricole.length > 300 && ` … e altre ${g.matricole.length - 300}`}
+                                    </td>
+                                  </tr>
+                                )}
+                              </Fragment>
+                            ))}
+                          </tbody>
+                        </table>
+                      )}
+                    </div>
                   </div>
-                </div>
-              )}
+                );
+              })()}
 
               {catTab === 'storico' && (
                 <div className="bg-white border border-gray-200 rounded-xl overflow-x-auto">
                   {catStorico.length === 0 ? (
-                    <div className="text-center py-16 text-gray-400 text-sm">Nessun export registrato.</div>
+                    <div className="text-center py-16 text-gray-400 text-sm">Nessuna Return Authorization esportata.</div>
                   ) : (
                     <table className="w-full text-xs">
                       <thead className="bg-gray-50 text-gray-500 uppercase text-[10px]">
                         <tr>
-                          {['Esportato il', 'Da', 'IDext', 'Tipo', 'Cliente', 'Data cat.', 'Origine', 'Destinazione', 'Righe', 'Matricole', 'Giacenza NS del', 'File'].map(h => (
+                          {['Esportata il', 'Da', 'IDext', 'Cliente', 'Data', 'Destinazione', 'Righe', 'Matricole', 'Giacenza NS del', 'File'].map(h => (
                             <th key={h} className="px-3 py-2 text-left font-black whitespace-nowrap">{h}</th>
                           ))}
                         </tr>
@@ -10030,10 +10251,8 @@ export default function App() {
                             <td className="px-3 py-1.5 whitespace-nowrap">{fmt(s.esportato_at)}</td>
                             <td className="px-3 py-1.5">{s.esportato_da || ''}</td>
                             <td className="px-3 py-1.5 font-mono whitespace-nowrap">{s.idext}</td>
-                            <td className="px-3 py-1.5"><span className={`text-[10px] font-bold border rounded px-1.5 py-0.5 ${CAT_ESITI[s.tipo]?.cls || ''}`}>{s.tipo}</span></td>
                             <td className="px-3 py-1.5">{s.cliente}</td>
-                            <td className="px-3 py-1.5 whitespace-nowrap">{new Date(s.data_catalogazione).toLocaleDateString('it-IT')}</td>
-                            <td className="px-3 py-1.5 whitespace-nowrap">{s.magazzino_origine || ''}</td>
+                            <td className="px-3 py-1.5 whitespace-nowrap">{s.data_catalogazione ? new Date(s.data_catalogazione).toLocaleDateString('it-IT') : ''}</td>
                             <td className="px-3 py-1.5 whitespace-nowrap">{s.magazzino_destinazione}</td>
                             <td className="px-3 py-1.5 text-right">{s.n_righe}</td>
                             <td className="px-3 py-1.5 text-right">{s.n_matricole}</td>
@@ -10052,7 +10271,7 @@ export default function App() {
                   <div className="bg-white border border-gray-200 rounded-xl p-4 space-y-3">
                     <p className="text-sm font-black text-gray-800">Destinazioni</p>
                     <label className="block text-xs font-bold text-gray-600">
-                      Clienti RIPAX (Customer ID separati da virgola)
+                      Clienti RIPAX (Internal ID separati da virgola)
                       <input value={catImpDraft.clienti} disabled={!canEdit('catalogazione')} onChange={e => setCatImpDraft(p => ({ ...p, clienti: e.target.value }))}
                         className="mt-1 block w-full text-sm font-normal border border-gray-300 rounded-lg px-3 py-2" />
                     </label>
@@ -10067,7 +10286,7 @@ export default function App() {
                         <input value={catImpDraft.magazzino_rip} disabled={!canEdit('catalogazione')} onChange={e => setCatImpDraft(p => ({ ...p, magazzino_rip: e.target.value }))}
                           list="cat-magazzini" className="mt-1 block w-full text-sm font-normal border border-gray-300 rounded-lg px-3 py-2" />
                       </label>
-                      <datalist id="cat-magazzini">{magazzini.map(m => <option key={m} value={m} />)}</datalist>
+                      <datalist id="cat-magazzini">{magazziniRepair.map(m => <option key={m} value={m} />)}</datalist>
                     </div>
                     {canEdit('catalogazione') && (
                       <button onClick={salvaCatImpostazioni} className="bg-blue-600 hover:bg-blue-700 text-white text-sm font-bold px-4 py-2 rounded-xl cursor-pointer transition">Salva</button>
@@ -10075,126 +10294,78 @@ export default function App() {
                   </div>
 
                   <div className="bg-white border border-gray-200 rounded-xl p-4 space-y-3">
-                    <div>
-                      <p className="text-sm font-black text-gray-800">Corrispondenze cliente catalogato → cliente Anagrafica ({catClientiAlias.length})</p>
-                      <p className="text-xs text-gray-500">
-                        Per questi clienti i prodotti sono intestati a un altro Customer ID (es. 1355 → 44): il controllo non li segnala
-                        e i prodotti pot_ vengono cercati sul cliente indicato. Si aggiungono da qui o dalla scheda Errori.
-                      </p>
-                    </div>
-                    {canEdit('catalogazione') && (
-                      <div className="flex items-center gap-2 flex-wrap">
-                        <input value={catNuovoAlias.cliente} onChange={e => setCatNuovoAlias(p => ({ ...p, cliente: e.target.value }))}
-                          placeholder="Cliente catalogato (es. 999995)" className="text-xs border border-gray-300 rounded-lg px-2 py-2 w-56" />
-                        <span className="text-gray-400">→</span>
-                        <input value={catNuovoAlias.cliente_anagrafica} onChange={e => setCatNuovoAlias(p => ({ ...p, cliente_anagrafica: e.target.value }))}
-                          placeholder="Customer ID Anagrafica" list="cat-customer-ids" className="text-xs border border-gray-300 rounded-lg px-2 py-2 w-56" />
-                        <datalist id="cat-customer-ids">
-                          {[...new Set(anagrafica.map(a => a.customer_id).filter(Boolean))].sort().map(c => <option key={c} value={c} />)}
-                        </datalist>
-                        <button
-                          onClick={async () => {
-                            const cliente = catNuovoAlias.cliente.trim();
-                            const dest = catNuovoAlias.cliente_anagrafica.trim();
-                            if (!cliente || !dest) return;
-                            if (!anagrafica.some(a => a.customer_id === dest)) {
-                              if (!window.confirm(`In Anagrafica non c'è nessun prodotto con Customer ID ${dest}. Salvare lo stesso?`)) return;
-                            }
-                            await salvaCatClienteAlias(cliente, dest);
-                            setCatNuovoAlias({ cliente: '', cliente_anagrafica: '' });
-                          }}
-                          disabled={!catNuovoAlias.cliente.trim() || !catNuovoAlias.cliente_anagrafica.trim()}
-                          className="bg-blue-600 hover:bg-blue-700 text-white text-xs font-bold px-3 py-2 rounded-lg cursor-pointer transition disabled:opacity-40">
-                          + Aggiungi
-                        </button>
+                    <div className="flex items-start justify-between flex-wrap gap-3">
+                      <div>
+                        <p className="text-sm font-black text-gray-800">Anagrafica clienti NetSuite ({catClientiNs.length})</p>
+                        <p className="text-xs text-gray-500">
+                          Export NetSuite dei Customers (Internal ID, ID, Name, [PAX] GROUP). Serve a leggere i nomi accanto agli Internal ID
+                          e a proporre gli abbinamenti con i nomi del backlog. L'<strong>Internal ID</strong> è il valore che finisce nel campo
+                          Customer della RA; la colonna <em>ID</em> dell'export è un codice secondario e non si usa.
+                        </p>
                       </div>
-                    )}
-                    {catClientiAlias.length === 0 ? (
-                      <p className="text-xs text-gray-400">Nessuna corrispondenza.</p>
-                    ) : (
-                      <table className="w-full text-xs">
-                        <tbody>
-                          {catClientiAlias.map(a => (
-                            <tr key={a.cliente} className="border-t border-gray-100">
-                              <td className="py-1.5 font-mono">{a.cliente}</td>
-                              <td className="py-1.5 text-gray-400">→</td>
-                              <td className="py-1.5 font-mono">{a.cliente_anagrafica}</td>
-                              <td className="py-1.5 text-gray-400">{a.updated_by || ''}</td>
-                              <td className="py-1.5 text-right">
-                                {canEdit('catalogazione') && <button onClick={() => eliminaCatClienteAlias(a)} className="text-red-500 hover:text-red-700 font-bold cursor-pointer">Elimina</button>}
-                              </td>
-                            </tr>
-                          ))}
-                        </tbody>
-                      </table>
-                    )}
-                  </div>
-
-                  <div className="bg-white border border-gray-200 rounded-xl p-4 space-y-3">
-                    <div>
-                      <p className="text-sm font-black text-gray-800">Storico RMA + matricole già caricate su NetSuite</p>
-                      <p className="text-xs text-gray-500">
-                        Una matricola già caricata su un RMA non può rientrare con lo stesso RMA: viene saltata nelle analisi.
-                        Lo storico si alimenta da solo a ogni export; qui si carica quello iniziale (CSV con colonne RMA e Serial).
-                      </p>
-                    </div>
-                    <div className="flex items-center gap-3 flex-wrap">
-                      <p className="text-sm font-bold text-gray-800">
-                        {catRmaTotale ? `${catRmaTotale.rma.toLocaleString('it-IT')} RMA registrati` : '—'}
-                        {catRmaTotale?.aggiornato_at && (
-                          <span className="font-normal text-gray-500"> · ultimo aggiornamento {fmt(catRmaTotale.aggiornato_at)}{catRmaTotale.aggiornato_by ? ` da ${catRmaTotale.aggiornato_by}` : ''}</span>
-                        )}
-                      </p>
                       {canUpload('catalogazione') && (
-                        <label className={`bg-blue-600 hover:bg-blue-700 text-white text-xs font-bold px-3 py-2 rounded-lg cursor-pointer transition ${catLoading ? 'opacity-50 pointer-events-none' : ''}`}>
-                          {catRmaProgress ? `Caricamento ${catRmaProgress}…` : '📂 Carica storico (CSV)'}
-                          <input type="file" accept=".csv,text/csv" className="hidden" onChange={handleCatStoricoRmaUpload} />
+                        <label className={`bg-blue-600 hover:bg-blue-700 text-white text-xs font-bold px-3 py-2 rounded-lg cursor-pointer transition whitespace-nowrap ${catLoading ? 'opacity-50 pointer-events-none' : ''}`}>
+                          📂 Carica clienti (xlsx/csv)
+                          <input type="file" accept=".xlsx,.xls,.csv" className="hidden" onChange={handleCatClientiNsUpload} />
                         </label>
                       )}
                     </div>
+                    {catClientiNs.length === 0 && (
+                      <p className="text-xs font-bold text-amber-700">
+                        Nessun cliente caricato: nei selettori vedi solo i numeri. Carica l'export dei Customers per avere anche i nomi.
+                      </p>
+                    )}
                   </div>
 
                   <div className="bg-white border border-gray-200 rounded-xl p-4 space-y-3">
                     <div>
-                      <p className="text-sm font-black text-gray-800">Regole magazzino origine → destinazione</p>
-                      <p className="text-xs text-gray-500">Senza regola, una matricola presente in un altro magazzino genera un Inventory Transfer.</p>
+                      <p className="text-sm font-black text-gray-800">Clienti: nome backlog → Internal ID ({catClienti.length})</p>
+                      <p className="text-xs text-gray-500">
+                        Il backlog non esporta l'Internal ID: questa tabella fa da ponte verso NetSuite e decide la destinazione.
+                        Si compila anche dalla scheda Errori, dove i nomi mancanti sono elencati con un suggerimento.
+                        Con <strong>Main Component</strong> spuntato la RA porta il Part Number del backlog come Item, senza cercare il prodotto
+                        intestato al cliente: serve per i clienti interni, che non hanno prodotti propri.
+                      </p>
                     </div>
                     {canEdit('catalogazione') && (
                       <div className="flex items-center gap-2 flex-wrap">
-                        <select value={catNuovaRegola.magazzino_origine} onChange={e => setCatNuovaRegola(p => ({ ...p, magazzino_origine: e.target.value }))}
-                          className="text-xs border border-gray-300 rounded-lg px-2 py-2 bg-white">
-                          <option value="">— magazzino origine —</option>
-                          {magazzini.map(m => <option key={m} value={m}>{m}</option>)}
-                        </select>
+                        <input value={catNuovoCliente.nome_backlog} onChange={e => setCatNuovoCliente(p => ({ ...p, nome_backlog: e.target.value }))}
+                          placeholder="Nome come nel backlog" className="text-xs border border-gray-300 rounded-lg px-2 py-2 w-72" />
                         <span className="text-gray-400">→</span>
-                        <select value={catNuovaRegola.magazzino_destinazione} onChange={e => setCatNuovaRegola(p => ({ ...p, magazzino_destinazione: e.target.value }))}
-                          className="text-xs border border-gray-300 rounded-lg px-2 py-2 bg-white">
-                          <option value="">— destinazione —</option>
-                          {destinazioni.map(m => <option key={m} value={m}>{m}</option>)}
-                        </select>
-                        <select value={catNuovaRegola.azione} onChange={e => setCatNuovaRegola(p => ({ ...p, azione: e.target.value }))}
-                          className="text-xs border border-gray-300 rounded-lg px-2 py-2 bg-white">
-                          <option value="da_verificare">Da verificare (blocca l'export)</option>
-                          <option value="ignora">Ignora (nessun trasferimento)</option>
-                        </select>
-                        <button onClick={aggiungiCatRegola} disabled={!catNuovaRegola.magazzino_origine || !catNuovaRegola.magazzino_destinazione}
-                          className="bg-blue-600 hover:bg-blue-700 text-white text-xs font-bold px-3 py-2 rounded-lg cursor-pointer transition disabled:opacity-40">+ Aggiungi</button>
+                        {campoCliente('__nuovo__', async ns => {
+                          const nome = catNuovoCliente.nome_backlog.trim();
+                          if (!nome) { alert('Indicare il nome come appare nel backlog.'); return; }
+                          await salvaCatCliente(nome, ns.internal_id);
+                          setCatNuovoCliente({ nome_backlog: '', customer_id: '' });
+                        })}
                       </div>
                     )}
-                    {catRegole.length === 0 ? (
-                      <p className="text-xs text-gray-400">Nessuna regola.</p>
+                    {catClienti.length === 0 ? (
+                      <p className="text-xs text-gray-400">Nessuna transcodifica.</p>
                     ) : (
                       <table className="w-full text-xs">
                         <tbody>
-                          {catRegole.map(r => (
-                            <tr key={r.id} className="border-t border-gray-100">
-                              <td className="py-1.5">{r.magazzino_origine}</td>
+                          {catClienti.map(c => (
+                            <tr key={c.nome_backlog} className="border-t border-gray-100">
+                              <td className="py-1.5">{c.nome_backlog}</td>
                               <td className="py-1.5 text-gray-400">→</td>
-                              <td className="py-1.5">{r.magazzino_destinazione}</td>
-                              <td className="py-1.5 font-bold">{r.azione === 'ignora' ? 'Ignora' : 'Da verificare'}</td>
-                              <td className="py-1.5 text-gray-400">{r.updated_by || ''}</td>
+                              <td className="py-1.5 whitespace-nowrap"><span className="font-mono">{c.customer_id}</span>{nomeCliente(c.customer_id) && <span className="text-gray-500"> · {nomeCliente(c.customer_id)}</span>}</td>
+                              <td className="py-1.5">
+                                {catImpostazioni.clienti_ripax.includes(c.customer_id)
+                                  ? <span className="text-[10px] font-black text-amber-600">RIPAX</span>
+                                  : <span className="text-[10px] font-bold text-gray-400">RIP</span>}
+                              </td>
+                              <td className="py-1.5">
+                                <label className="flex items-center gap-1.5 cursor-pointer" title="Nella RA usa il Main Component del backlog come Item, senza cercare il prodotto del cliente">
+                                  <input type="checkbox" checked={!!c.usa_main_component} disabled={!canEdit('catalogazione')}
+                                    onChange={e => salvaCatCliente(c.nome_backlog, c.customer_id, e.target.checked)}
+                                    className="w-3.5 h-3.5 accent-blue-600 cursor-pointer" />
+                                  <span className="text-[10px] font-bold text-gray-500">Main Component</span>
+                                </label>
+                              </td>
+                              <td className="py-1.5 text-gray-400">{c.updated_by || ''}</td>
                               <td className="py-1.5 text-right">
-                                {canEdit('catalogazione') && <button onClick={() => eliminaCatRegola(r)} className="text-red-500 hover:text-red-700 font-bold cursor-pointer">Elimina</button>}
+                                {canEdit('catalogazione') && <button onClick={() => eliminaCatCliente(c)} className="text-red-500 hover:text-red-700 font-bold cursor-pointer">Elimina</button>}
                               </td>
                             </tr>
                           ))}
@@ -10205,19 +10376,22 @@ export default function App() {
 
                   <div className="bg-white border border-gray-200 rounded-xl p-4 space-y-3">
                     <div>
-                      <p className="text-sm font-black text-gray-800">Transcodifiche pot_ ({catTranscodifiche.length})</p>
-                      <p className="text-xs text-gray-500">Customer ID + Main Component → prodotto in Anagrafica. “Nessun prodotto” esclude le matricole dagli export.</p>
+                      <p className="text-sm font-black text-gray-800">Eccezioni prodotto ({catTranscodifiche.length})</p>
+                      <p className="text-xs text-gray-500">
+                        Internal ID + Part Number → prodotto. Serve quando l'Anagrafica non ha un prodotto per quella coppia
+                        (“escluso” toglie quelle matricole dagli export) o quando va forzato un prodotto diverso.
+                      </p>
                     </div>
                     {catTranscodifiche.length === 0 ? (
-                      <p className="text-xs text-gray-400">Nessuna transcodifica salvata.</p>
+                      <p className="text-xs text-gray-400">Nessuna eccezione.</p>
                     ) : (
                       <table className="w-full text-xs">
                         <tbody>
                           {[...catTranscodifiche].sort((a, b) => a.customer_id.localeCompare(b.customer_id) || a.main_component.localeCompare(b.main_component)).map(t => (
                             <tr key={`${t.customer_id}|${t.main_component}`} className="border-t border-gray-100">
-                              <td className="py-1.5">Cliente {t.customer_id}</td>
+                              <td className="py-1.5 whitespace-nowrap"><span className="font-mono">{t.customer_id}</span>{nomeCliente(t.customer_id) && <span className="text-gray-500"> · {nomeCliente(t.customer_id)}</span>}</td>
                               <td className="py-1.5 font-mono">{t.main_component}</td>
-                              <td className="py-1.5">{selectTranscodifica(t.customer_id, t.main_component, t.prodotto)}</td>
+                              <td className="py-1.5 font-mono">{t.prodotto || <span className="text-gray-400 font-sans">escluso dagli export</span>}</td>
                               <td className="py-1.5 text-gray-400">{t.updated_by || ''}</td>
                               <td className="py-1.5 text-right">
                                 {canEdit('catalogazione') && <button onClick={() => eliminaCatTranscodifica(t)} className="text-red-500 hover:text-red-700 font-bold cursor-pointer">Elimina</button>}
