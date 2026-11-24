@@ -78,16 +78,22 @@ function splitCsvLine(line, sep) {
 // Catalogazione: esiti per matricola e tipi di errore bloccante
 const CAT_ESITI = {
   RA: { label: 'Da caricare (RA)', cls: 'bg-purple-50 text-purple-700 border-purple-200' },
+  IT: { label: 'Da trasferire (IT)', cls: 'bg-blue-50 text-blue-700 border-blue-200' },
   nessuna: { label: 'Già in NS', cls: 'bg-green-50 text-green-700 border-green-200' },
-  disallineata: { label: 'Disallineata', cls: 'bg-amber-50 text-amber-700 border-amber-200' },
   esclusa: { label: 'Esclusa', cls: 'bg-gray-100 text-gray-500 border-gray-200' },
 };
 const CAT_ERRORI = {
   cliente: 'Cliente del backlog senza Internal ID',
   prodotto: 'Part Number senza prodotto in Anagrafica',
   scelta: 'Configurazione da scegliere',
-  magazzino: 'In NS su un magazzino diverso dalla destinazione',
-  deposito: 'In NS su conto deposito o irreparabili',
+  doppia: 'Matricola su più magazzini in NS',
+};
+// Trasferimenti: cosa fare di una combinazione magazzino di origine → destinazione.
+// Le combinazioni mai viste partono da "segnala": nessun trasferimento entra in un file senza una scelta.
+const CAT_AZIONI = {
+  segnala: { label: 'Da decidere', cls: 'bg-amber-50 text-amber-800 border-amber-300' },
+  trasferisci: { label: 'Trasferisci (IT)', cls: 'bg-blue-50 text-blue-700 border-blue-200' },
+  ignora: { label: 'Ignora', cls: 'bg-gray-100 text-gray-500 border-gray-200' },
 };
 const catDataCompatta = (d) => d.replace(/\//g, ''); // 10/09/2026 -> 10092026
 // Il confronto delle matricole ignora gli zeri iniziali: un catalogato passato da Excel li perde
@@ -689,10 +695,13 @@ export default function App() {
   // Catalogazione: backlog repair contro giacenza NS (RIP/RIPAX) → Return Authorization
   const [catTab, setCatTab] = useState('analisi'); // 'analisi' | 'anomalie' | 'storico' | 'impostazioni'
   const [catSubTab, setCatSubTab] = useState('carico'); // dentro l'analisi: 'carico' | 'errori'
+  const [catIgnoraScelte, setCatIgnoraScelte] = useState(false); // esporta le RA lasciando fuori le configurazioni non scelte
   const [catRighe, setCatRighe] = useState([]); // righe del backlog caricato (non persistite)
   const [catFile, setCatFile] = useState('');
   const [catFileAt, setCatFileAt] = useState(null); // data del file backlog: è la data dei documenti RA
-  const [catGiacenza, setCatGiacenza] = useState(new Map()); // matricola -> { item, location } dai magazzini repair
+  const [catGiacenza, setCatGiacenza] = useState(new Map()); // matricola -> { item, location }, tutti i magazzini
+  const [catGiacenzaDoppie, setCatGiacenzaDoppie] = useState(new Map()); // matricola -> magazzini, se è su più di uno
+  const [catRegole, setCatRegole] = useState([]); // azione per combinazione magazzino origine -> destinazione
   const [catGiacenzaAt, setCatGiacenzaAt] = useState(null); // data della giacenza NS usata per l'analisi
   const [catNonNelBacklog, setCatNonNelBacklog] = useState([]); // matricole in RIP/RIPAX assenti dal backlog
   const [catLoading, setCatLoading] = useState(false);
@@ -4210,9 +4219,10 @@ export default function App() {
     const elenco = (m) => m.map(x => `• ${x}`).join('\n');
     if (!window.confirm(
       `Caricare la giacenza NS: ${rows.length.toLocaleString('it-IT')} matricole (file del ${dataFile.toLocaleString('it-IT')})?\n\n` +
-      `Vengono SOSTITUITI questi ${magFile.length} magazzini:\n${elenco(magFile)}\n\n` +
+      `La giacenza di questi ${magFile.length} magazzini viene rifatta col contenuto del file: le matricole che il file non ha\n`
+      + `vengono eliminate, le altre aggiornate.\n${elenco(magFile)}\n\n` +
       (magAltri.length > 0
-        ? `Restano invariati:\n${elenco(magAltri)}\n\n`
+        ? `Questi magazzini non sono nel file e restano come sono, con i dati del carico precedente:\n${elenco(magAltri)}\n\n`
         : '') +
       'Le missioni già lanciate non cambiano: conservano le matricole attese al momento del lancio.' +
       (duplicati ? `\n\n${duplicati} matricole ripetute nel file: viene tenuta l'ultima occorrenza.` : '')
@@ -4930,11 +4940,12 @@ export default function App() {
 
   async function fetchCatConfig() {
     try {
-      const [imp, clienti, transc, storico] = await Promise.all([
+      const [imp, clienti, transc, storico, regole] = await Promise.all([
         supabase.from('cat_impostazioni').select('*'),
         supabase.from('cat_clienti_transcodifica').select('*').order('nome_backlog'),
         invFetchAll('cat_transcodifiche', '*', q => q, ['customer_id', 'main_component']),
         invFetchAll('cat_export_testate', '*', q => q, ['id']),
+        supabase.from('cat_regole_magazzini').select('*'),
       ]);
       if (imp.error) throw imp.error;
       if (clienti.error) throw clienti.error;
@@ -4949,6 +4960,7 @@ export default function App() {
       setCatImpDraft({ clienti: conf.clienti_ripax.join(', '), magazzino_ripax: conf.magazzino_ripax, magazzino_rip: conf.magazzino_rip });
       setCatClienti(clienti.data || []);
       setCatTranscodifiche(transc);
+      setCatRegole(regole.data || []);
       setCatStorico(storico.reverse());
       const { data: clientiNs } = await supabase.from('cat_clienti_ns').select('*').order('nome');
       setCatClientiNs(clientiNs || []);
@@ -5016,19 +5028,28 @@ export default function App() {
       (meta || []).forEach(m => { metaMap[m.chiave] = m.updated_at; });
       setCatGiacenzaAt(metaMap.inv_snapshot_file || metaMap.inv_snapshot || null);
 
-      // Giacenza completa dei magazzini di riparazione (RIP, RIPAX e i conti deposito/irreparabili).
+      // Giacenza di TUTTI i magazzini: le matricole assenti diventano RA, quelle su un magazzino diverso
+      // dalla destinazione diventano trasferimenti (IT), quindi serve l'intera giacenza, non solo il repair.
       // L'elenco si legge dal DB qui, non dallo stato: all'apertura del modulo potrebbe non essere ancora arrivato.
       setCatProgress('lettura giacenza…');
       const riep = await invFetchAll('inv_snapshot_riepilogo', '*', q => q, ['location', 'item']);
       setInvRiepilogo(riep);
-      const magRepair = [...new Set(riep.map(r => r.location).filter(l => /^(RIP|RIPAX|DEP|IRREP)/i.test(l)))];
+      const magazzini = [...new Set(riep.map(r => r.location))];
       const giacenza = new Map();
-      for (const loc of magRepair) {
+      const doppie = new Map(); // matricola -> magazzini, per segnalare chi sta su più magazzini
+      for (const loc of magazzini) {
         const rows = await invFetchAll('inv_snapshot', 'numero, item, location', q => q.eq('location', loc), ['numero']);
-        rows.forEach(r => giacenza.set(catSerialNorm(r.numero), { numero: r.numero, item: r.item, location: r.location }));
+        rows.forEach(r => {
+          const k = catSerialNorm(r.numero);
+          const g = { numero: r.numero, item: r.item, location: r.location };
+          const pre = giacenza.get(k);
+          if (pre && pre.location !== r.location) doppie.set(k, [...new Set([...(doppie.get(k) || [pre.location]), r.location])]);
+          else giacenza.set(k, g);
+        });
         setCatProgress(`lettura giacenza… ${giacenza.size.toLocaleString('it-IT')}`);
       }
       setCatGiacenza(giacenza);
+      setCatGiacenzaDoppie(doppie);
 
       // Matricole in RIP/RIPAX che il backlog non conosce: disallineamenti
       const nelBacklog = new Set(righe.flatMap(r => catSerialVarianti(r.serial)));
@@ -5049,6 +5070,7 @@ export default function App() {
     const clienteDi = new Map(catClienti.map(c => [c.nome_backlog, c]));
     const transc = new Map(catTranscodifiche.map(t => [`${t.customer_id}|${t.main_component}`, t.prodotto]));
     const anagByCodice = new Map(anagrafica.map(a => [a.codice, a]));
+    const regoleMag = new Map(catRegole.map(r => [`${r.origine}|${r.destinazione}`, r.azione]));
     const anagPerClienteMc = new Map();
     anagrafica.forEach(a => {
       if (!a.main_component) return;
@@ -5108,17 +5130,31 @@ export default function App() {
         base.note.push(...codifica.map(e => `${e.msg} (non serve: la matricola è già in NS come ${g.item})`));
       };
       base.origine = g.location;
+      base.itemNs = g.item;
       const mag = g.location.split(' - ')[0].trim();
       const magDest = (base.destinazione || '').split(' - ')[0].trim();
-      if (mag !== 'RIP' && mag !== 'RIPAX') {
-        declassaCodifica();
-        base.errori.push({ tipo: 'deposito', msg: `In NS risulta su ${g.location}: riparazione chiusa, non dovrebbe essere nel backlog` });
-        return { ...base, esito: 'disallineata' };
+      base.magOrigine = mag;
+      base.magDest = magDest;
+      // Articolo NS intestato a un altro cliente: lo si segnala solo per i clienti non RIPAX, dove è un'anomalia
+      // vera. Per i clienti RIPAX (interni, CSC/CSE, main component) la differenza è fisiologica.
+      const aNs = anagByCodice.get(g.item);
+      base.itemCustomer = aNs?.customer_id ? String(aNs.customer_id) : '';
+      if (!base.ripax && !cliente?.usa_main_component && base.itemCustomer && base.itemCustomer !== String(customer)) {
+        base.incongruo = true;
+        base.note.push(`In NS è su ${g.item}, prodotto del cliente ${base.itemCustomer}`);
       }
+      // La stessa matricola su due magazzini in NS non deve esistere: è un errore da segnalare
+      const dueMag = catGiacenzaDoppie.get(catSerialNorm(r.serial)) || catGiacenzaDoppie.get(catSerialNorm(base.serialNs));
+      if (dueMag) {
+        declassaCodifica();
+        base.errori.push({ tipo: 'doppia', msg: `In NS risulta su più magazzini: ${dueMag.join(', ')}` });
+        return { ...base, esito: 'IT', azione: 'segnala' };
+      }
+      // Magazzino diverso dalla destinazione: è un trasferimento, e l'azione la decide la regola della coppia
       if (customer && mag !== magDest) {
         declassaCodifica();
-        base.errori.push({ tipo: 'magazzino', msg: `In NS è su ${mag}, per il cliente ${customer} è attesa su ${magDest}` });
-        return { ...base, esito: 'disallineata' };
+        base.azione = regoleMag.get(`${mag}|${magDest}`) || 'segnala';
+        return { ...base, esito: 'IT' };
       }
       // Articolo diverso da quello calcolato: solo una nota, non un errore. La matricola è già in NetSuite,
       // quindi non si carica nulla e l'item buono è quello che ha in NS (capita con i codici -OLD o tra
@@ -5152,14 +5188,56 @@ export default function App() {
       d.linee = [...perItem.entries()].map(([item, rr], k) => ({ item, surrogate: k + 1, righe: rr }));
     });
 
+    // Trasferimenti: un gruppo per coppia magazzino origine → destinazione, dentro il dettaglio per articolo.
+    // L'articolo di un IT è quello con cui NetSuite ha già registrato la matricola, non il prodotto del cliente.
+    const trasfGruppi = new Map();
+    righe.filter(r => r.esito === 'IT').forEach(r => {
+      const k = `${r.magOrigine}|${r.magDest}`;
+      const x = trasfGruppi.get(k) || {
+        key: k, magOrigine: r.magOrigine, magDest: r.magDest, origine: r.origine, destinazione: r.destinazione,
+        azione: regoleMag.get(k) || 'segnala', righe: [], clienti: new Set(), segnalazioni: new Set(),
+      };
+      x.righe.push(r);
+      if (r.customer) x.clienti.add(r.customer);
+      r.errori.forEach(e => x.segnalazioni.add(e.msg));
+      trasfGruppi.set(k, x);
+    });
+    trasfGruppi.forEach(x => {
+      const perItem = new Map();
+      x.righe.forEach(r => perItem.set(r.itemNs, [...(perItem.get(r.itemNs) || []), r]));
+      x.articoli = [...perItem.entries()].map(([item, rr]) => ({ item, righe: rr })).sort((a, b) => b.righe.length - a.righe.length);
+    });
+
+    // Un documento IT per coppia origine → destinazione, con le sole righe da trasferire e senza errori
+    const docsIt = new Map();
+    righe.filter(r => r.esito === 'IT' && r.azione === 'trasferisci' && r.errori.length === 0).forEach(r => {
+      const k = `${r.magOrigine}|${r.magDest}`;
+      if (!docsIt.has(k)) {
+        const b = `${r.magOrigine}-IT-${r.magDest}-${catDataCompatta(dataRa)}`;
+        let idext = b;
+        for (let j = 2; usati.has(idext); j++) idext = `${b}-${j}`;
+        usati.add(idext);
+        docsIt.set(k, { idext, tipo: 'IT', cliente: '', data: dataRa, origine: r.origine, destinazione: r.destinazione, righe: [] });
+      }
+      const d = docsIt.get(k);
+      r.idext = d.idext;
+      d.righe.push(r);
+    });
+    docsIt.forEach(d => {
+      const perItem = new Map();
+      d.righe.forEach(r => perItem.set(r.itemNs, [...(perItem.get(r.itemNs) || []), r]));
+      d.linee = [...perItem.entries()].map(([item, rr], k) => ({ item, surrogate: k + 1, righe: rr }));
+    });
+
     const conErrori = righe.filter(r => r.errori.length > 0);
     const erroriPerTipo = {};
     conErrori.forEach(r => new Set(r.errori.map(e => e.tipo)).forEach(t => { erroriPerTipo[t] = (erroriPerTipo[t] || 0) + 1; }));
     // Nomi cliente da transcodificare, con l'Internal ID suggerito dai prodotti già in giacenza
     const clientiMancanti = new Map();
     righe.filter(r => r.errori.some(e => e.tipo === 'cliente')).forEach(r => {
-      const c = clientiMancanti.get(r.cliente) || { nome: r.cliente, n: 0, suggeriti: new Map() };
+      const c = clientiMancanti.get(r.cliente) || { nome: r.cliente, n: 0, suggeriti: new Map(), righe: [] };
       c.n++;
+      c.righe.push(r);
       const g = catGiacenza.get(catSerialNorm(r.serial));
       const a = g && anagByCodice.get(g.item);
       if (a?.customer_id) c.suggeriti.set(a.customer_id, (c.suggeriti.get(a.customer_id) || 0) + 1);
@@ -5174,22 +5252,54 @@ export default function App() {
       s.rma.add(r.rma);
       sceltaGruppi.set(k, s);
     });
+    // Codici incongruenti: cliente non RIPAX la cui matricola in NS sta su un articolo di un altro cliente
+    const codiciIncongrui = new Map();
+    righe.filter(r => r.incongruo).forEach(r => {
+      const k = `${r.customer}|${r.itemNs}`;
+      const x = codiciIncongrui.get(k) || {
+        key: k, customer: r.customer, cliente: r.cliente, itemNs: r.itemNs,
+        itemCustomer: r.itemCustomer, magazzini: new Set(), pn: new Set(), righe: [],
+      };
+      x.righe.push(r);
+      x.magazzini.add(r.magOrigine);
+      x.pn.add(r.pn);
+      codiciIncongrui.set(k, x);
+    });
     const prodottiMancanti = new Map();
     righe.filter(r => r.errori.some(e => e.tipo === 'prodotto')).forEach(r => {
       const k = `${r.customer}|${r.pn}`;
-      const p = prodottiMancanti.get(k) || { customer: r.customer, pn: r.pn, descrizione: r.descrizione, n: 0 };
+      const p = prodottiMancanti.get(k) || { key: k, customer: r.customer, pn: r.pn, descrizione: r.descrizione, n: 0, righe: [] };
       p.n++;
+      p.righe.push(r);
       prodottiMancanti.set(k, p);
     });
     const conta = (esito) => righe.filter(r => r.esito === esito).length;
     return {
-      righe, docs: [...docs.values()], conErrori, erroriPerTipo,
+      righe, docs: [...docs.values()], docsIt: [...docsIt.values()], conErrori, erroriPerTipo,
       clientiMancanti: [...clientiMancanti.values()].sort((a, b) => b.n - a.n),
       prodottiMancanti: [...prodottiMancanti.values()].sort((a, b) => b.n - a.n),
       sceltaGruppi: [...sceltaGruppi.values()].sort((a, b) => b.n - a.n),
-      n: { RA: conta('RA'), nessuna: conta('nessuna'), disallineata: conta('disallineata'), esclusa: conta('esclusa') },
+      trasfGruppi: [...trasfGruppi.values()].sort((a, b) => b.righe.length - a.righe.length),
+      codiciIncongrui: [...codiciIncongrui.values()].sort((a, b) => b.righe.length - a.righe.length),
+      n: { RA: conta('RA'), IT: conta('IT'), nessuna: conta('nessuna'), esclusa: conta('esclusa') },
     };
-  }, [catRighe, catGiacenza, catFileAt, catImpostazioni, catClienti, catTranscodifiche, catStorico, catSceltaProdotto, anagrafica]);
+  }, [catRighe, catGiacenza, catGiacenzaDoppie, catRegole, catFileAt, catImpostazioni, catClienti, catTranscodifiche, catStorico, catSceltaProdotto, anagrafica]);
+
+  // Azione per una coppia di magazzini: la sceglie l'utente dalla scheda Trasferimenti
+  async function salvaCatRegola(origine, destinazione, azione) {
+    const riga = { origine, destinazione, azione, updated_at: new Date().toISOString(), updated_by: currentUser || null };
+    const { error } = await supabase.from('cat_regole_magazzini').upsert(riga, { onConflict: 'origine,destinazione' });
+    if (error) { alert('Errore salvataggio regola: ' + error.message); return; }
+    setCatRegole(prev => [...prev.filter(r => !(r.origine === origine && r.destinazione === destinazione)), riga]);
+  }
+
+  // Rimuovere la regola riporta la coppia a "Da decidere"
+  async function eliminaCatRegola(r) {
+    if (!window.confirm(`Rimuovere la scelta per ${r.origine} → ${r.destinazione}?\n\nLa coppia torna a «Da decidere» e le sue matricole restano fuori dai file.`)) return;
+    const { error } = await supabase.from('cat_regole_magazzini').delete().eq('origine', r.origine).eq('destinazione', r.destinazione);
+    if (error) { alert('Errore rimozione regola: ' + error.message); return; }
+    setCatRegole(prev => prev.filter(x => !(x.origine === r.origine && x.destinazione === r.destinazione)));
+  }
 
   async function salvaCatCliente(nome_backlog, customer_id, usa_main_component = false) {
     const riga = { nome_backlog, customer_id, usa_main_component, updated_at: new Date().toISOString(), updated_by: currentUser || null };
@@ -5274,6 +5384,11 @@ export default function App() {
     alert('Impostazioni salvate.');
   }
 
+  // I file per NetSuite sono separati da virgola: un valore che contenesse virgole o apici va tra apici
+  const catCella = (v) => {
+    const s = String(v ?? '');
+    return /[",\r\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+  };
   const catDownloadCsv = (header, rows, nome) => {
     const blob = new Blob(['﻿' + [header, ...rows].join('\r\n')], { type: 'text/csv;charset=utf-8;' });
     const url = URL.createObjectURL(blob);
@@ -5282,9 +5397,16 @@ export default function App() {
     URL.revokeObjectURL(url);
   };
 
-  async function esportaCatalogazione() {
+  // Un solo percorso di export per i due tipi: 'RA' (carico) e 'IT' (trasferimenti)
+  async function esportaCatalogazione(tipo = 'RA') {
     const an = catAnalisi;
-    if (!an || an.docs.length === 0) { alert('Nessun documento da esportare.'); return; }
+    const docs = tipo === 'IT' ? (an?.docsIt || []) : (an?.docs || []);
+    if (!an || docs.length === 0) { alert('Nessun documento da esportare.'); return; }
+    // Le configurazioni si scelgono prima di esportare: senza scelta quelle matricole restano fuori dalle RA
+    if (tipo === 'RA' && an.sceltaGruppi.length > 0 && !catIgnoraScelte) {
+      alert(`Ci sono ancora ${an.sceltaGruppi.length} configurazioni da scegliere nel carico.\n\nScegli le configurazioni, oppure spunta «ignora le configurazioni da scegliere» per esportare lasciando fuori quelle matricole.`);
+      return;
+    }
     // La giacenza può essere stata ricaricata dopo l'analisi: verifica sul DB, non sullo stato locale
     const { data: meta } = await supabase.from('import_meta').select('*').in('chiave', ['inv_snapshot_file', 'inv_snapshot', INV_SNAPSHOT_LOCK]);
     const metaMap = {};
@@ -5294,17 +5416,21 @@ export default function App() {
       await fetchImportMeta();
       return;
     }
-    const nMat = an.docs.reduce((s, d) => s + d.righe.length, 0);
+    const nMat = docs.reduce((s, d) => s + d.righe.length, 0);
     if (!window.confirm(
-      `Esportare ${an.docs.length} Return Authorization (${nMat.toLocaleString('it-IT')} matricole)?\n\n` +
-      `Un documento per cliente, data ${an.docs[0].data}.` +
-      (an.conErrori.length > 0 ? `\n\n${an.conErrori.length.toLocaleString('it-IT')} matricole con errori restano fuori: le ritrovi nella scheda Errori al prossimo caricamento del backlog.` : '')
+      tipo === 'IT'
+        ? `Esportare ${docs.length} Inventory Transfer (${nMat.toLocaleString('it-IT')} matricole)?\n\n`
+          + `Un documento per coppia di magazzini, data ${docs[0].data}:\n`
+          + docs.map(d => `· ${d.idext}: ${d.righe.length} matricole`).join('\n')
+        : `Esportare ${docs.length} Return Authorization (${nMat.toLocaleString('it-IT')} matricole)?\n\n`
+          + `Un documento per cliente, data ${docs[0].data}.`
+          + (an.conErrori.length > 0 ? `\n\n${an.conErrori.length.toLocaleString('it-IT')} matricole con errori restano fuori: le ritrovi nella scheda Errori al prossimo caricamento del backlog.` : '')
     )) return;
 
     setCatLoading(true);
-    const testate = an.docs.map(d => ({
-      idext: d.idext, tipo: 'RA', cliente: d.cliente, data_catalogazione: catDataIso(d.data),
-      magazzino_origine: null, magazzino_destinazione: d.destinazione,
+    const testate = docs.map(d => ({
+      idext: d.idext, tipo, cliente: d.cliente || null, data_catalogazione: catDataIso(d.data),
+      magazzino_origine: d.origine || null, magazzino_destinazione: d.destinazione,
       n_righe: d.linee.length, n_matricole: d.righe.length, giacenza_at: catGiacenzaAt,
       file_catalogato: catFile, esportato_da: currentUser || null,
     }));
@@ -5316,12 +5442,16 @@ export default function App() {
       return;
     }
     const rows = [];
-    an.docs.forEach(d => d.linee.forEach(l => l.righe.forEach(r => rows.push(
-      // Serial senza il prefisso interno del backlog: è la forma con cui NetSuite conosce le matricole
-      [d.idext, l.surrogate, d.data, d.cliente, r.serialNs || r.serial, l.item, l.righe.length, d.destinazione, `catalogazione ${d.data}`].join(';'),
-    ))));
-    catDownloadCsv('External ID;Surrogate Line;Date;Customer;Serial;Item;Quantity;Magazzino di destinazione;memo', rows,
-      `catalogazione_RA_${new Date().toISOString().slice(0, 16).replace(/[-:]/g, '').replace('T', '_')}.csv`);
+    // Serial senza il prefisso interno del backlog: è la forma con cui NetSuite conosce le matricole
+    docs.forEach(d => d.linee.forEach(l => l.righe.forEach(r => rows.push((tipo === 'IT'
+      ? [d.idext, l.surrogate, d.data, l.item, l.righe.length, r.serialNs || r.serial, d.origine, d.destinazione, `catalogazione ${d.data}`]
+      : [d.idext, l.surrogate, d.data, d.cliente, r.serialNs || r.serial, l.item, l.righe.length, d.destinazione, `catalogazione ${d.data}`]
+    ).map(catCella).join(',')))));
+    const stamp = new Date().toISOString().slice(0, 16).replace(/[-:]/g, '').replace('T', '_');
+    catDownloadCsv(tipo === 'IT'
+      ? 'IDextIT,Surrogate Line,Date,Item,Quantity,Serial,Magazzino di origine,Magazzino di destinazione,memo'
+      : 'External ID,Surrogate Line,Date,Customer,Serial,Item,Quantity,Magazzino di destinazione,memo',
+    rows, `catalogazione_${tipo}_${stamp}.csv`);
     await fetchCatConfig();
     setCatLoading(false);
   }
@@ -5352,8 +5482,11 @@ export default function App() {
     const dettaglio = an.righe.map(r => ({
       Matricola: r.serial, 'Matricola NS': r.serialNs !== r.serial ? r.serialNs : '', RMA: r.rma,
       'Cliente backlog': r.cliente, 'Internal ID': r.customer, Stato: r.stato, BIN: r.bin,
-      'Part Number': r.pn, Descrizione: r.descrizione, Prodotto: r.prodotto, 'Magazzino NS': r.origine,
-      Destinazione: r.destinazione, Esito: CAT_ESITI[r.esito]?.label || r.esito, IDext: r.idext || '',
+      'Part Number': r.pn, Descrizione: r.descrizione, Prodotto: r.prodotto,
+      'Magazzino NS': r.origine, 'Articolo NS': r.itemNs || '',
+      Destinazione: r.destinazione, Esito: CAT_ESITI[r.esito]?.label || r.esito,
+      Trasferimento: r.esito === 'IT' ? (CAT_AZIONI[r.azione]?.label || r.azione || '') : '',
+      IDext: r.idext || '',
       Errori: r.errori.map(e => e.msg).join(' | '), Note: (r.note || []).join(' | '),
     }));
     const cols = Object.keys(dettaglio[0]);
@@ -5380,6 +5513,11 @@ export default function App() {
     XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(an.docs.map(d => ({
       IDext: d.idext, Cliente: d.cliente, Data: d.data, Destinazione: d.destinazione, Righe: d.linee.length, Matricole: d.righe.length,
     }))), 'Documenti RA');
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(an.trasfGruppi.flatMap(g => g.articoli.map(a => ({
+      Origine: g.origine, Destinazione: g.destinazione, Azione: CAT_AZIONI[g.azione]?.label || g.azione,
+      'Articolo NS': a.item, Matricole: a.righe.length, IDextIT: a.righe[0]?.idext || '',
+      Segnalazioni: [...g.segnalazioni].join(' | '),
+    })))), 'Trasferimenti');
     XLSX.writeFile(wb, `catalogazione_backlog_${new Date().toISOString().slice(0, 10)}.xlsx`);
   }
 
@@ -9627,22 +9765,17 @@ export default function App() {
           const nomeCliente = (id) => nsById.get(String(id))?.nome || '';
           const etichettaCliente = (id) => (nomeCliente(id) ? `${id} · ${nomeCliente(id)}` : String(id || ''));
           // La configurazione da scegliere non è un errore: è un passo del carico, quindi sta sotto il carico.
-          // Disallineate: sotto-scheda a parte. Errori: ciò che va corretto altrove (clienti, Anagrafica).
+          // Trasferimenti: sotto-scheda a parte. Errori: ciò che va corretto altrove (clienti, Anagrafica).
           const soloScelta = r => r.errori.length > 0 && r.errori.every(e => e.tipo === 'scelta');
-          const daSistemare = r => r.errori.length > 0 && r.esito !== 'disallineata' && !soloScelta(r);
-          const righeVis = !an ? [] : an.righe.filter(r => daSistemare(r) && cerca(r));
-          const righeDisall = !an ? [] : an.righe.filter(r => r.esito === 'disallineata' && cerca(r));
-          // Disallineate raggruppate per segnalazione: stesso messaggio, stesse matricole sotto
-          const gruppiDisall = [...righeDisall.reduce((m, r) => {
-            r.errori.filter(e => e.tipo === 'deposito' || e.tipo === 'magazzino').forEach(e => {
-              const x = m.get(e.msg) || { key: e.msg, msg: e.msg, tipo: e.tipo, righe: [], clienti: new Set() };
-              x.righe.push(r);
-              if (r.customer) x.clienti.add(r.customer);
-              m.set(e.msg, x);
-            });
-            return m;
-          }, new Map()).values()].sort((a, b) => b.righe.length - a.righe.length);
+          const daSistemare = r => r.errori.length > 0 && r.esito !== 'IT' && !soloScelta(r);
           const nErrori = !an ? 0 : an.righe.filter(daSistemare).length;
+          // Matricole che finiscono davvero nei file: quelle dei documenti, non tutte le righe con quell'esito
+          const nCarico = !an ? 0 : an.docs.reduce((s, d) => s + d.righe.length, 0);
+          const nTrasf = !an ? 0 : an.docsIt.reduce((s, d) => s + d.righe.length, 0);
+          const nDaConfigurare = !an ? 0 : an.sceltaGruppi.reduce((s, g) => s + g.n, 0);
+          const trasfVis = !an ? [] : an.trasfGruppi.filter(g => !q
+            || [g.origine, g.destinazione].some(v => (v || '').toLowerCase().includes(q))
+            || g.articoli.some(a => a.item.toLowerCase().includes(q) || a.righe.some(cerca)));
           const docsVis = !an ? [] : an.docs.filter(d => !q
             || [d.idext, d.cliente, nomeCliente(d.cliente), d.destinazione].some(v => (v || '').toLowerCase().includes(q))
             || d.linee.some(l => l.item.toLowerCase().includes(q) || l.righe.some(cerca)));
@@ -9697,48 +9830,13 @@ export default function App() {
             return esatti.length > 0 ? esatti : catClientiNs.filter(c => nomeNorm(c.nome).startsWith(base));
           };
 
-          const tabellaRighe = (righe) => (
-            <div className="bg-white border border-gray-200 rounded-xl overflow-x-auto">
-              <table className="w-full text-xs">
-                <thead className="bg-gray-50 text-gray-500 uppercase text-[10px]">
-                  <tr>
-                    {['Matricola', 'RMA', 'Cliente', 'Stato', 'Part Number', 'Prodotto', 'Magazzino NS', 'Destinazione', 'Esito', 'Errori e note'].map(h => (
-                      <th key={h} className="px-3 py-2 text-left font-black whitespace-nowrap">{h}</th>
-                    ))}
-                  </tr>
-                </thead>
-                <tbody>
-                  {righe.slice(0, 500).map(r => (
-                    <tr key={r.i} className={`border-t border-gray-100 ${r.errori.length ? 'bg-amber-50/50' : ''}`}>
-                      <td className="px-3 py-1.5 font-mono">{r.serial}</td>
-                      <td className="px-3 py-1.5 font-mono whitespace-nowrap">{r.rma}</td>
-                      <td className="px-3 py-1.5">{r.cliente}{r.customer && <span className="text-gray-400"> · {r.customer}</span>}{r.ripax && <span className="ml-1 text-[9px] font-black text-amber-600">RIPAX</span>}</td>
-                      <td className="px-3 py-1.5 text-[10px] text-gray-500">{r.stato.replace('DEVICE_IN_REPAIR_', '')}</td>
-                      <td className="px-3 py-1.5 font-mono">{r.pn}</td>
-                      <td className="px-3 py-1.5 font-mono">{r.prodotto}</td>
-                      <td className="px-3 py-1.5 whitespace-nowrap">{r.origine || <span className="text-gray-300">non in NS</span>}</td>
-                      <td className="px-3 py-1.5 whitespace-nowrap">{r.destinazione}</td>
-                      <td className="px-3 py-1.5">
-                        <span className={`text-[10px] font-bold border rounded px-1.5 py-0.5 whitespace-nowrap ${CAT_ESITI[r.esito]?.cls || ''}`}>{CAT_ESITI[r.esito]?.label}</span>
-                      </td>
-                      <td className="px-3 py-1.5">
-                        {r.errori.length > 0 && <span className="text-amber-800">{r.errori.map(e => e.msg).join(' · ')}</span>}
-                        {r.note?.length > 0 && <span className="text-gray-400">{r.errori.length > 0 ? ' · ' : ''}{r.note.join(' · ')}</span>}
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          );
-
           return (
             <div className="space-y-5">
               <div>
                 <h2 className="text-lg font-black text-gray-800">🏷️ Catalogazione</h2>
                 <p className="text-xs text-gray-500">
-                  Confronto del backlog repair con la giacenza NS dei magazzini di riparazione: le matricole assenti da NetSuite
-                  diventano Return Authorization, i disallineamenti vanno verificati.
+                  Confronto del backlog repair con la giacenza NS di tutti i magazzini: le matricole assenti da NetSuite
+                  diventano Return Authorization, quelle su un magazzino diverso dalla destinazione diventano Inventory Transfer.
                 </p>
               </div>
               {/* Giacenza e backlog si caricano dallo stesso punto, con la data del file su ciascun pulsante */}
@@ -9777,22 +9875,6 @@ export default function App() {
 
               {catTab === 'analisi' && (
                 <div className="space-y-4">
-                  <div className="flex items-center gap-2 flex-wrap">
-                    {an && (
-                      <>
-                        <button onClick={() => analizzaBacklog()} disabled={catLoading}
-                          className="bg-gray-100 hover:bg-gray-200 text-gray-700 text-sm font-bold px-4 py-2.5 rounded-xl cursor-pointer transition disabled:opacity-50">
-                          ↻ Rianalizza
-                        </button>
-                        <button onClick={esportaCatalogazione} disabled={catLoading || giacenzaCambiata || an.docs.length === 0}
-                          title={an.docs.length === 0 ? 'Nessun documento da esportare' : ''}
-                          className="bg-green-600 hover:bg-green-700 text-white text-sm font-bold px-4 py-2.5 rounded-xl cursor-pointer transition shadow-xs disabled:opacity-40 disabled:cursor-not-allowed">
-                          📤 Esporta RA ({an.docs.length} documenti)
-                        </button>
-                      </>
-                    )}
-                  </div>
-
                   {!an ? (
                     <div className="text-center py-16 text-gray-400 text-sm">Carica il backlog repair col pulsante in alto per avviare il confronto con la giacenza NS.</div>
                   ) : (
@@ -9811,9 +9893,9 @@ export default function App() {
 
                       <div className="flex gap-1 bg-gray-100 p-1 rounded-xl w-fit">
                         {[
-                          { id: 'carico', label: '📦 Carico', n: an.n.RA },
+                          { id: 'carico', label: '📦 Carico', n: nCarico },
+                          { id: 'trasferimenti', label: '🔁 Trasferimenti', n: an.n.IT },
                           { id: 'errori', label: '⚠️ Errori', n: nErrori },
-                          { id: 'disallineate', label: '🧭 Disallineate', n: an.n.disallineata },
                         ].map(s => (
                           <button key={s.id} onClick={() => setCatSubTab(s.id)}
                             className={`text-xs font-bold px-4 py-2 rounded-lg cursor-pointer transition ${catSubTab === s.id ? 'bg-white text-gray-800 shadow-xs' : 'text-gray-500 hover:text-gray-700'}`}>
@@ -9822,36 +9904,62 @@ export default function App() {
                         ))}
                       </div>
 
-                      {catSubTab === 'carico' && (
-                        <div className="grid grid-cols-3 gap-2 max-w-2xl">
-                          {[
-                            { label: 'Da caricare (RA)', n: an.n.RA, sub: `${an.docs.length} ${an.docs.length === 1 ? 'documento' : 'documenti'}`, cls: 'text-purple-700' },
-                            { label: 'Già in NS', n: an.n.nessuna, cls: 'text-green-700' },
-                            { label: 'Totale backlog', n: an.righe.length, cls: 'text-gray-800' },
-                          ].map(c => (
-                            <div key={c.label} className="bg-white border border-gray-200 rounded-xl px-3 py-2.5">
-                              <p className="text-[10px] font-bold uppercase text-gray-400">{c.label}</p>
-                              <p className={`text-xl font-black ${c.cls}`}>{c.n.toLocaleString('it-IT')}</p>
-                              {c.sub && <p className="text-[10px] text-gray-400">{c.sub}</p>}
-                            </div>
-                          ))}
+                      {/* Contatori a sinistra, azioni a destra: da qui si rianalizza e si esporta */}
+                      <div className="flex items-start justify-between gap-3 flex-wrap">
+                        {catSubTab === 'carico' ? (
+                          <div className="grid grid-cols-3 lg:grid-cols-6 gap-2 max-w-5xl">
+                            {[
+                              { label: 'Da caricare (RA)', n: nCarico, sub: `${an.docs.length} ${an.docs.length === 1 ? 'documento' : 'documenti'}`, cls: 'text-purple-700' },
+                              {
+                                label: 'Da trasferire (IT)', n: an.n.IT,
+                                sub: nTrasf === an.n.IT ? `${an.docsIt.length} ${an.docsIt.length === 1 ? 'documento' : 'documenti'}` : `${nTrasf.toLocaleString('it-IT')} pronte →`,
+                                cls: an.n.IT ? 'text-blue-700' : 'text-gray-300',
+                                onClick: an.n.IT ? () => setCatSubTab('trasferimenti') : null,
+                              },
+                              {
+                                label: 'Da configurare', n: nDaConfigurare,
+                                sub: `${an.sceltaGruppi.length} ${an.sceltaGruppi.length === 1 ? 'gruppo' : 'gruppi'}`,
+                                cls: nDaConfigurare ? 'text-amber-700' : 'text-gray-300', bordo: nDaConfigurare ? 'border-amber-300' : 'border-gray-200',
+                              },
+                              {
+                                label: 'Errori', n: nErrori, sub: nErrori ? 'da sistemare →' : 'nessuno',
+                                cls: nErrori ? 'text-amber-700' : 'text-gray-300', bordo: nErrori ? 'border-amber-300' : 'border-gray-200',
+                                onClick: nErrori ? () => setCatSubTab('errori') : null,
+                              },
+                              { label: 'Già in NS', n: an.n.nessuna, cls: 'text-green-700' },
+                              { label: 'Totale backlog', n: an.righe.length, cls: 'text-gray-800' },
+                            ].map(c => (
+                              <div key={c.label} onClick={c.onClick || undefined}
+                                className={`bg-white border ${c.bordo || 'border-gray-200'} rounded-xl px-3 py-2.5 ${c.onClick ? 'cursor-pointer hover:bg-gray-50 transition' : ''}`}>
+                                <p className="text-[10px] font-bold uppercase text-gray-400">{c.label}</p>
+                                <p className={`text-xl font-black ${c.cls}`}>{c.n.toLocaleString('it-IT')}</p>
+                                {c.sub && <p className="text-[10px] text-gray-400">{c.sub}</p>}
+                              </div>
+                            ))}
+                          </div>
+                        ) : <span />}
+                        <div className="flex items-center gap-2 flex-wrap">
+                          <button onClick={() => analizzaBacklog()} disabled={catLoading}
+                            className="bg-gray-100 hover:bg-gray-200 text-gray-700 text-sm font-bold px-4 py-2.5 rounded-xl cursor-pointer transition disabled:opacity-50">
+                            ↻ Rianalizza
+                          </button>
+                          <button onClick={() => esportaCatalogazione('RA')}
+                            disabled={catLoading || giacenzaCambiata || an.docs.length === 0 || (an.sceltaGruppi.length > 0 && !catIgnoraScelte)}
+                            title={an.docs.length === 0 ? 'Nessun documento da esportare'
+                              : (an.sceltaGruppi.length > 0 && !catIgnoraScelte) ? 'Scegli le configurazioni in testa al carico, o spunta «ignora le configurazioni da scegliere»' : ''}
+                            className="bg-green-600 hover:bg-green-700 text-white text-sm font-bold px-4 py-2.5 rounded-xl cursor-pointer transition shadow-xs disabled:opacity-40 disabled:cursor-not-allowed">
+                            📤 Esporta RA ({an.docs.length})
+                          </button>
+                          <button onClick={() => esportaCatalogazione('IT')}
+                            disabled={catLoading || giacenzaCambiata || an.docsIt.length === 0}
+                            title={an.docsIt.length === 0
+                              ? (an.n.IT ? 'Nessun trasferimento confermato: scegli l\'azione nella scheda Trasferimenti' : 'Nessun trasferimento da esportare')
+                              : ''}
+                            className="bg-blue-600 hover:bg-blue-700 text-white text-sm font-bold px-4 py-2.5 rounded-xl cursor-pointer transition shadow-xs disabled:opacity-40 disabled:cursor-not-allowed">
+                            📤 Esporta IT ({an.docsIt.length})
+                          </button>
                         </div>
-                      )}
-
-                      {catSubTab === 'carico' && (
-                        nErrori > 0 ? (
-                          <div className="bg-white border border-gray-200 text-gray-600 text-sm rounded-xl px-4 py-3">
-                            {an.docs.length} documenti pronti con {an.n.RA.toLocaleString('it-IT')} matricole.
-                            <button onClick={() => setCatSubTab('errori')} className="ml-1 font-bold text-amber-700 hover:underline cursor-pointer">
-                              {nErrori.toLocaleString('it-IT')} matricole restano fuori, da sistemare →
-                            </button>
-                          </div>
-                        ) : (
-                          <div className="bg-green-50 border border-green-200 text-green-800 text-sm font-bold rounded-xl px-4 py-3">
-                            ✓ Nessun errore · {an.docs.length} documenti pronti
-                          </div>
-                        )
-                      )}
+                      </div>
 
                       {catSubTab === 'errori' && (
                         <>
@@ -9860,7 +9968,7 @@ export default function App() {
                               {nErrori === 0 ? '✓ Nessuna matricola da sistemare.' : `${nErrori.toLocaleString('it-IT')} matricole da sistemare: restano fuori dai documenti RA`}
                             </p>
                             <div className="flex flex-wrap gap-2">
-                              {Object.entries(an.erroriPerTipo).filter(([t]) => !['deposito', 'magazzino', 'scelta'].includes(t)).map(([t, n]) => (
+                              {Object.entries(an.erroriPerTipo).filter(([t]) => !['scelta', 'doppia'].includes(t)).map(([t, n]) => (
                                 <span key={t} className="text-xs font-bold bg-white border border-amber-200 text-amber-800 rounded-lg px-2 py-1">{CAT_ERRORI[t]}: {n.toLocaleString('it-IT')}</span>
                               ))}
                             </div>
@@ -9874,10 +9982,17 @@ export default function App() {
                                 la destinazione: RIPAX se è tra i clienti RIPAX delle impostazioni, altrimenti RIP.
                                 Dove possibile è suggerito quello dei prodotti già presenti in giacenza.
                               </p>
-                              {an.clientiMancanti.map(c => (
-                                <div key={c.nome} className="flex items-center gap-3 flex-wrap border-t border-gray-100 pt-2">
+                              {an.clientiMancanti.map(c => {
+                                const kc = `cm|${c.nome}`;
+                                return (
+                                <div key={c.nome} className="border-t border-gray-100 pt-2">
+                                <div className="flex items-center gap-3 flex-wrap">
                                   <span className="text-xs font-bold text-gray-700 min-w-[18rem]">
                                     {c.nome} <span className="text-gray-400 font-normal">({c.n.toLocaleString('it-IT')} matricole)</span>
+                                    <button onClick={() => setCatLineeAperte(prev => ({ ...prev, [kc]: !prev[kc] }))}
+                                      className="ml-2 text-[11px] font-bold text-blue-600 hover:underline cursor-pointer">
+                                      {catLineeAperte[kc] ? 'nascondi' : 'matricole'}
+                                    </button>
                                   </span>
                                   {canEdit('catalogazione') && (
                                     <>
@@ -9898,7 +10013,15 @@ export default function App() {
                                     </>
                                   )}
                                 </div>
-                              ))}
+                                {catLineeAperte[kc] && (
+                                  <p className="mt-1 font-mono text-[11px] text-gray-600 break-all">
+                                    {c.righe.slice(0, 300).map(r => r.serial).join(' · ')}
+                                    {c.righe.length > 300 && ` … e altre ${c.righe.length - 300}`}
+                                  </p>
+                                )}
+                                </div>
+                                );
+                              })}
                             </div>
                           )}
 
@@ -9915,20 +10038,96 @@ export default function App() {
                                     <tr>{['Cliente', 'Part Number', 'Descrizione', 'Matricole', ''].map(h => <th key={h} className="px-3 py-2 text-left font-black whitespace-nowrap">{h}</th>)}</tr>
                                   </thead>
                                   <tbody>
-                                    {an.prodottiMancanti.map(p => (
-                                      <tr key={`${p.customer}|${p.pn}`} className="border-t border-gray-100">
-                                        <td className="px-3 py-1.5 whitespace-nowrap"><span className="font-mono">{p.customer}</span>{nomeCliente(p.customer) && <span className="text-gray-500"> · {nomeCliente(p.customer)}</span>}</td>
-                                        <td className="px-3 py-1.5 font-mono">{p.pn}</td>
-                                        <td className="px-3 py-1.5 text-gray-500">{p.descrizione}</td>
-                                        <td className="px-3 py-1.5 text-right">{p.n.toLocaleString('it-IT')}</td>
-                                        <td className="px-3 py-1.5 text-right">
-                                          {canEdit('catalogazione') && (
-                                            <button onClick={() => salvaCatTranscodifica(p.customer, p.pn, null)}
-                                              className="text-gray-500 hover:text-gray-700 font-bold cursor-pointer">Escludi</button>
+                                    {an.prodottiMancanti.map(p => {
+                                      const kp = `pm|${p.key}`;
+                                      return (
+                                        <Fragment key={kp}>
+                                          <tr className="border-t border-gray-100">
+                                            <td className="px-3 py-1.5 whitespace-nowrap"><span className="font-mono">{p.customer}</span>{nomeCliente(p.customer) && <span className="text-gray-500"> · {nomeCliente(p.customer)}</span>}</td>
+                                            <td className="px-3 py-1.5 font-mono">{p.pn}</td>
+                                            <td className="px-3 py-1.5 text-gray-500">{p.descrizione}</td>
+                                            <td className="px-3 py-1.5 text-right">{p.n.toLocaleString('it-IT')}</td>
+                                            <td className="px-3 py-1.5 text-right whitespace-nowrap">
+                                              <button onClick={() => setCatLineeAperte(prev => ({ ...prev, [kp]: !prev[kp] }))}
+                                                className="text-[11px] font-bold text-blue-600 hover:underline cursor-pointer">
+                                                {catLineeAperte[kp] ? 'nascondi' : 'matricole'}
+                                              </button>
+                                              {canEdit('catalogazione') && (
+                                                <button onClick={() => salvaCatTranscodifica(p.customer, p.pn, null)}
+                                                  className="ml-3 text-gray-500 hover:text-gray-700 font-bold cursor-pointer">Escludi</button>
+                                              )}
+                                            </td>
+                                          </tr>
+                                          {catLineeAperte[kp] && (
+                                            <tr className="border-t border-gray-100 bg-gray-50/60">
+                                              <td colSpan={5} className="px-3 py-2 font-mono text-[11px] text-gray-600 break-all">
+                                                {p.righe.slice(0, 300).map(r => r.serial).join(' · ')}
+                                                {p.righe.length > 300 && ` … e altre ${p.righe.length - 300}`}
+                                              </td>
+                                            </tr>
                                           )}
-                                        </td>
-                                      </tr>
-                                    ))}
+                                        </Fragment>
+                                      );
+                                    })}
+                                  </tbody>
+                                </table>
+                              </div>
+                            </div>
+                          )}
+
+                          {/* Codici incongruenti: solo clienti non RIPAX, dove l'articolo di un altro cliente è un'anomalia vera */}
+                          {an.codiciIncongrui.length > 0 && (
+                            <div className="bg-white border border-gray-200 rounded-xl p-4 space-y-2">
+                              <p className="text-sm font-black text-gray-800">
+                                Articoli NetSuite intestati a un altro cliente
+                                <span className="text-gray-400 font-bold"> · {an.codiciIncongrui.reduce((s, c) => s + c.righe.length, 0).toLocaleString('it-IT')} matricole in {an.codiciIncongrui.length} combinazioni</span>
+                              </p>
+                              <p className="text-xs text-gray-500">
+                                La matricola è in NetSuite su un articolo che in Anagrafica appartiene a un cliente diverso da quello del backlog.
+                                Solo clienti <strong>non RIPAX</strong>: per quelli RIPAX la differenza è fisiologica. Non blocca niente —
+                                negli IT l'articolo giusto è quello di NetSuite — ma va guardato: o il cliente nel backlog è sbagliato,
+                                o l'articolo in Anagrafica è intestato al cliente sbagliato.
+                              </p>
+                              <div className="overflow-x-auto">
+                                <table className="w-full text-xs">
+                                  <thead className="bg-gray-50 text-gray-500 uppercase text-[10px]">
+                                    <tr>{['Cliente del backlog', 'Articolo in NS', 'Cliente dell\'articolo', 'Magazzino', 'Part Number', 'Matricole', ''].map(h => (
+                                      <th key={h} className="px-3 py-2 text-left font-black whitespace-nowrap">{h}</th>
+                                    ))}</tr>
+                                  </thead>
+                                  <tbody>
+                                    {an.codiciIncongrui.map(c => {
+                                      const ki = `inc|${c.key}`;
+                                      return (
+                                        <Fragment key={ki}>
+                                          <tr className="border-t border-gray-100">
+                                            <td className="px-3 py-1.5">
+                                              <span className="font-bold text-gray-800">{c.cliente}</span>
+                                              <span className="block text-[10px] font-mono text-gray-400">{etichettaCliente(c.customer)}</span>
+                                            </td>
+                                            <td className="px-3 py-1.5 font-mono font-bold text-gray-800">{c.itemNs}</td>
+                                            <td className="px-3 py-1.5 font-mono text-gray-500">{etichettaCliente(c.itemCustomer)}</td>
+                                            <td className="px-3 py-1.5 font-mono text-gray-500">{[...c.magazzini].join(', ')}</td>
+                                            <td className="px-3 py-1.5 font-mono text-gray-500">{[...c.pn].join(', ')}</td>
+                                            <td className="px-3 py-1.5 text-right font-bold">{c.righe.length.toLocaleString('it-IT')}</td>
+                                            <td className="px-3 py-1.5 text-right">
+                                              <button onClick={() => setCatLineeAperte(p => ({ ...p, [ki]: !p[ki] }))}
+                                                className="text-[11px] font-bold text-blue-600 hover:underline cursor-pointer">
+                                                {catLineeAperte[ki] ? 'nascondi' : 'matricole'}
+                                              </button>
+                                            </td>
+                                          </tr>
+                                          {catLineeAperte[ki] && (
+                                            <tr className="border-t border-gray-100 bg-gray-50/60">
+                                              <td colSpan={7} className="px-3 py-2 font-mono text-[11px] text-gray-600 break-all">
+                                                {c.righe.slice(0, 300).map(r => r.serialNs || r.serial).join(' · ')}
+                                                {c.righe.length > 300 && ` … e altre ${c.righe.length - 300}`}
+                                              </td>
+                                            </tr>
+                                          )}
+                                        </Fragment>
+                                      );
+                                    })}
                                   </tbody>
                                 </table>
                               </div>
@@ -9938,9 +10137,61 @@ export default function App() {
                         </>
                       )}
 
+                      {/* In testa al carico: le configurazioni si scelgono prima di esportare le RA */}
+                      {catSubTab === 'carico' && an.sceltaGruppi.length > 0 && (
+                        <div className="bg-amber-50 border-2 border-amber-300 rounded-xl p-4 space-y-2 shadow-xs">
+                          <p className="text-sm font-black text-amber-900">
+                            ⚠️ Configurazione da scegliere prima di esportare: {an.sceltaGruppi.length} {an.sceltaGruppi.length === 1 ? 'gruppo' : 'gruppi'}
+                            <span className="font-bold text-amber-700"> · {an.sceltaGruppi.reduce((s, g) => s + g.n, 0).toLocaleString('it-IT')} matricole</span>
+                          </p>
+                          <p className="text-xs text-amber-800">
+                            Questi carichi aspettano solo la configurazione: stesso cliente e stesso Part Number con più prodotti possibili. La scelta vale per il gruppo
+                            <strong> cliente + Part Number + DDT</strong>, perché i terminali arrivati con lo stesso DDT hanno la stessa configurazione,
+                            e non viene memorizzata. Appena scegli, il gruppo sparisce da qui ed entra nel carico sotto.
+                          </p>
+                          <div className="overflow-x-auto bg-white border border-amber-200 rounded-lg">
+                            <table className="w-full text-xs">
+                              <thead className="bg-amber-100/60 text-amber-900 uppercase text-[10px]">
+                                <tr>{['Cliente', 'Part Number', 'Descrizione', 'DDT', 'RMA', 'Matricole', 'Configurazione'].map(h => <th key={h} className="px-3 py-2 text-left font-black whitespace-nowrap">{h}</th>)}</tr>
+                              </thead>
+                              <tbody>
+                                {an.sceltaGruppi.map(s => (
+                                  <tr key={s.key} className="border-t border-amber-100">
+                                    <td className="px-3 py-1.5 whitespace-nowrap">{s.cliente} <span className="text-gray-400 font-mono">· {s.customer}</span></td>
+                                    <td className="px-3 py-1.5 font-mono">{s.pn}</td>
+                                    <td className="px-3 py-1.5 text-gray-500">{s.descrizione}</td>
+                                    <td className="px-3 py-1.5 whitespace-nowrap">{s.ddt || <span className="text-gray-300">(vuoto)</span>}</td>
+                                    <td className="px-3 py-1.5 text-gray-500 whitespace-nowrap">{[...s.rma].slice(0, 2).join(', ')}{s.rma.size > 2 ? ` +${s.rma.size - 2}` : ''}</td>
+                                    <td className="px-3 py-1.5 text-right font-bold">{s.n.toLocaleString('it-IT')}</td>
+                                    <td className="px-3 py-1.5">
+                                      <select value={catSceltaProdotto[s.key] || ''}
+                                        onChange={e => setCatSceltaProdotto(prev => ({ ...prev, [s.key]: e.target.value }))}
+                                        className="text-xs border border-gray-300 rounded-lg px-2 py-1 bg-white">
+                                        <option value="">— scegli —</option>
+                                        {s.candidati.map(c => <option key={c} value={c}>{c}</option>)}
+                                      </select>
+                                    </td>
+                                  </tr>
+                                ))}
+                              </tbody>
+                            </table>
+                          </div>
+                          <label className="flex items-center gap-2 text-xs font-bold text-amber-900 cursor-pointer w-fit">
+                            <input type="checkbox" checked={catIgnoraScelte} onChange={e => setCatIgnoraScelte(e.target.checked)} className="cursor-pointer" />
+                            Ignora le configurazioni da scegliere ed esporta comunque le RA
+                            <span className="font-normal text-amber-700">
+                              ({an.sceltaGruppi.reduce((s, g) => s + g.n, 0).toLocaleString('it-IT')} matricole restano fuori)
+                            </span>
+                          </label>
+                        </div>
+                      )}
+
                       <div className="flex items-center gap-2 flex-wrap">
-                        <input value={catSearch} onChange={e => setCatSearch(e.target.value)} placeholder="Cerca matricola, RMA, cliente, Part Number…"
-                          className="text-sm border border-gray-300 rounded-xl px-3 py-2 w-80 max-w-full" />
+                        {/* Negli errori non c'è un elenco da filtrare: le matricole si aprono riga per riga nei riquadri sopra */}
+                        {catSubTab !== 'errori' && (
+                          <input value={catSearch} onChange={e => setCatSearch(e.target.value)} placeholder="Cerca matricola, RMA, cliente, Part Number…"
+                            className="text-sm border border-gray-300 rounded-xl px-3 py-2 w-80 max-w-full" />
+                        )}
                         <button onClick={scaricaCatDettaglio} title="Scarica l'analisi completa in Excel"
                           className="bg-green-50 hover:bg-green-100 text-green-800 border border-green-200 text-sm font-bold px-3 py-2 rounded-xl cursor-pointer transition whitespace-nowrap">
                           🟩 Excel
@@ -9948,10 +10199,9 @@ export default function App() {
                         <span className="text-xs text-gray-400">
                           {catSubTab === 'carico'
                             ? `${docsVis.length} ${docsVis.length === 1 ? 'documento' : 'documenti'} · ${docsVis.reduce((s, d) => s + d.righe.length, 0).toLocaleString('it-IT')} matricole`
-                            : (() => {
-                              const n = catSubTab === 'disallineate' ? righeDisall.length : righeVis.length;
-                              return `${n.toLocaleString('it-IT')} matricole${n > 500 ? ' (visualizzate le prime 500, tutte nel dettaglio Excel)' : ''}`;
-                            })()}
+                            : catSubTab === 'trasferimenti'
+                              ? `${trasfVis.length} ${trasfVis.length === 1 ? 'combinazione' : 'combinazioni'} · ${trasfVis.reduce((s, g) => s + g.righe.length, 0).toLocaleString('it-IT')} matricole`
+                              : `${nErrori.toLocaleString('it-IT')} matricole da sistemare`}
                         </span>
                       </div>
 
@@ -10043,107 +10293,116 @@ export default function App() {
                         </div>
                       ))}
 
-                          {catSubTab === 'carico' && an.sceltaGruppi.length > 0 && (
-                            <div className="bg-white border border-gray-200 rounded-xl p-4 space-y-2">
-                              <p className="text-sm font-black text-gray-800">Configurazione da scegliere ({an.sceltaGruppi.length} {an.sceltaGruppi.length === 1 ? 'gruppo' : 'gruppi'})</p>
-                              <p className="text-xs text-gray-500">
-                                Questi carichi aspettano solo la configurazione: stesso cliente e stesso Part Number con più prodotti possibili. La scelta vale per il gruppo
-                                <strong> cliente + Part Number + DDT</strong>, perché i terminali arrivati con lo stesso DDT hanno la stessa configurazione,
-                                e non viene memorizzata. Appena scegli, il gruppo sparisce da qui ed entra nel carico sopra.
-                              </p>
-                              <div className="overflow-x-auto">
-                                <table className="w-full text-xs">
-                                  <thead className="bg-gray-50 text-gray-500 uppercase text-[10px]">
-                                    <tr>{['Cliente', 'Part Number', 'Descrizione', 'DDT', 'RMA', 'Matricole', 'Configurazione'].map(h => <th key={h} className="px-3 py-2 text-left font-black whitespace-nowrap">{h}</th>)}</tr>
-                                  </thead>
-                                  <tbody>
-                                    {an.sceltaGruppi.map(s => (
-                                      <tr key={s.key} className="border-t border-gray-100">
-                                        <td className="px-3 py-1.5 whitespace-nowrap">{s.cliente} <span className="text-gray-400 font-mono">· {s.customer}</span></td>
-                                        <td className="px-3 py-1.5 font-mono">{s.pn}</td>
-                                        <td className="px-3 py-1.5 text-gray-500">{s.descrizione}</td>
-                                        <td className="px-3 py-1.5 whitespace-nowrap">{s.ddt || <span className="text-gray-300">(vuoto)</span>}</td>
-                                        <td className="px-3 py-1.5 text-gray-500 whitespace-nowrap">{[...s.rma].slice(0, 2).join(', ')}{s.rma.size > 2 ? ` +${s.rma.size - 2}` : ''}</td>
-                                        <td className="px-3 py-1.5 text-right font-bold">{s.n.toLocaleString('it-IT')}</td>
-                                        <td className="px-3 py-1.5">
-                                          <select value={catSceltaProdotto[s.key] || ''}
-                                            onChange={e => setCatSceltaProdotto(prev => ({ ...prev, [s.key]: e.target.value }))}
-                                            className="text-xs border border-gray-300 rounded-lg px-2 py-1 bg-white">
-                                            <option value="">— scegli —</option>
-                                            {s.candidati.map(c => <option key={c} value={c}>{c}</option>)}
-                                          </select>
-                                        </td>
-                                      </tr>
-                                    ))}
-                                  </tbody>
-                                </table>
-                              </div>
-                            </div>
-                          )}
-
-                      {/* Dettaglio delle matricole da sistemare: i pannelli sopra dicono cosa fare, qui si vede su quali */}
-                      {catSubTab === 'errori' && righeVis.length > 0 && (
-                        <div className="space-y-1">
-                          <p className="text-sm font-black text-gray-800">
-                            Matricole da sistemare <span className="text-gray-400 font-bold">· {righeVis.length.toLocaleString('it-IT')}</span>
-                          </p>
-                          {tabellaRighe(righeVis)}
-                        </div>
-                      )}
-
-                      {catSubTab === 'disallineate' && (
+                      {/* Trasferimenti a tre livelli: coppia di magazzini → articoli con la quantità → matricole */}
+                      {catSubTab === 'trasferimenti' && (
                         <div className="space-y-3">
-                          <div className={`${an.n.disallineata ? 'bg-amber-50 border-amber-200 text-amber-800' : 'bg-green-50 border-green-200 text-green-800'} border rounded-xl px-4 py-3 text-sm font-bold`}>
-                            {an.n.disallineata === 0
-                              ? '✓ Nessun disallineamento: ogni matricola del backlog è nel magazzino che le spetta.'
-                              : `${an.n.disallineata.toLocaleString('it-IT')} matricole da verificare: in NetSuite sono su un magazzino che non corrisponde al backlog.`}
-                          </div>
-                          {an.n.disallineata > 0 && (
-                            <>
-                              <p className="text-xs text-gray-500">
-                                Due casi: la matricola è su un magazzino diverso dalla destinazione attesa per quel cliente,
-                                oppure è su un conto deposito o tra gli irreparabili, quindi con la riparazione chiusa, e non dovrebbe stare nel backlog.
-                                Restano fuori dai documenti RA: va corretto il magazzino in NetSuite o lo stato nel backlog.
-                              </p>
-                              {/* Raggruppate per segnalazione, con il dettaglio matricole a richiesta, come carico ed errori */}
-                              <div className="bg-white border border-gray-200 rounded-xl overflow-x-auto">
-                                <table className="w-full text-xs">
-                                  <thead className="bg-gray-50 text-gray-500 uppercase text-[10px]">
-                                    <tr>
-                                      <th className="px-3 py-2 text-left font-black">Segnalazione</th>
-                                      <th className="px-3 py-2 text-left font-black w-28">Clienti</th>
-                                      <th className="px-3 py-2 text-right font-black w-28">Matricole</th>
-                                      <th className="px-4 py-2 text-right font-black w-24"></th>
-                                    </tr>
-                                  </thead>
-                                  <tbody>
-                                    {gruppiDisall.map(g => (
-                                      <Fragment key={g.key}>
-                                        <tr className="border-t border-gray-100">
-                                          <td className="px-3 py-1.5 text-amber-800">{g.msg}</td>
-                                          <td className="px-3 py-1.5 font-mono text-gray-500">{[...g.clienti].slice(0, 3).join(', ')}{g.clienti.size > 3 ? ` +${g.clienti.size - 3}` : ''}</td>
-                                          <td className="px-3 py-1.5 text-right font-bold">{g.righe.length.toLocaleString('it-IT')}</td>
-                                          <td className="px-4 py-1.5 text-right">
-                                            <button onClick={() => setCatLineeAperte(p => ({ ...p, [`dis|${g.key}`]: !p[`dis|${g.key}`] }))}
-                                              className="text-[11px] font-bold text-blue-600 hover:underline cursor-pointer">
-                                              {catLineeAperte[`dis|${g.key}`] ? 'nascondi' : 'matricole'}
-                                            </button>
-                                          </td>
-                                        </tr>
-                                        {catLineeAperte[`dis|${g.key}`] && (
-                                          <tr className="border-t border-gray-100 bg-gray-50/60">
-                                            <td colSpan={4} className="px-3 py-2 font-mono text-[11px] text-gray-600 break-all">
-                                              {g.righe.slice(0, 300).map(r => r.serialNs || r.serial).join(' · ')}
-                                              {g.righe.length > 300 && ` … e altre ${g.righe.length - 300}`}
-                                            </td>
-                                          </tr>
+                          <p className="text-xs text-gray-500 max-w-4xl">
+                            Matricole del backlog che NetSuite ha già, ma su un magazzino diverso dalla destinazione attesa per quel cliente:
+                            non si caricano con una RA, si spostano con un Inventory Transfer. Per ogni coppia di magazzini scegli una volta
+                            cosa fare: la scelta resta e vale anche per i prossimi backlog. Le combinazioni nuove partono da
+                            <strong> Da decidere</strong>, così nessun trasferimento finisce in un file senza che tu l'abbia deciso.
+                          </p>
+                          {/* Se un magazzino non è nella giacenza caricata, le sue matricole sembrano assenti da NS e finirebbero nelle RA */}
+                          <p className="text-xs text-gray-500">
+                            Il confronto ha letto <strong>{[...new Set(invRiepilogo.map(r => r.location))].length} magazzini</strong>:
+                            {' '}{[...new Set(invRiepilogo.map(r => (r.location || '').split(' - ')[0].trim()))].sort().join(', ')}.
+                            I magazzini che non sono nella giacenza caricata non si vedono: le loro matricole sembrano assenti da NetSuite
+                            e finirebbero nelle RA, quindi conviene caricare l'estrazione completa.
+                          </p>
+                          {trasfVis.length === 0 ? (
+                            <div className="bg-green-50 border border-green-200 text-green-800 text-sm font-bold rounded-xl px-4 py-3">
+                              ✓ Nessun trasferimento: ogni matricola del backlog che NetSuite conosce è già nel magazzino che le spetta.
+                            </div>
+                          ) : (
+                            <div className="bg-white border border-gray-200 rounded-xl overflow-hidden">
+                              {trasfVis.map(g => {
+                                const kg = `trasf|${g.key}`;
+                                const aperto = !!catLineeAperte[kg];
+                                const az = CAT_AZIONI[g.azione] || CAT_AZIONI.segnala;
+                                return (
+                                  <div key={g.key} className="border-b border-gray-200 last:border-b-0">
+                                    <div className="flex items-center justify-between gap-3 px-4 py-3 hover:bg-gray-50 transition">
+                                      <button onClick={() => setCatLineeAperte(p => ({ ...p, [kg]: !p[kg] }))}
+                                        className="flex items-center gap-2 min-w-0 cursor-pointer text-left">
+                                        <span className={`text-gray-400 text-xs transition-transform ${aperto ? 'rotate-90' : ''}`}>▶</span>
+                                        <span className="min-w-0">
+                                          <span className="text-sm font-black text-gray-800">
+                                            {g.magOrigine} <span className="text-gray-400">→</span> {g.magDest}
+                                          </span>
+                                          <span className="block text-[11px] text-gray-400">
+                                            {g.origine} → {g.destinazione} · {g.articoli.length} {g.articoli.length === 1 ? 'articolo' : 'articoli'}
+                                          </span>
+                                          {/* I clienti in chiaro: la destinazione dipende da loro, non dall'articolo */}
+                                          <span className="block text-[11px] text-gray-500">
+                                            {[...g.clienti].slice(0, 2).map(c => etichettaCliente(c)).join(' · ')}
+                                            {g.clienti.size > 2 && ` · +${g.clienti.size - 2} clienti`}
+                                          </span>
+                                          {[...g.segnalazioni].slice(0, 2).map(s => (
+                                            <span key={s} className="block text-[11px] font-bold text-amber-700">⚠ {s}</span>
+                                          ))}
+                                        </span>
+                                      </button>
+                                      <span className="flex items-center gap-4 shrink-0">
+                                        <span className={`text-[10px] font-black border rounded px-2 py-1 ${az.cls}`}>{az.label}</span>
+                                        {canEdit('catalogazione') && (
+                                          <select value={g.azione} onChange={e => salvaCatRegola(g.magOrigine, g.magDest, e.target.value)}
+                                            className="text-xs border border-gray-300 rounded-lg px-2 py-1 bg-white cursor-pointer">
+                                            {Object.entries(CAT_AZIONI).map(([k, v]) => <option key={k} value={k}>{v.label}</option>)}
+                                          </select>
                                         )}
-                                      </Fragment>
-                                    ))}
-                                  </tbody>
-                                </table>
-                              </div>
-                            </>
+                                        <span className="text-right">
+                                          <span className="text-lg font-black text-blue-700">{g.righe.length.toLocaleString('it-IT')}</span>
+                                          <span className="text-[10px] font-bold uppercase text-gray-400"> matricole</span>
+                                        </span>
+                                      </span>
+                                    </div>
+
+                                    {aperto && (
+                                      <div className="bg-gray-50/60 border-t border-gray-200">
+                                        <table className="w-full text-xs">
+                                          <thead className="text-gray-400 uppercase text-[10px]">
+                                            <tr>
+                                              <th className="pl-10 pr-3 py-1.5 text-left font-black">Articolo in NS</th>
+                                              <th className="px-3 py-1.5 text-left font-black">Part Number backlog</th>
+                                              <th className="px-3 py-1.5 text-right font-black w-28">Quantità</th>
+                                              <th className="px-4 py-1.5 text-right font-black w-24"></th>
+                                            </tr>
+                                          </thead>
+                                          <tbody>
+                                            {g.articoli.map(a => {
+                                              const ka = `trasfit|${g.key}|${a.item}`;
+                                              return (
+                                                <Fragment key={ka}>
+                                                  <tr className="border-t border-gray-200/70">
+                                                    <td className="pl-10 pr-3 py-1.5 font-mono font-bold text-gray-800">{a.item}</td>
+                                                    <td className="px-3 py-1.5 font-mono text-gray-500">{[...new Set(a.righe.map(r => r.pn))].join(', ')}</td>
+                                                    <td className="px-3 py-1.5 text-right font-bold">{a.righe.length.toLocaleString('it-IT')}</td>
+                                                    <td className="px-4 py-1.5 text-right">
+                                                      <button onClick={() => setCatLineeAperte(p => ({ ...p, [ka]: !p[ka] }))}
+                                                        className="text-[11px] font-bold text-blue-600 hover:underline cursor-pointer">
+                                                        {catLineeAperte[ka] ? 'nascondi' : 'matricole'}
+                                                      </button>
+                                                    </td>
+                                                  </tr>
+                                                  {catLineeAperte[ka] && (
+                                                    <tr className="border-t border-gray-200/70 bg-white">
+                                                      <td colSpan={4} className="px-3 py-2 pl-10 font-mono text-[11px] text-gray-600 break-all">
+                                                        {a.righe.slice(0, 300).map(r => r.serialNs || r.serial).join(' · ')}
+                                                        {a.righe.length > 300 && ` … e altre ${a.righe.length - 300}`}
+                                                      </td>
+                                                    </tr>
+                                                  )}
+                                                </Fragment>
+                                              );
+                                            })}
+                                          </tbody>
+                                        </table>
+                                      </div>
+                                    )}
+                                  </div>
+                                );
+                              })}
+                            </div>
                           )}
                         </div>
                       )}
@@ -10290,6 +10549,52 @@ export default function App() {
                     </div>
                     {canEdit('catalogazione') && (
                       <button onClick={salvaCatImpostazioni} className="bg-blue-600 hover:bg-blue-700 text-white text-sm font-bold px-4 py-2 rounded-xl cursor-pointer transition">Salva</button>
+                    )}
+                  </div>
+
+                  {/* Le scelte fatte nella scheda Trasferimenti restano qui, rivedibili anche quando il caso non si presenta */}
+                  <div className="bg-white border border-gray-200 rounded-xl p-4 space-y-3">
+                    <div>
+                      <p className="text-sm font-black text-gray-800">Trasferimenti: azione per coppia di magazzini ({catRegole.length})</p>
+                      <p className="text-xs text-gray-500">
+                        Decise dalla scheda Trasferimenti e valide per tutti i backlog successivi. Le coppie che non sono in elenco
+                        valgono <strong>Da decidere</strong>: compaiono nei Trasferimenti ma non entrano in nessun file.
+                      </p>
+                    </div>
+                    {catRegole.length === 0 ? (
+                      <p className="text-xs text-gray-400">Nessuna scelta salvata.</p>
+                    ) : (
+                      <div className="overflow-x-auto">
+                        <table className="w-full text-xs">
+                          <thead className="bg-gray-50 text-gray-500 uppercase text-[10px]">
+                            <tr>{['Origine', 'Destinazione', 'Azione', 'Deciso da', ''].map(h => <th key={h} className="px-3 py-2 text-left font-black whitespace-nowrap">{h}</th>)}</tr>
+                          </thead>
+                          <tbody>
+                            {[...catRegole].sort((a, b) => a.origine.localeCompare(b.origine) || a.destinazione.localeCompare(b.destinazione)).map(r => (
+                              <tr key={`${r.origine}|${r.destinazione}`} className="border-t border-gray-100">
+                                <td className="px-3 py-1.5 font-mono font-bold">{r.origine}</td>
+                                <td className="px-3 py-1.5 font-mono font-bold">{r.destinazione}</td>
+                                <td className="px-3 py-1.5">
+                                  {canEdit('catalogazione') ? (
+                                    <select value={r.azione} onChange={e => salvaCatRegola(r.origine, r.destinazione, e.target.value)}
+                                      className="text-xs border border-gray-300 rounded-lg px-2 py-1 bg-white cursor-pointer">
+                                      {Object.entries(CAT_AZIONI).map(([k, v]) => <option key={k} value={k}>{v.label}</option>)}
+                                    </select>
+                                  ) : (CAT_AZIONI[r.azione]?.label || r.azione)}
+                                </td>
+                                <td className="px-3 py-1.5 text-gray-500 whitespace-nowrap">
+                                  {r.updated_by || '—'}{r.updated_at && ` · ${new Date(r.updated_at).toLocaleDateString('it-IT')}`}
+                                </td>
+                                <td className="px-3 py-1.5 text-right">
+                                  {canEdit('catalogazione') && (
+                                    <button onClick={() => eliminaCatRegola(r)} className="text-gray-500 hover:text-gray-700 font-bold cursor-pointer">Rimuovi</button>
+                                  )}
+                                </td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
                     )}
                   </div>
 
