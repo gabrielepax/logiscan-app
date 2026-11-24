@@ -28,5 +28,7 @@ grant all on public.cat_regole_magazzini to anon, authenticated;
 comment on table public.cat_regole_magazzini is
   'Catalogazione: azione per coppia magazzino di origine -> destinazione nei trasferimenti (IT)';
 
--- Lo storico delle testate accoglie anche i documenti IT (tipo = ''IT'',
--- magazzino_origine valorizzato): la tabella c''è già, nessuna modifica.
+-- Lo storico delle testate accoglie anche i documenti IT (tipo = 'IT',
+-- magazzino_origine valorizzato). Un IT è un movimento tra magazzini e non ha
+-- un cliente, mentre la colonna era nata obbligatoria con le sole RA.
+alter table public.cat_export_testate alter column cliente drop not null;

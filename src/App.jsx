@@ -702,6 +702,7 @@ export default function App() {
   const [catGiacenza, setCatGiacenza] = useState(new Map()); // matricola -> { item, location }, tutti i magazzini
   const [catGiacenzaDoppie, setCatGiacenzaDoppie] = useState(new Map()); // matricola -> magazzini, se è su più di uno
   const [catRegole, setCatRegole] = useState([]); // azione per combinazione magazzino origine -> destinazione
+  const [catAnalisiPronta, setCatAnalisiPronta] = useState(false); // true solo a confronto completato
   const [catGiacenzaAt, setCatGiacenzaAt] = useState(null); // data della giacenza NS usata per l'analisi
   const [catNonNelBacklog, setCatNonNelBacklog] = useState([]); // matricole in RIP/RIPAX assenti dal backlog
   const [catLoading, setCatLoading] = useState(false);
@@ -5003,6 +5004,10 @@ export default function App() {
       });
     });
     if (righe.length === 0) { alert('Nessuna matricola nel backlog.'); return; }
+    // Niente numeri a schermo finché l'analisi non è finita: con la giacenza non ancora letta
+    // ogni matricola risulterebbe assente da NetSuite
+    setCatAnalisiPronta(false);
+    setCatNonNelBacklog([]);
     setCatRighe(righe);
     setCatFile(file.name);
     setCatFileAt(new Date(file.lastModified));
@@ -5012,10 +5017,11 @@ export default function App() {
     await analizzaBacklog(righe);
   }
 
-  // Legge la giacenza dei magazzini di riparazione: le matricole del backlog e, al contrario,
+  // Legge la giacenza di tutti i magazzini: le matricole del backlog e, al contrario,
   // quelle presenti in RIP/RIPAX che il backlog non conosce
   async function analizzaBacklog(righe = catRighe) {
     if (righe.length === 0) return;
+    setCatAnalisiPronta(false);
     setCatLoading(true);
     try {
       await fetchCatConfig();
@@ -5059,6 +5065,7 @@ export default function App() {
         if ((mag === 'RIP' || mag === 'RIPAX') && !nelBacklog.has(k)) soloNs.push(g);
       });
       setCatNonNelBacklog(soloNs.sort((a, b) => a.location.localeCompare(b.location) || a.item.localeCompare(b.item)));
+      setCatAnalisiPronta(true);
     } catch (err) { alert('Errore analisi backlog: ' + err.message); }
     setCatProgress('');
     setCatLoading(false);
@@ -5436,7 +5443,9 @@ export default function App() {
     }));
     const { error } = await supabase.from('cat_export_testate').insert(testate);
     if (error) {
-      alert('Export annullato, nessun file generato: ' + error.message + '\n\nProbabilmente un documento è già stato esportato: rianalizza.');
+      // Lo storico si scrive prima del file: se non entra, non si scarica niente
+      alert('Export annullato, nessun file generato.\n\n' + error.message
+        + (error.code === '23505' ? '\n\nUno di questi documenti è già stato esportato: rianalizza.' : ''));
       await fetchCatConfig();
       setCatLoading(false);
       return;
@@ -5513,11 +5522,32 @@ export default function App() {
     XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(an.docs.map(d => ({
       IDext: d.idext, Cliente: d.cliente, Data: d.data, Destinazione: d.destinazione, Righe: d.linee.length, Matricole: d.righe.length,
     }))), 'Documenti RA');
+    // Le RA matricola per matricola: le stesse righe del file CSV, con RMA e DDT in più
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(an.docs.flatMap(d => d.linee.flatMap(l => l.righe.map(r => ({
+      IDext: d.idext, 'Surrogate Line': l.surrogate, Data: d.data, Cliente: d.cliente, 'Nome cliente': r.cliente,
+      Matricola: r.serialNs || r.serial, 'Matricola backlog': r.serial, Articolo: l.item, 'Quantità riga': l.righe.length,
+      Destinazione: d.destinazione, 'Part Number': r.pn, RMA: r.rma, DDT: r.ddt, Stato: r.stato,
+    }))))), 'Matricole RA');
     XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(an.trasfGruppi.flatMap(g => g.articoli.map(a => ({
       Origine: g.origine, Destinazione: g.destinazione, Azione: CAT_AZIONI[g.azione]?.label || g.azione,
       'Articolo NS': a.item, Matricole: a.righe.length, IDextIT: a.righe[0]?.idext || '',
       Segnalazioni: [...g.segnalazioni].join(' | '),
     })))), 'Trasferimenti');
+    // I trasferimenti matricola per matricola, comprese le coppie ancora da decidere
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(an.trasfGruppi.flatMap(g => g.articoli.flatMap(a => a.righe.map(r => ({
+      Origine: g.origine, Destinazione: g.destinazione, Azione: CAT_AZIONI[g.azione]?.label || g.azione,
+      IDextIT: r.idext || '', 'Articolo NS': a.item, 'Quantità riga': a.righe.length,
+      Matricola: r.serialNs || r.serial, 'Matricola backlog': r.serial,
+      Cliente: r.customer, 'Nome cliente': r.cliente, 'Part Number': r.pn, RMA: r.rma, DDT: r.ddt, Stato: r.stato,
+      Segnalazioni: [...r.errori.map(e => e.msg), ...(r.note || [])].join(' | '),
+    }))))), 'Matricole IT');
+    if (an.codiciIncongrui.length > 0) {
+      XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(an.codiciIncongrui.flatMap(c => c.righe.map(r => ({
+        Cliente: c.customer, 'Nome cliente': c.cliente, 'Articolo NS': c.itemNs, 'Cliente articolo': c.itemCustomer,
+        Magazzino: r.origine, Matricola: r.serialNs || r.serial, 'Part Number': r.pn, RMA: r.rma, DDT: r.ddt,
+        Esito: CAT_ESITI[r.esito]?.label || r.esito,
+      })))), 'Codici incongruenti');
+    }
     XLSX.writeFile(wb, `catalogazione_backlog_${new Date().toISOString().slice(0, 10)}.xlsx`);
   }
 
@@ -9754,7 +9784,9 @@ export default function App() {
         {/* ==================== MODULO PRELIEVI — LISTA ==================== */}
         {/* ==================== MODULO CATALOGAZIONE ==================== */}
         {activeModule === 'catalogazione' && (() => {
-          const an = catAnalisi;
+          // Finché l'analisi non è completata non si mostra nessun numero: sarebbe calcolato
+          // su una giacenza non ancora letta, con tutte le matricole apparentemente assenti da NS
+          const an = catAnalisiPronta ? catAnalisi : null;
           const fmt = iso => iso ? new Date(iso).toLocaleString('it-IT') : '—';
           const giacenzaCambiata = an && catGiacenzaAt !== (importMeta.inv_snapshot_file || importMeta.inv_snapshot || null);
           const q = catSearch.trim().toLowerCase();
@@ -9876,7 +9908,21 @@ export default function App() {
               {catTab === 'analisi' && (
                 <div className="space-y-4">
                   {!an ? (
-                    <div className="text-center py-16 text-gray-400 text-sm">Carica il backlog repair col pulsante in alto per avviare il confronto con la giacenza NS.</div>
+                    <div className="text-center py-16 space-y-3">
+                      <p className="text-gray-400 text-sm">
+                        {catLoading
+                          ? `Confronto in corso… ${catProgress || ''}`
+                          : catRighe.length > 0
+                            ? 'Analisi non completata: il confronto con la giacenza NS va rifatto.'
+                            : 'Carica il backlog repair col pulsante in alto per avviare il confronto con la giacenza NS.'}
+                      </p>
+                      {!catLoading && catRighe.length > 0 && (
+                        <button onClick={() => analizzaBacklog()}
+                          className="bg-gray-100 hover:bg-gray-200 text-gray-700 text-sm font-bold px-4 py-2.5 rounded-xl cursor-pointer transition">
+                          ↻ Rianalizza
+                        </button>
+                      )}
+                    </div>
                   ) : (
                     <>
                       {giacenzaCambiata && (
